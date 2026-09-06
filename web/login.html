@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#050916" />
+    <script>document.documentElement.classList.add('dark')</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;500;600;700&family=Press+Start+2P&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/pixelquest.css" />
+    <title>Welcome to SocialQuest</title>
+  </head>
+  <body class="login-body">
+    <main class="login-layout">
+      <section class="login-art"><a class="brand brand-light" href="/"><span class="brand-mark">S</span>SocialQuest</a><div class="login-wordmark"><p>REAL WORLD · REAL PEOPLE</p><h1>Social<br /><em>Quest.</em></h1><span>⚔</span></div><p class="login-quote">Discover real-world quests, meet your people, and level up every connection.</p><div class="login-orbit orbit-a"></div><div class="login-orbit orbit-b"></div></section>
+      <section class="auth-panel"><div class="auth-inner"><p class="eyebrow">WELCOME IN</p><h2 id="auth-title">Find your people.</h2><p class="auth-sub" id="auth-sub">Log in and see what your community is up to.</p><form id="auth-form"><div id="register-fields" hidden><label>Display name<input name="display_name" autocomplete="name" placeholder="What should people call you?" /></label></div><label>Username<input name="username" autocomplete="username" required placeholder="your_username" /></label><label id="email-field" hidden>Email<input type="email" name="email" autocomplete="email" placeholder="you@example.com" /></label><label>Password<input type="password" name="password" autocomplete="current-password" required placeholder="••••••••" /></label><p class="form-error" id="form-error"></p><button class="auth-submit" type="submit" id="auth-submit">Log in <span>→</span></button></form><p class="auth-switch" id="auth-switch">New here? <button type="button" data-action="toggle-auth">Create an account</button></p><p class="auth-note">By continuing, you agree to build a kind, consent-first community.</p></div></section>
+    </main>
+    <script src="/static/login.js"></script>
+  </body>
+</html>

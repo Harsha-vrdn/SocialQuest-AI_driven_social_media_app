@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "SocialQuest",
+    "slug": "socialquest",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "socialquest",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.socialquest.app"
+    },
+    "android": {
+      "package": "com.socialquest.app",
+      "softwareKeyboardLayoutMode": "resize"
+    },
+    "androidNavigationBar": {
+      "backgroundColor": "#ffffff",
+      "barStyle": "dark-content"
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "SocialQuest uses your photos only when you choose one to share in a post.",
+          "cameraPermission": "SocialQuest uses your camera only when you choose to take a photo for a post."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "SocialQuest uses your location only when you choose to find nearby events or tag a post with your current place."
+        }
+      ],
+      "expo-font",
+      "expo-asset"
+    ],
+    "extra": {}
+  }
+}

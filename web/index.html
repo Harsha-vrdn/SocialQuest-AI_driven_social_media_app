@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#050916" />
+    <script>document.documentElement.classList.add('dark')</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;500;600;700&family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/pixelquest.css?v=20260831-chat-scroll" />
+    <title>SocialQuest — Home</title>
+  </head>
+  <body class="app-body">
+    <div class="app-shell">
+      <aside class="left-rail">
+        <a class="brand" href="/"><span class="brand-mark">S</span>SocialQuest</a>
+        <p class="brand-tagline">REAL WORLD · REAL PEOPLE · REAL ADVENTURES</p>
+        <nav class="main-nav" aria-label="Main navigation">
+          <button class="nav-link active" data-view="home"><span>⌂</span> Home</button>
+          <button class="nav-link" data-view="explore"><span>⌖</span> Explore events</button>
+          <button class="nav-link" data-view="reels"><span>◉</span> Reels</button>
+          <button class="nav-link" data-view="chats"><span>✉</span> Chats</button>
+          <button class="nav-link notification-nav" data-view="notifications"><span>♢</span> Notifications <b class="notification-count" data-notification-count hidden>0</b></button>
+          <button class="nav-link" data-view="profile"><span>♙</span> Profile</button>
+        </nav>
+        <button class="logout-button" data-action="logout"><span>↪</span> Log out</button>
+        <button class="new-post" data-action="compose">＋ <span>Share a moment</span></button>
+        <button class="me-mini" data-view="profile" aria-label="Open your profile"><span class="avatar avatar-me" id="my-avatar">S</span><span><strong id="my-name">Your profile</strong><small id="my-handle">@you</small></span><b>···</b></button>
+      </aside>
+
+      <main class="main-content">
+        <header class="mobile-top"><a class="brand" href="/"><span class="brand-mark">S</span>SocialQuest</a><div><button class="notification-bell" data-view="notifications" aria-label="Notifications">♢<b class="notification-count" data-notification-count hidden>0</b></button><button class="mobile-logout" data-action="logout" aria-label="Log out">↪</button><button class="icon-button" data-action="compose" aria-label="Share a moment">＋</button></div></header>
+        <div id="view" aria-live="polite"></div>
+      </main>
+
+      <aside class="right-rail">
+        <section class="quest-card"><p>✦ TODAY'S SPARK</p><h3>Send a “thinking of you” message to someone you met this month.</h3><span>+ 15 XP if it leads to a plan</span></section>
+        <section class="side-section"><div class="side-heading"><h3>People worth meeting</h3><button data-action="explore-people">See all</button></div><div id="people-suggestions"></div></section>
+        <section class="side-section"><div class="side-heading"><h3>Up next</h3><button data-view="explore">Explore</button></div><div id="event-mini-list"></div></section>
+      </aside>
+    </div>
+
+    <nav class="mobile-nav" aria-label="Mobile navigation"><button class="active" data-view="home">⌂<small>Home</small></button><button data-view="explore">⌖<small>Events</small></button><button data-view="chats">✉<small>Chats</small></button><button data-action="compose" class="plus" aria-label="Share a moment">＋</button><button data-view="notifications">♢<small>Alerts</small></button><button data-view="reels">◉<small>Reels</small></button><button data-view="profile">♙<small>Profile</small></button></nav>
+    <dialog id="modal"><button class="modal-close" data-action="close-modal" aria-label="Close">×</button><div id="modal-content"></div></dialog>
+    <script src="/static/app.js?v=20260831-chat-tabs"></script>
+  </body>
+</html>
