@@ -1,8 +1,9 @@
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import serializers
 from .media import compress_image_upload
 from .models import (Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
-                     Notification, Post, Profile, Quest, QuestSubmission)
+                     Notification, Post, Profile, Quest, QuestSubmission, UserPresence)
 
 User = get_user_model()
 
@@ -23,10 +24,10 @@ class PublicUserSerializer(serializers.ModelSerializer):
         fields = ["id", "username", "display_name", "bio", "city", "avatar", "xp", "karma", "follower_count", "following_count", "is_followed_by_me"]
 
     def get_follower_count(self, obj):
-        return obj.follower_relations.count()
+        return obj.follower_relations.filter(follower__is_active=True).count()
 
     def get_following_count(self, obj):
-        return obj.following_relations.count()
+        return obj.following_relations.filter(following__is_active=True).count()
 
     def get_is_followed_by_me(self, obj):
         request = self.context.get("request")
@@ -34,22 +35,27 @@ class PublicUserSerializer(serializers.ModelSerializer):
 
 
 class EventSerializer(serializers.ModelSerializer):
+    capacity = serializers.IntegerField(min_value=2, required=False)
     host = PublicUserSerializer(read_only=True)
     accepted_count = serializers.SerializerMethodField()
     pending_count = serializers.SerializerMethodField()
     my_attendance_status = serializers.SerializerMethodField()
     is_finished = serializers.BooleanField(read_only=True)
     quest_status = serializers.SerializerMethodField()
+    has_quests = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
-        fields = ["id", "host", "name", "description", "cover_image", "location_name", "latitude", "longitude", "starts_at", "ends_at", "capacity", "privacy", "created_at", "accepted_count", "pending_count", "my_attendance_status", "has_started", "is_finished", "quest_status"]
+        fields = ["id", "host", "name", "description", "cover_image", "location_name", "latitude", "longitude", "starts_at", "ends_at", "capacity", "privacy", "created_at", "accepted_count", "pending_count", "my_attendance_status", "has_started", "is_finished", "quest_status", "has_quests"]
         read_only_fields = ["host", "created_at"]
 
     def validate(self, attrs):
-        starts, ends = attrs.get("starts_at"), attrs.get("ends_at")
+        starts = attrs.get("starts_at", getattr(self.instance, "starts_at", None))
+        ends = attrs.get("ends_at", getattr(self.instance, "ends_at", None))
         if starts and ends and ends <= starts:
             raise serializers.ValidationError("The event must end after it starts.")
+        if self.instance and attrs.get("capacity", self.instance.capacity) < self.instance.attendances.filter(status=Attendance.Status.ACCEPTED).count():
+            raise serializers.ValidationError({"capacity": "Capacity cannot be lower than the number of accepted guests."})
         latitude = attrs.get("latitude", getattr(self.instance, "latitude", None))
         longitude = attrs.get("longitude", getattr(self.instance, "longitude", None))
         if (latitude is None) != (longitude is None):
@@ -75,6 +81,9 @@ class EventSerializer(serializers.ModelSerializer):
             return None
         attendance = obj.attendances.filter(user=request.user).first()
         return attendance.status if attendance else None
+
+    def get_has_quests(self, obj):
+        return obj.quests.filter(kind=Quest.Kind.MAIN).exists()
 
     def get_quest_status(self, obj):
         if obj.quests_are_active:
@@ -109,16 +118,36 @@ class QuestSerializer(serializers.ModelSerializer):
 
 class QuestSubmissionSerializer(serializers.ModelSerializer):
     participant = PublicUserSerializer(read_only=True)
+    quest_title = serializers.CharField(source="quest.title", read_only=True)
+    xp_reward = serializers.IntegerField(source="quest.xp_reward", read_only=True)
 
     class Meta:
         model = QuestSubmission
-        fields = ["id", "quest", "participant", "caption", "media", "media_type", "status", "submitted_at", "reviewed_at"]
+        fields = ["id", "quest", "quest_title", "xp_reward", "participant", "caption", "media", "media_type", "status", "submitted_at", "reviewed_at"]
         read_only_fields = ["participant", "status", "submitted_at", "reviewed_at"]
 
     def validate(self, attrs):
+        request = self.context.get("request")
+        if request and QuestSubmission.objects.filter(quest=attrs.get("quest"), participant=request.user).exists():
+            raise serializers.ValidationError("You have already submitted proof for this quest.")
         if attrs.get("media"):
+            if attrs["media"].size > 50 * 1024 * 1024:
+                raise serializers.ValidationError({"media": "Uploads must be smaller than 50 MB."})
+            content_type = getattr(attrs["media"], "content_type", "")
+            expected = "video/" if attrs.get("media_type") == "REEL" else "image/"
+            if not content_type.startswith(expected):
+                raise serializers.ValidationError({"media": "Choose a photo for image proof or a video for reel proof."})
             attrs["media"] = compress_image_upload(attrs["media"])
         return attrs
+
+
+class ProfileUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Profile
+        fields = ["display_name", "bio", "city", "avatar"]
+
+    def validate_avatar(self, value):
+        return compress_image_upload(value)
 
 
 class KarmaRatingSerializer(serializers.ModelSerializer):
@@ -183,7 +212,19 @@ class PostSerializer(serializers.ModelSerializer):
         if current and current.quest_id and "event" in attrs and attrs["event"] != current.event:
             raise serializers.ValidationError("A quest moment must remain connected to its original event.")
         if attrs.get("media"):
+            upload = attrs["media"]
+            content_type = getattr(upload, "content_type", "")
+            if upload.size > 50 * 1024 * 1024:
+                raise serializers.ValidationError({"media": "Uploads must be smaller than 50 MB."})
+            if not content_type.startswith(("image/", "video/")):
+                raise serializers.ValidationError({"media": "Choose an image or video file."})
+            if content_type.startswith("video/"):
+                attrs["kind"] = Post.Kind.REEL
+            elif kind == Post.Kind.REEL:
+                raise serializers.ValidationError({"media": "A reel needs a video upload."})
             attrs["media"] = compress_image_upload(attrs["media"])
+        elif current and kind != current.kind and current.media:
+            raise serializers.ValidationError({"kind": "Upload matching media to change the post type."})
         return attrs
 
     def get_quest_title(self, obj):
@@ -212,8 +253,23 @@ class MessageSerializer(serializers.ModelSerializer):
         read_only_fields = ["sender", "created_at", "edited_at", "deleted_for_everyone"]
 
 
+class ChatParticipantSerializer(PublicUserSerializer):
+    is_online = serializers.SerializerMethodField()
+
+    class Meta(PublicUserSerializer.Meta):
+        fields = PublicUserSerializer.Meta.fields + ["is_online"]
+
+    def get_is_online(self, obj):
+        cutoff = timezone.now() - UserPresence.TIMEOUT
+        return any(session.last_seen > cutoff for session in obj.presence_sessions.all())
+
+
+class PresenceSerializer(serializers.Serializer):
+    session_id = serializers.UUIDField()
+
+
 class ConversationSerializer(serializers.ModelSerializer):
-    participants = PublicUserSerializer(many=True, read_only=True)
+    participants = ChatParticipantSerializer(many=True, read_only=True)
     latest_message = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
 

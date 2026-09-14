@@ -3,6 +3,7 @@ from io import BytesIO
 import shutil
 import tempfile
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -12,7 +13,7 @@ from PIL import Image
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from .models import Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message, Notification, Post, PostLikeReward, PostShareClick, Quest, QuestSubmission
+from .models import Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message, Notification, Post, PostLikeReward, PostShareClick, Quest, QuestSubmission, UserPresence
 from .media import MAX_IMAGE_DIMENSION, compress_image_upload
 
 User = get_user_model()
@@ -545,3 +546,200 @@ class SocialQuestFlowTests(TestCase):
         self.assertLess(compressed.size, upload.size)
         with Image.open(compressed) as result:
             self.assertLessEqual(max(result.size), MAX_IMAGE_DIMENSION)
+
+
+class AuditRegressionTests(TestCase):
+    def setUp(self):
+        self.host = User.objects.create_user('audit-host')
+        self.guest = User.objects.create_user('audit-guest')
+        self.other = User.objects.create_user('audit-other')
+        self.client = APIClient()
+        self.client.force_authenticate(self.host)
+        self.event = Event.objects.create(host=self.host, name='Audit walk', description='Meet nearby.', location_name='Park', starts_at=timezone.now()-timedelta(hours=1), ends_at=timezone.now()+timedelta(hours=1), capacity=2)
+
+    def test_profile_updates_validate_length_and_image(self):
+        self.assertEqual(self.client.patch('/api/people/me/', {'display_name': 'x'*81}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch('/api/people/me/', {'avatar': SimpleUploadedFile('bad.txt', b'not an image', content_type='text/plain')}, format='multipart').status_code, 400)
+        self.host.profile.refresh_from_db()
+        self.assertEqual(self.host.profile.display_name, 'audit-host')
+        self.assertEqual(self.client.patch('/api/people/me/', {'city': 'Bengaluru'}, format='json').status_code, 200)
+
+    def test_partial_event_updates_validate_both_dates_and_capacity(self):
+        url = f'/api/events/{self.event.id}/'
+        self.assertEqual(self.client.patch(url, {'ends_at': (self.event.starts_at-timedelta(hours=1)).isoformat()}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(url, {'starts_at': (self.event.ends_at+timedelta(hours=1)).isoformat()}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(url, {'capacity': 0}, format='json').status_code, 400)
+
+    def test_proof_review_is_accessible_only_to_host_and_cannot_repeat_xp(self):
+        quest = Quest.objects.create(event=self.event, kind='MAIN', title='Meet', instructions='Say hello', xp_reward=120)
+        proof = QuestSubmission.objects.create(quest=quest, participant=self.guest, media='quest_proofs/example.jpg', media_type='IMAGE')
+        url = f'/api/events/{self.event.id}/submissions/'
+        result = self.client.get(url)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.data[0]['quest_title'], 'Meet')
+        review = f'/api/submissions/{proof.id}/review/'
+        self.assertEqual(self.client.post(review, {'decision':'APPROVED'}, format='json').status_code, 200)
+        self.assertEqual(self.client.post(review, {'decision':'REJECTED'}, format='json').status_code, 400)
+        self.assertEqual(self.client.post(review, {'decision':'APPROVED'}, format='json').status_code, 200)
+        self.guest.profile.refresh_from_db()
+        self.assertEqual(self.guest.profile.total_xp, 120)
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self.assertEqual(self.client.post(review, {'decision':'APPROVED'}, format='json').status_code, 403)
+
+    def test_duplicate_proof_returns_validation_error(self):
+        quest = Quest.objects.create(event=self.event, kind='MAIN', title='Meet', instructions='Say hello')
+        Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        QuestSubmission.objects.create(quest=quest, participant=self.guest, media='quest_proofs/example.jpg', media_type='IMAGE')
+        self.client.force_authenticate(self.guest)
+        response = self.client.post('/api/submissions/', {'quest':quest.id, 'media_type':'IMAGE', 'media':SimpleUploadedFile('proof.jpg', b'photo', content_type='image/jpeg')}, format='multipart')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(QuestSubmission.objects.count(), 1)
+
+    def test_unread_count_includes_every_page_and_empty_ids_mark_nothing(self):
+        Notification.objects.bulk_create([Notification(recipient=self.host, kind='MESSAGE') for _ in range(26)])
+        self.assertEqual(self.client.get('/api/notifications/unread-count/').data['count'], 26)
+        self.assertEqual(self.client.post('/api/notifications/mark-read/', {'ids':[]}, format='json').data['marked_read'], 0)
+        self.assertEqual(self.client.post('/api/notifications/mark-read/', {'ids':'bad'}, format='json').status_code, 400)
+        self.assertEqual(self.client.post('/api/notifications/mark-read/', {}, format='json').data['marked_read'], 26)
+
+    def test_repeated_rsvp_review_is_idempotent_at_capacity(self):
+        first = Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        Attendance.objects.create(event=self.event, user=self.other, status='ACCEPTED')
+        url = f'/api/events/{self.event.id}/review-request/'
+        payload = {'attendance_id':first.id, 'decision':'ACCEPTED'}
+        self.assertEqual(self.client.post(url, payload, format='json').status_code, 200)
+        for decision in ['DENIED','ACCEPTED','DENIED','ACCEPTED']:
+            self.assertEqual(self.client.post(url, {**payload,'decision':decision}, format='json').status_code, 200)
+
+    def test_reel_rejects_image_and_post_rejects_non_media(self):
+        self.assertEqual(self.client.post('/api/posts/', {'kind':'REEL','media':SimpleUploadedFile('photo.jpg', b'photo', content_type='image/jpeg')}, format='multipart').status_code, 400)
+        self.assertEqual(self.client.post('/api/posts/', {'body':'Text','media':SimpleUploadedFile('test.html', b'<script></script>', content_type='text/html')}, format='multipart').status_code, 400)
+
+    def test_generated_quests_have_bounded_fields_and_distinct_fallbacks(self):
+        from .ai import _fallback_main_quest, _fallback_side_quests, _validated_quests
+        self.event.name = 'x'*120
+        self.assertLessEqual(len(_fallback_main_quest(self.event)[0]['title']), 120)
+        for number in range(1, 30):
+            quests = _fallback_side_quests(number)
+            self.assertNotEqual(quests[0]['instructions'], quests[1]['instructions'])
+        with self.assertRaises(ValueError):
+            _validated_quests([{'kind':'MAIN','title':'Test','instructions':'Test','xp_reward':-1}], 'MAIN', 1, 100, 150)
+
+    def test_private_event_content_is_limited_to_host_and_accepted_guests(self):
+        self.event.privacy = Event.Privacy.PRIVATE
+        self.event.save()
+        post = Post.objects.create(event=self.event, author=self.host, body='Private event moment')
+        Comment.objects.create(post=post, author=self.host, body='Private reply')
+        Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        for user in [None, self.other]:
+            self.client.force_authenticate(user)
+            self.assertEqual(self.client.get(f'/api/events/{self.event.id}/').status_code, 404)
+            self.assertEqual(self.client.get(f'/api/posts/{post.id}/').status_code, 404)
+            self.assertEqual(self.client.get(f'/api/comments/?post={post.id}').data['count'], 0)
+        self.assertEqual(self.client.post('/api/comments/', {'post':post.id, 'body':'Uninvited'}, format='json').status_code, 404)
+        self.client.force_authenticate(self.guest)
+        self.assertEqual(self.client.get(f'/api/events/{self.event.id}/').status_code, 200)
+        self.assertEqual(self.client.get(f'/api/posts/{post.id}/').status_code, 200)
+        self.assertEqual(self.client.get(f'/api/comments/?post={post.id}').data['count'], 1)
+
+
+class PeopleAndPresenceTests(TestCase):
+    def setUp(self):
+        self.alex = User.objects.create_user('alex', password='test-password')
+        self.sam = User.objects.create_user('sam', password='test-password')
+        self.jordan = User.objects.create_user('jordan', password='test-password')
+        self.client = APIClient()
+        self.client.force_authenticate(self.alex)
+        self.chat = Conversation.objects.create(direct_key=f'direct:{self.alex.id}:{self.sam.id}')
+        self.chat.participants.add(self.alex, self.sam)
+
+    def sam_is_online(self):
+        response = self.client.get(f'/api/conversations/{self.chat.id}/')
+        self.assertEqual(response.status_code, 200)
+        return next(person['is_online'] for person in response.data['participants'] if person['id'] == self.sam.id)
+
+    def test_relationship_lists_have_correct_direction_and_follow_state(self):
+        Follow.objects.create(follower=self.sam, following=self.alex)
+        Follow.objects.create(follower=self.alex, following=self.jordan)
+        followers = self.client.get(f'/api/people/{self.alex.id}/followers/').data['results']
+        following = self.client.get(f'/api/people/{self.alex.id}/following/').data['results']
+        self.assertEqual([person['id'] for person in followers], [self.sam.id])
+        self.assertEqual([person['id'] for person in following], [self.jordan.id])
+        self.assertFalse(followers[0]['is_followed_by_me'])
+        self.assertTrue(following[0]['is_followed_by_me'])
+        self.assertEqual(self.client.get(f'/api/people/{self.jordan.id}/following/').data['results'], [])
+        self.client.delete(f'/api/people/{self.jordan.id}/follow/')
+        self.assertEqual(self.client.get(f'/api/people/{self.alex.id}/following/').data['count'], 0)
+        self.assertEqual(self.client.get('/api/people/me/').data['following_count'], 0)
+
+    def test_relationship_search_filters_members_not_profile_owner_and_paginates(self):
+        for index in range(23):
+            follower = User.objects.create_user(f'member{index:02}')
+            Follow.objects.create(follower=follower, following=self.alex)
+        response = self.client.get(f'/api/people/{self.alex.id}/followers/')
+        self.assertEqual(response.data['count'], 23)
+        self.assertEqual(len(response.data['results']), 20)
+        self.assertIsNotNone(response.data['next'])
+        self.assertEqual(len(self.client.get(response.data['next']).data['results']), 3)
+        response = self.client.get(f'/api/people/{self.alex.id}/followers/?q=member22')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([person['username'] for person in response.data['results']], ['member22'])
+        self.assertEqual(self.client.get('/api/people/999999/followers/').status_code, 404)
+        self.assertEqual(self.client.get('/api/people/invalid/followers/').status_code, 404)
+
+    def test_search_and_counts_exclude_inactive_people(self):
+        self.sam.profile.display_name = 'Sunny Sam'
+        self.sam.profile.save()
+        self.jordan.is_active = False
+        self.jordan.save()
+        Follow.objects.create(follower=self.alex, following=self.jordan)
+        response = self.client.get('/api/people/?q=SUNNY')
+        self.assertEqual([person['id'] for person in response.data['results']], [self.sam.id])
+        self.assertEqual(self.client.get('/api/people/?q=@sam').data['results'][0]['id'], self.sam.id)
+        self.assertEqual(self.client.get('/api/people/?q=jordan').data['count'], 0)
+        self.assertEqual(self.client.get('/api/people/me/').data['following_count'], 0)
+
+    def test_presence_requires_authentication_and_valid_session(self):
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.put('/api/people/presence/', {'session_id': str(uuid4())}, format='json').status_code, 401)
+        self.client.force_authenticate(self.alex)
+        self.assertEqual(self.client.put('/api/people/presence/', {'session_id': 'invalid'}, format='json').status_code, 400)
+        self.assertEqual(self.client.put('/api/people/presence/', {}, format='json').status_code, 400)
+        self.assertFalse(UserPresence.objects.exists())
+
+    def test_presence_expires_without_heartbeat_and_public_profiles_do_not_expose_it(self):
+        now = timezone.now()
+        self.assertFalse(self.sam_is_online())
+        UserPresence.objects.create(user=self.sam, session_id=uuid4(), last_seen=now)
+        self.assertTrue(self.sam_is_online())
+        with patch('core.serializers.timezone.now', return_value=now + UserPresence.TIMEOUT):
+            self.assertFalse(self.sam_is_online())
+        self.assertNotIn('is_online', self.client.get(f'/api/people/{self.sam.id}/').data)
+        self.client.force_authenticate(self.jordan)
+        self.assertEqual(self.client.get(f'/api/conversations/{self.chat.id}/').status_code, 404)
+
+    def test_presence_heartbeat_is_idempotent_and_devices_are_independent(self):
+        first, second = str(uuid4()), str(uuid4())
+        self.client.force_authenticate(self.sam)
+        for session_id in [first, first, second]:
+            response = self.client.put('/api/people/presence/', {'session_id': session_id}, format='json')
+            self.assertEqual(response.status_code, 204)
+        self.assertEqual(UserPresence.objects.filter(user=self.sam).count(), 2)
+        self.client.delete('/api/people/presence/', {'session_id': first}, format='json')
+        self.client.force_authenticate(self.alex)
+        self.assertTrue(self.sam_is_online())
+        self.client.delete('/api/people/presence/', {'session_id': second}, format='json')
+        self.assertTrue(self.sam_is_online(), 'Another user must not clear Sam’s session')
+        self.client.force_authenticate(self.sam)
+        self.client.delete('/api/people/presence/', {'session_id': second}, format='json')
+        self.client.force_authenticate(self.alex)
+        self.assertFalse(self.sam_is_online())
+
+    def test_logout_clears_presence_and_background_reads_do_not_mark_online(self):
+        UserPresence.objects.create(user=self.alex, session_id=uuid4())
+        self.assertEqual(self.client.post('/api/auth/logout/').status_code, 204)
+        self.assertFalse(UserPresence.objects.filter(user=self.alex).exists())
+        self.client.get('/api/notifications/')
+        self.client.get('/api/people/me/')
+        self.assertFalse(UserPresence.objects.filter(user=self.alex).exists())

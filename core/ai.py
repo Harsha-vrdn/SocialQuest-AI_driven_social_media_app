@@ -11,7 +11,7 @@ def _read_json(response):
 def _fallback_main_quest(event):
     return [{
         "kind": "MAIN",
-        "title": f"Find your crew at {event.name.strip()}",
+        "title": f"Find your crew at {event.name.strip()}"[:120],
         "instructions": "Introduce yourself to two new people and capture one shared photo that celebrates the moment.",
         "xp_reward": 120,
         "position": 1,
@@ -39,7 +39,7 @@ def _fallback_side_quests(participant_number):
         "Make a quick collaborative idea, sketch, or list with someone you just met.",
     ]
     first = (participant_number - 1) % len(lenses)
-    second = (participant_number * 5 + 3) % len(lenses)
+    second = (first + 5) % len(lenses)
     return [
         {
             "kind": "SIDE",
@@ -56,6 +56,24 @@ def _fallback_side_quests(participant_number):
             "position": 2,
         },
     ]
+
+
+def _validated_quests(quests, kind, count, minimum_xp, maximum_xp):
+    if not isinstance(quests, list) or len(quests) != count:
+        raise ValueError("Invalid quest count")
+    result = []
+    for position, quest in enumerate(quests, start=1):
+        if not isinstance(quest, dict) or quest.get("kind") != kind:
+            raise ValueError("Invalid quest type")
+        title, instructions, reward = quest.get("title"), quest.get("instructions"), quest.get("xp_reward")
+        if not isinstance(title, str) or not title.strip() or len(title) > 120:
+            raise ValueError("Invalid quest title")
+        if not isinstance(instructions, str) or not instructions.strip() or len(instructions) > 1000:
+            raise ValueError("Invalid quest instructions")
+        if type(reward) is not int or not minimum_xp <= reward <= maximum_xp:
+            raise ValueError("Invalid quest reward")
+        result.append({"kind": kind, "title": title.strip(), "instructions": instructions.strip(), "xp_reward": reward, "position": position})
+    return result
 
 
 def generate_quests(event):
@@ -75,7 +93,7 @@ def generate_quests(event):
             "description": event.description,
             "location": event.location_name,
         })
-        quests = _read_json(response)
+        quests = _validated_quests(_read_json(response), "MAIN", 1, 100, 150)
         if len(quests) != 1 or quests[0].get("kind") != "MAIN":
             raise ValueError("Invalid main quest shape")
         return quests
@@ -103,7 +121,7 @@ def generate_side_quests(event, participant, participant_number, existing_titles
             "participant_number": participant_number,
             "existing_titles": "; ".join(existing_titles) or "None",
         })
-        quests = _read_json(response)
+        quests = _validated_quests(_read_json(response), "SIDE", 2, 30, 80)
         normalized_titles = {title.strip().lower() for title in existing_titles}
         if len(quests) != 2 or any(quest.get("kind") != "SIDE" for quest in quests):
             raise ValueError("Invalid side quest shape")

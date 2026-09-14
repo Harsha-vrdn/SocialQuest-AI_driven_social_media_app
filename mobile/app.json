@@ -14,10 +14,6 @@
       "package": "com.socialquest.app",
       "softwareKeyboardLayoutMode": "resize"
     },
-    "androidNavigationBar": {
-      "backgroundColor": "#ffffff",
-      "barStyle": "dark-content"
-    },
     "plugins": [
       [
         "expo-image-picker",
@@ -33,7 +29,21 @@
         }
       ],
       "expo-font",
-      "expo-asset"
+      "expo-asset",
+      [
+        "expo-status-bar",
+        {
+          "style": "light"
+        }
+      ],
+      "expo-video",
+      [
+        "expo-navigation-bar",
+        {
+          "style": "light",
+          "enforceContrast": false
+        }
+      ]
     ],
     "extra": {}
   }

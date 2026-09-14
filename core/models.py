@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 from django.db.models import Sum
 from django.utils import timezone
+from datetime import timedelta
 
 
 class Profile(models.Model):
@@ -17,6 +18,18 @@ class Profile(models.Model):
 
     def __str__(self):
         return self.display_name or self.user.username
+
+
+class UserPresence(models.Model):
+    """A foreground client lease; another device can stay online independently."""
+    TIMEOUT = timedelta(seconds=60)
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="presence_sessions")
+    session_id = models.UUIDField()
+    last_seen = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "session_id"], name="unique_user_presence_session")]
 
 
 class Follow(models.Model):

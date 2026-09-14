@@ -7,20 +7,20 @@ from django.utils import timezone
 from uuid import uuid4
 from rest_framework import permissions, status, viewsets
 from rest_framework.authentication import TokenAuthentication
-from rest_framework.exceptions import MethodNotAllowed, PermissionDenied
+from rest_framework.exceptions import MethodNotAllowed, PermissionDenied, ValidationError
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action
+from rest_framework.generics import get_object_or_404 as get_api_object_or_404
 from rest_framework.response import Response
 from .ai import generate_quests, generate_side_quests
-from .media import compress_image_upload
 from .models import (Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
-                     Notification, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission)
-from .permissions import IsHostOrReadOnly
+                     Notification, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission, UserPresence)
+from .permissions import IsHostOrReadOnly, visible_events, visible_posts
 from .recommendations import rank_events, rank_posts
 from .serializers import (AttendanceSerializer, EventSerializer, KarmaRatingSerializer,
                           CommentSerializer, ConversationSerializer, MessageSerializer,
                           NotificationSerializer, PostSerializer, PublicUserSerializer, QuestSerializer,
-                          QuestSubmissionSerializer, RegisterSerializer)
+                          QuestSubmissionSerializer, RegisterSerializer, ProfileUpdateSerializer, PresenceSerializer)
 
 User = get_user_model()
 
@@ -44,7 +44,7 @@ def create_participant_side_quests(event, participant, participant_number=None):
 
 def shared_post_link(request, post_id, shared_caption=None):
     """Reward a post author for one unique shared-link visit, then open the post."""
-    post = get_object_or_404(Post, id=post_id)
+    post = get_object_or_404(visible_posts(request.user), id=post_id)
     visitor_id = request.COOKIES.get("socialquest_share_visitor") or uuid4().hex
     with transaction.atomic():
         _, created = PostShareClick.objects.get_or_create(post=post, visitor_id=visitor_id)
@@ -80,6 +80,7 @@ class AuthViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def logout(self, request):
+        UserPresence.objects.filter(user=request.user).delete()
         Token.objects.filter(user=request.user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -89,7 +90,7 @@ class EventViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsHostOrReadOnly]
 
     def get_queryset(self):
-        queryset = Event.objects.select_related("host", "host__profile").prefetch_related("attendances")
+        queryset = visible_events(self.request.user).select_related("host", "host__profile").prefetch_related("attendances")
         host_id = self.request.query_params.get("host")
         participant_id = self.request.query_params.get("participant")
         if host_id and host_id.isdigit():
@@ -172,8 +173,10 @@ class EventViewSet(viewsets.ModelViewSet):
         return Response(AttendanceSerializer(accepted, many=True, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], url_path="review-request", permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
     def review_request(self, request, pk=None):
         event = self.get_object()
+        event = Event.objects.select_for_update().get(pk=event.pk)
         if event.host != request.user:
             return Response({"detail": "Only the host can approve requests."}, status=403)
         attendance = get_object_or_404(event.attendances, id=request.data.get("attendance_id"))
@@ -182,7 +185,7 @@ class EventViewSet(viewsets.ModelViewSet):
             return Response({"detail": "decision must be ACCEPTED or DENIED."}, status=400)
         if event.is_finished and decision == Attendance.Status.ACCEPTED:
             return Response({"detail": "The attendee list is closed because the event has ended."}, status=400)
-        if decision == Attendance.Status.ACCEPTED and event.attendances.filter(status=Attendance.Status.ACCEPTED).count() >= event.capacity:
+        if decision == Attendance.Status.ACCEPTED and attendance.status != decision and event.attendances.filter(status=Attendance.Status.ACCEPTED).count() >= event.capacity:
             return Response({"detail": "This event is at capacity."}, status=400)
         status_changed = attendance.status != decision
         attendance.status = decision
@@ -191,7 +194,7 @@ class EventViewSet(viewsets.ModelViewSet):
             create_participant_side_quests(event, attendance.user)
         if status_changed:
             kind = Notification.Kind.RSVP_ACCEPTED if decision == Attendance.Status.ACCEPTED else Notification.Kind.RSVP_DENIED
-            Notification.objects.create(recipient=attendance.user, actor=request.user, attendance=attendance, kind=kind)
+            Notification.objects.update_or_create(recipient=attendance.user, attendance=attendance, kind=kind, defaults={"actor": request.user, "read_at": None})
         return Response(AttendanceSerializer(attendance, context={"request": request}).data)
 
     @action(detail=True, methods=["get"], permission_classes=[permissions.AllowAny])
@@ -206,6 +209,14 @@ class EventViewSet(viewsets.ModelViewSet):
         else:
             quests = event.quests.filter(kind=Quest.Kind.MAIN)
         return Response(QuestSerializer(quests, many=True, context={"request": request}).data)
+
+    @action(detail=True, methods=["get"], permission_classes=[permissions.IsAuthenticated])
+    def submissions(self, request, pk=None):
+        event = self.get_object()
+        if event.host_id != request.user.id:
+            raise PermissionDenied("Only the host can review event proof.")
+        proofs = QuestSubmission.objects.filter(quest__event=event).select_related("quest", "participant__profile").order_by("submitted_at", "id")
+        return Response(QuestSubmissionSerializer(proofs, many=True, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], url_path="generate-quests", permission_classes=[permissions.IsAuthenticated])
     def generate_event_quests(self, request, pk=None):
@@ -241,20 +252,20 @@ class QuestSubmissionViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         quest = serializer.validated_data["quest"]
         if not quest.event.quests_are_active:
-            from rest_framework.exceptions import ValidationError
             raise ValidationError("Quest proof can only be submitted while the event is in progress.")
         accepted = Attendance.objects.filter(event=quest.event, user=self.request.user, status=Attendance.Status.ACCEPTED).exists()
         if not accepted:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You must be accepted into the event before submitting a quest.")
         if quest.kind == Quest.Kind.SIDE and quest.assigned_to_id != self.request.user.id:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("This side quest is assigned to a different participant.")
         media = serializer.validated_data["media"]
         if media.size > 50 * 1024 * 1024:
-            from rest_framework.exceptions import ValidationError
             raise ValidationError("Proof uploads must be smaller than 50 MB.")
         with transaction.atomic():
+            # Lock the participant so duplicate uploads cannot race the unique constraint.
+            User.objects.select_for_update().get(pk=self.request.user.pk)
+            if QuestSubmission.objects.filter(quest=quest, participant=self.request.user).exists():
+                raise ValidationError("You have already submitted proof for this quest.")
             submission = serializer.save(participant=self.request.user)
             Post.objects.create(
                 author=self.request.user,
@@ -275,14 +286,14 @@ class QuestSubmissionViewSet(viewsets.ModelViewSet):
         if decision not in (QuestSubmission.Status.APPROVED, QuestSubmission.Status.REJECTED):
             return Response({"detail": "decision must be APPROVED or REJECTED."}, status=400)
         with transaction.atomic():
-            submission.refresh_from_db()
+            submission = QuestSubmission.objects.select_for_update().select_related("quest").get(pk=submission.pk)
+            if submission.status == QuestSubmission.Status.APPROVED and decision != submission.status:
+                return Response({"detail": "Approved proof cannot be reversed after XP has been awarded."}, status=400)
             earned = decision == QuestSubmission.Status.APPROVED and submission.status != QuestSubmission.Status.APPROVED
             submission.status, submission.reviewed_at = decision, timezone.now()
             submission.save(update_fields=["status", "reviewed_at"])
             if earned:
-                profile = submission.participant.profile
-                profile.total_xp += submission.quest.xp_reward
-                profile.save(update_fields=["total_xp"])
+                Profile.objects.filter(user=submission.participant).update(total_xp=F("total_xp") + submission.quest.xp_reward)
         return Response(QuestSubmissionSerializer(submission, context={"request": request}).data)
 
 
@@ -298,14 +309,11 @@ class KarmaRatingViewSet(viewsets.ModelViewSet):
 
     def _validate_rating_participants(self, event, target):
         if not event.is_finished:
-            from rest_framework.exceptions import ValidationError
             raise ValidationError("Karma opens after the event has ended.")
         if target == self.request.user:
-            from rest_framework.exceptions import ValidationError
             raise ValidationError("Choose another person who attended this event.")
         attendees = Attendance.objects.filter(event=event, status=Attendance.Status.ACCEPTED)
         if not attendees.filter(user=self.request.user).exists() or not attendees.filter(user=target).exists():
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You can only rate another accepted attendee from this event.")
 
     def create(self, request, *args, **kwargs):
@@ -332,8 +340,8 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        queryset = User.objects.select_related("profile").all()
-        query = self.request.query_params.get("q", "").strip()[:100]
+        queryset = User.objects.select_related("profile").filter(is_active=True)
+        query = self.request.query_params.get("q", "").strip()[:100].lstrip("@")
         if query:
             queryset = queryset.filter(
                 Q(username__icontains=query)
@@ -345,12 +353,9 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=["get", "patch"], permission_classes=[permissions.IsAuthenticated])
     def me(self, request):
         if request.method == "PATCH":
-            profile = request.user.profile
-            for field in ("display_name", "bio", "city", "avatar"):
-                if field in request.data:
-                    value = request.data[field]
-                    setattr(profile, field, compress_image_upload(value) if field == "avatar" else value)
-            profile.save()
+            serializer = ProfileUpdateSerializer(request.user.profile, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         return Response(PublicUserSerializer(request.user, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
@@ -373,13 +378,47 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = self.get_queryset().filter(id__in=following_ids)
         return Response(PublicUserSerializer(queryset, many=True, context={"request": request}).data)
 
+    def relationship_list(self, person, relationship):
+        if relationship == "followers":
+            user_ids = person.follower_relations.values_list("follower_id", flat=True)
+        else:
+            user_ids = person.following_relations.values_list("following_id", flat=True)
+        queryset = self.get_queryset().filter(id__in=user_ids)
+        page = self.paginate_queryset(queryset)
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="followers")
+    def followers(self, request, pk=None):
+        person = get_api_object_or_404(User, pk=pk, is_active=True)
+        return self.relationship_list(person, "followers")
+
+    @action(detail=True, methods=["get"], url_path="following")
+    def following_list(self, request, pk=None):
+        person = get_api_object_or_404(User, pk=pk, is_active=True)
+        return self.relationship_list(person, "following")
+
+    @action(detail=False, methods=["put", "delete"], permission_classes=[permissions.IsAuthenticated])
+    def presence(self, request):
+        serializer = PresenceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        session_id = serializer.validated_data["session_id"]
+        if request.method == "DELETE":
+            UserPresence.objects.filter(user=request.user, session_id=session_id).delete()
+        else:
+            now = timezone.now()
+            UserPresence.objects.filter(last_seen__lte=now - UserPresence.TIMEOUT).delete()
+            UserPresence.objects.update_or_create(
+                user=request.user, session_id=session_id, defaults={"last_seen": now},
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class PostViewSet(viewsets.ModelViewSet):
     serializer_class = PostSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
     def get_queryset(self):
-        queryset = Post.objects.select_related("author", "author__profile", "event", "quest").prefetch_related("likes", "comments").all()
+        queryset = visible_posts(self.request.user).select_related("author", "author__profile", "event", "quest").prefetch_related("likes", "comments")
         author_id = self.request.query_params.get("author")
         kind = self.request.query_params.get("kind")
         event_id = self.request.query_params.get("event")
@@ -394,23 +433,19 @@ class PostViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         event = serializer.validated_data.get("event")
         if event and event.host_id != self.request.user.id and not Attendance.objects.filter(event=event, user=self.request.user, status=Attendance.Status.ACCEPTED).exists():
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only accepted participants can add a moment to this event.")
         serializer.save(author=self.request.user)
 
     def perform_update(self, serializer):
         if self.get_object().author != self.request.user:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You can only edit your own post.")
         event = serializer.validated_data.get("event", self.get_object().event)
         if event and event.host_id != self.request.user.id and not Attendance.objects.filter(event=event, user=self.request.user, status=Attendance.Status.ACCEPTED).exists():
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only accepted participants can add a moment to this event.")
         serializer.save()
 
     def perform_destroy(self, instance):
         if instance.author != self.request.user:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You can only delete your own post.")
         instance.delete()
 
@@ -452,11 +487,12 @@ class CommentViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        queryset = Comment.objects.select_related("author", "author__profile", "post")
+        queryset = Comment.objects.filter(post__in=visible_posts(self.request.user)).select_related("author", "author__profile", "post")
         post_id = self.request.query_params.get("post")
         return queryset.filter(post_id=post_id) if post_id else queryset
 
     def perform_create(self, serializer):
+        get_object_or_404(visible_posts(self.request.user), pk=serializer.validated_data["post"].pk)
         serializer.save(author=self.request.user)
 
     def perform_update(self, serializer):
@@ -478,7 +514,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        return Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user).prefetch_related("participants", "messages").order_by("-created_at")
+        return Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user).prefetch_related("participants__profile", "participants__presence_sessions", "messages").order_by("-created_at")
 
     def create(self, request, *args, **kwargs):
         raise MethodNotAllowed("POST")
@@ -578,7 +614,13 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     def mark_read(self, request):
         ids = request.data.get("ids")
         queryset = self.get_queryset().filter(read_at__isnull=True)
-        if ids:
+        if ids is not None:
+            if not isinstance(ids, list) or any(not isinstance(value, int) or isinstance(value, bool) for value in ids):
+                raise ValidationError({"ids": "Provide a list of notification IDs."})
             queryset = queryset.filter(id__in=ids)
         updated = queryset.update(read_at=timezone.now())
         return Response({"marked_read": updated})
+
+    @action(detail=False, methods=["get"], url_path="unread-count")
+    def unread_count(self, request):
+        return Response({"count": self.get_queryset().filter(read_at__isnull=True).count()})
