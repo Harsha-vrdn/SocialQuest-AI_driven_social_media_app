@@ -7,7 +7,7 @@ SocialQuest is a full-stack MVP for turning real-world events into low-pressure 
 - Events: users can host events, manage capacity, and review every join request.
 - Public social reputation: XP is earned only when a host approves quest proof; karma is a separate total of post-event peer reactions (+1 Like, −1 Dislike, or 0 None).
 - Quests: hosts can generate one main quest and two side quests from an event name and description. With `OPENAI_API_KEY`, this goes through LangChain; without it, a safe local generator keeps development working.
-- Proof: accepted attendees upload a photo (`IMAGE`) or video/reel (`REEL`) for each quest. Hosts approve or reject it.
+- Proof: accepted attendees upload a photo (`IMAGE`) or video/reel (`REEL`) for each quest. 
 - Social graph: public profiles, follower/following counts, and follow/unfollow endpoints.
 - Sharing and bonuses: posts, reels, events, and profiles have shareable links. A new, non-self like awards the post author +1 XP; the first visit from each browser/device to a shared post link awards +5 XP.
 - Clients: desktop/mobile responsive web UI and an Expo app configured for both iOS and Android.
