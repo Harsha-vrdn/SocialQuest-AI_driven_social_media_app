@@ -26,8 +26,6 @@ cp .env.example .env
 
 Open `http://127.0.0.1:8000/`. The home route sends unsigned-in visitors to `http://127.0.0.1:8000/login/`; after login or registration, they are taken directly to the community Home feed.
 
-Dark mode is available from the moon toggle in the web navigation (and on the login page). The setting is stored locally and follows the device preference until the user makes a choice.
-
 For AI quest generation, add `OPENAI_API_KEY` to `.env`. The generator deliberately instructs the model to produce inclusive, low-risk prompts and falls back to a deterministic set if the AI response is invalid or unavailable.
 
 ## Run the mobile app
