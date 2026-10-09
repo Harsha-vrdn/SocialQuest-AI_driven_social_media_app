@@ -1,20 +1,20 @@
 from django.contrib.auth import authenticate, get_user_model
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import BooleanField, Count, Exists, F, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
+from django.db.models.functions import Coalesce
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 from rest_framework import permissions, status, viewsets
-from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import MethodNotAllowed, PermissionDenied, ValidationError
-from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action
 from rest_framework.generics import get_object_or_404 as get_api_object_or_404
 from rest_framework.response import Response
 from .ai import generate_quests, generate_side_quests
-from .models import (Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
-                     Notification, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission, UserPresence)
+from .authentication import SessionTokenAuthentication
+from .models import (AuthSession, Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
+                     Notification, NotificationDevice, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission, UserPresence)
 from .permissions import IsHostOrReadOnly, visible_events, visible_posts
 from .recommendations import rank_events, rank_posts
 from .serializers import (AttendanceSerializer, EventSerializer, KarmaRatingSerializer,
@@ -23,6 +23,17 @@ from .serializers import (AttendanceSerializer, EventSerializer, KarmaRatingSeri
                           QuestSubmissionSerializer, RegisterSerializer, ProfileUpdateSerializer, PresenceSerializer)
 
 User = get_user_model()
+
+
+def with_public_user_stats(queryset, viewer):
+    karma = KarmaRating.objects.filter(target_id=OuterRef("pk")).values("target_id").annotate(total=Sum("score")).values("total")
+    followed = Exists(Follow.objects.filter(follower=viewer, following_id=OuterRef("pk"))) if viewer.is_authenticated else Value(False, output_field=BooleanField())
+    return queryset.select_related("profile").annotate(
+        follower_count_value=Count("follower_relations", filter=Q(follower_relations__follower__is_active=True), distinct=True),
+        following_count_value=Count("following_relations", filter=Q(following_relations__following__is_active=True), distinct=True),
+        karma_value=Coalesce(Subquery(karma, output_field=IntegerField()), Value(0)),
+        is_followed_value=followed,
+    )
 
 
 def direct_conversation_key(first_user_id, second_user_id):
@@ -59,7 +70,7 @@ class AuthViewSet(viewsets.ViewSet):
     # The app uses API tokens for authentication.  Do not let an unrelated
     # browser Django session apply SessionAuthentication's CSRF requirement to
     # login/register requests.
-    authentication_classes = [TokenAuthentication]
+    authentication_classes = [SessionTokenAuthentication]
     permission_classes = [permissions.AllowAny]
 
     @action(detail=False, methods=["post"])
@@ -67,7 +78,7 @@ class AuthViewSet(viewsets.ViewSet):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        token, _ = Token.objects.get_or_create(user=user)
+        token = AuthSession.objects.create(user=user)
         return Response({"token": token.key, "user": PublicUserSerializer(user, context={"request": request}).data}, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"])
@@ -75,13 +86,16 @@ class AuthViewSet(viewsets.ViewSet):
         user = authenticate(username=request.data.get("username", ""), password=request.data.get("password", ""))
         if not user:
             return Response({"detail": "Invalid username or password."}, status=status.HTTP_400_BAD_REQUEST)
-        token, _ = Token.objects.get_or_create(user=user)
+        token = AuthSession.objects.create(user=user)
         return Response({"token": token.key, "user": PublicUserSerializer(user, context={"request": request}).data})
 
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def logout(self, request):
-        UserPresence.objects.filter(user=request.user).delete()
-        Token.objects.filter(user=request.user).delete()
+        # Only revoke the credential presented by this client. Presence and
+        # notification registrations belong to each client and are released by
+        # that client before this request.
+        if isinstance(request.auth, AuthSession):
+            request.auth.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -90,12 +104,17 @@ class EventViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsHostOrReadOnly]
 
     def get_queryset(self):
-        queryset = visible_events(self.request.user).select_related("host", "host__profile").prefetch_related("attendances")
+        hosts = with_public_user_stats(User.objects.all(), self.request.user)
+        queryset = visible_events(self.request.user).prefetch_related(Prefetch("host", queryset=hosts), "attendances", "quests")
         host_id = self.request.query_params.get("host")
         participant_id = self.request.query_params.get("participant")
-        if host_id and host_id.isdigit():
+        if host_id:
+            if not host_id.isdigit():
+                return queryset.none()
             queryset = queryset.filter(host_id=host_id)
-        if participant_id and participant_id.isdigit():
+        if participant_id:
+            if not participant_id.isdigit():
+                return queryset.none()
             queryset = queryset.filter(
                 attendances__user_id=participant_id,
                 attendances__status=Attendance.Status.ACCEPTED,
@@ -131,33 +150,124 @@ class EventViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Latitude must be between -90 and 90."}, status=status.HTTP_400_BAD_REQUEST)
         if longitude is not None and not -180 <= longitude <= 180:
             return Response({"detail": "Longitude must be between -180 and 180."}, status=status.HTTP_400_BAD_REQUEST)
+        invited = list(self.get_queryset().filter(
+            ends_at__gt=timezone.now(),
+            attendances__user=request.user,
+            attendances__status=Attendance.Status.INVITED,
+        ))
         ranked = rank_events(request.user, latitude=latitude, longitude=longitude)
-        payload = EventSerializer([event for _, event, _ in ranked], many=True, context={"request": request}).data
-        for item, (_, _, reason) in zip(payload, ranked):
+        events = invited + [event for _, event, _ in ranked]
+        reasons = ["You were invited"] * len(invited) + [reason for _, _, reason in ranked]
+        payload = EventSerializer(events, many=True, context={"request": request}).data
+        for item, reason in zip(payload, reasons):
             item["recommendation_reason"] = reason
         return Response(payload)
 
     @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
     def join(self, request, pk=None):
-        event = self.get_object()
+        visible_event = self.get_object()
+        event = Event.objects.select_for_update().get(pk=visible_event.pk)
         if event.host == request.user:
             return Response({"detail": "Hosts are already part of their event."}, status=400)
         if event.is_finished:
             return Response({"detail": "Join requests close when the event ends."}, status=400)
-        existing = Attendance.objects.filter(event=event, user=request.user).first()
-        if existing:
+        note = str(request.data.get("note", "") or "").strip()[:240]
+        existing = Attendance.objects.select_for_update().filter(event=event, user=request.user).first()
+        if existing and existing.status in (Attendance.Status.PENDING, Attendance.Status.ACCEPTED):
             return Response(AttendanceSerializer(existing, context={"request": request}).data)
-        with transaction.atomic():
-            active_rsvps = Attendance.objects.select_for_update().filter(
-                user=request.user,
-                status__in=[Attendance.Status.PENDING, Attendance.Status.ACCEPTED],
-                event__ends_at__gt=timezone.now(),
+        active_rsvps = Attendance.objects.select_for_update().filter(
+            user=request.user,
+            status__in=[Attendance.Status.PENDING, Attendance.Status.ACCEPTED],
+            event__ends_at__gt=timezone.now(),
+        )
+        if active_rsvps.count() >= 2:
+            return Response({"detail": "You can RSVP to at most 2 upcoming or active events at a time."}, status=400)
+
+        invited = bool(existing and existing.status == Attendance.Status.INVITED)
+        next_status = Attendance.Status.ACCEPTED if invited else Attendance.Status.PENDING
+        if invited and event.attendances.filter(status=Attendance.Status.ACCEPTED).count() >= event.capacity:
+            return Response({"detail": "This event is at capacity."}, status=400)
+        if existing:
+            existing.status = next_status
+            existing.note = note
+            existing.save(update_fields=["status", "note"])
+            attendance = existing
+        else:
+            attendance = Attendance.objects.create(event=event, user=request.user, note=note, status=next_status)
+        if invited:
+            if event.quests.filter(kind=Quest.Kind.MAIN).exists():
+                create_participant_side_quests(event, request.user)
+            Notification.objects.update_or_create(
+                recipient=event.host,
+                attendance=attendance,
+                kind=Notification.Kind.INVITE_ACCEPTED,
+                defaults={"actor": request.user, "read_at": None},
             )
-            if active_rsvps.count() >= 2:
-                return Response({"detail": "You can RSVP to at most 2 upcoming or active events at a time."}, status=400)
-            attendance = Attendance.objects.create(event=event, user=request.user, note=request.data.get("note", ""))
-            Notification.objects.create(recipient=event.host, actor=request.user, attendance=attendance, kind=Notification.Kind.RSVP)
+        else:
+            Notification.objects.update_or_create(
+                recipient=event.host,
+                attendance=attendance,
+                kind=Notification.Kind.RSVP,
+                defaults={"actor": request.user, "read_at": None},
+            )
         return Response(AttendanceSerializer(attendance, context={"request": request}).data, status=201)
+
+    @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
+    def invite(self, request, pk=None):
+        visible_event = self.get_object()
+        event = Event.objects.select_for_update().get(pk=visible_event.pk)
+        if event.host != request.user:
+            raise PermissionDenied("Only the host can invite people.")
+        if event.is_finished:
+            raise ValidationError("Invitations close when the event ends.")
+        user_id = request.data.get("user_id")
+        if user_id is None or not str(user_id).isdigit():
+            raise ValidationError({"user_id": "Provide a valid user ID."})
+        invitee = get_api_object_or_404(User, pk=int(user_id), is_active=True)
+        if invitee == request.user:
+            raise ValidationError({"user_id": "Hosts are already part of their event."})
+        attendance, created = Attendance.objects.select_for_update().get_or_create(
+            event=event,
+            user=invitee,
+            defaults={"status": Attendance.Status.INVITED},
+        )
+        if attendance.status != Attendance.Status.ACCEPTED:
+            attendance.status = Attendance.Status.INVITED
+            attendance.note = ""
+            attendance.save(update_fields=["status", "note"])
+        Notification.objects.update_or_create(
+            recipient=invitee,
+            attendance=attendance,
+            kind=Notification.Kind.EVENT_INVITE,
+            defaults={"actor": request.user, "read_at": None},
+        )
+        return Response(AttendanceSerializer(attendance, context={"request": request}).data, status=201 if created else 200)
+
+    @action(detail=True, methods=["post"], url_path="cancel-rsvp", permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
+    def cancel_rsvp(self, request, pk=None):
+        event = Event.objects.select_for_update().get(pk=self.get_object().pk)
+        attendance = Attendance.objects.filter(event=event, user=request.user).first()
+        if not attendance or attendance.status not in (Attendance.Status.INVITED, Attendance.Status.PENDING, Attendance.Status.ACCEPTED):
+            return Response({"detail": "No active RSVP found to cancel."}, status=status.HTTP_400_BAD_REQUEST)
+        if event.is_finished:
+            return Response({"detail": "Cannot cancel RSVP for a finished event."}, status=status.HTTP_400_BAD_REQUEST)
+        attendance.status = Attendance.Status.CANCELLED
+        attendance.save(update_fields=["status"])
+        return Response(AttendanceSerializer(attendance, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
+    def chat(self, request, pk=None):
+        event = Event.objects.select_for_update().get(pk=self.get_object().pk)
+        if event.host_id != request.user.id and not event.attendances.filter(user=request.user, status=Attendance.Status.ACCEPTED).exists():
+            raise PermissionDenied("The event chat is for the host and accepted participants.")
+        from .event_chat import sync_event_conversation
+        conversation = sync_event_conversation(event.pk)
+        conversation.hidden_for.remove(request.user)
+        return Response(ConversationSerializer(conversation, context={"request": request}).data)
 
     @action(detail=True, methods=["get"], permission_classes=[permissions.IsAuthenticated])
     def requests(self, request, pk=None):
@@ -179,7 +289,12 @@ class EventViewSet(viewsets.ModelViewSet):
         event = Event.objects.select_for_update().get(pk=event.pk)
         if event.host != request.user:
             return Response({"detail": "Only the host can approve requests."}, status=403)
-        attendance = get_object_or_404(event.attendances, id=request.data.get("attendance_id"))
+        attendance_id = request.data.get("attendance_id")
+        if attendance_id is None or not (isinstance(attendance_id, int) or (isinstance(attendance_id, str) and str(attendance_id).isdigit())):
+            return Response({"detail": "attendance_id must be a valid integer."}, status=status.HTTP_400_BAD_REQUEST)
+        attendance = get_object_or_404(event.attendances, id=int(attendance_id))
+        if attendance.status == Attendance.Status.INVITED:
+            return Response({"detail": "Only the invited person can accept this invitation."}, status=400)
         decision = request.data.get("decision")
         if decision not in (Attendance.Status.ACCEPTED, Attendance.Status.DENIED):
             return Response({"detail": "decision must be ACCEPTED or DENIED."}, status=400)
@@ -210,13 +325,7 @@ class EventViewSet(viewsets.ModelViewSet):
             quests = event.quests.filter(kind=Quest.Kind.MAIN)
         return Response(QuestSerializer(quests, many=True, context={"request": request}).data)
 
-    @action(detail=True, methods=["get"], permission_classes=[permissions.IsAuthenticated])
-    def submissions(self, request, pk=None):
-        event = self.get_object()
-        if event.host_id != request.user.id:
-            raise PermissionDenied("Only the host can review event proof.")
-        proofs = QuestSubmission.objects.filter(quest__event=event).select_related("quest", "participant__profile").order_by("submitted_at", "id")
-        return Response(QuestSubmissionSerializer(proofs, many=True, context={"request": request}).data)
+
 
     @action(detail=True, methods=["post"], url_path="generate-quests", permission_classes=[permissions.IsAuthenticated])
     def generate_event_quests(self, request, pk=None):
@@ -225,10 +334,14 @@ class EventViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Only the host can generate quests."}, status=403)
         if event.is_finished:
             return Response({"detail": "Quests cannot be generated after an event has ended."}, status=400)
-        if event.quests.exists() and not request.data.get("replace"):
+        replace = request.data.get("replace")
+        replace_requested = replace is True or str(replace).lower() in ("true", "1")
+        if event.quests.exists() and not replace_requested:
             return Response({"detail": "This event already has quests. Send replace=true to generate a new set."}, status=400)
+        if replace_requested and QuestSubmission.objects.filter(quest__event=event).exists():
+            return Response({"detail": "Cannot regenerate quests after submissions have been made."}, status=400)
         with transaction.atomic():
-            if request.data.get("replace"):
+            if replace_requested:
                 event.quests.all().delete()
             generated = generate_quests(event)
             main_quest = next((quest for quest in generated if quest.get("kind") == Quest.Kind.MAIN), None)
@@ -258,15 +371,16 @@ class QuestSubmissionViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You must be accepted into the event before submitting a quest.")
         if quest.kind == Quest.Kind.SIDE and quest.assigned_to_id != self.request.user.id:
             raise PermissionDenied("This side quest is assigned to a different participant.")
-        media = serializer.validated_data["media"]
-        if media.size > 50 * 1024 * 1024:
-            raise ValidationError("Proof uploads must be smaller than 50 MB.")
         with transaction.atomic():
             # Lock the participant so duplicate uploads cannot race the unique constraint.
             User.objects.select_for_update().get(pk=self.request.user.pk)
             if QuestSubmission.objects.filter(quest=quest, participant=self.request.user).exists():
-                raise ValidationError("You have already submitted proof for this quest.")
-            submission = serializer.save(participant=self.request.user)
+                raise ValidationError("Looks like you already snapped proof for this one — nice work! 🎉")
+            submission = serializer.save(
+                participant=self.request.user,
+                status=QuestSubmission.Status.APPROVED,
+                reviewed_at=timezone.now(),
+            )
             Post.objects.create(
                 author=self.request.user,
                 event=quest.event,
@@ -276,25 +390,8 @@ class QuestSubmissionViewSet(viewsets.ModelViewSet):
                 media=submission.media.name,
                 location_name=quest.event.location_name,
             )
-
-    @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
-    def review(self, request, pk=None):
-        submission = get_object_or_404(QuestSubmission.objects.select_related("quest__event", "participant__profile"), pk=pk)
-        if submission.quest.event.host != request.user:
-            return Response({"detail": "Only the event host can review quest proof."}, status=403)
-        decision = request.data.get("decision")
-        if decision not in (QuestSubmission.Status.APPROVED, QuestSubmission.Status.REJECTED):
-            return Response({"detail": "decision must be APPROVED or REJECTED."}, status=400)
-        with transaction.atomic():
-            submission = QuestSubmission.objects.select_for_update().select_related("quest").get(pk=submission.pk)
-            if submission.status == QuestSubmission.Status.APPROVED and decision != submission.status:
-                return Response({"detail": "Approved proof cannot be reversed after XP has been awarded."}, status=400)
-            earned = decision == QuestSubmission.Status.APPROVED and submission.status != QuestSubmission.Status.APPROVED
-            submission.status, submission.reviewed_at = decision, timezone.now()
-            submission.save(update_fields=["status", "reviewed_at"])
-            if earned:
-                Profile.objects.filter(user=submission.participant).update(total_xp=F("total_xp") + submission.quest.xp_reward)
-        return Response(QuestSubmissionSerializer(submission, context={"request": request}).data)
+            # XP is awarded immediately — no host review required.
+            Profile.objects.filter(user=self.request.user).update(total_xp=F("total_xp") + quest.xp_reward)
 
 
 class KarmaRatingViewSet(viewsets.ModelViewSet):
@@ -305,7 +402,11 @@ class KarmaRatingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = KarmaRating.objects.select_related("rater__profile", "target__profile", "event").filter(rater=self.request.user)
         event_id = self.request.query_params.get("event")
-        return queryset.filter(event_id=event_id) if event_id else queryset
+        if event_id:
+            if not event_id.isdigit():
+                return queryset.none()
+            queryset = queryset.filter(event_id=event_id)
+        return queryset
 
     def _validate_rating_participants(self, event, target):
         if not event.is_finished:
@@ -340,7 +441,7 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        queryset = User.objects.select_related("profile").filter(is_active=True)
+        queryset = with_public_user_stats(User.objects.filter(is_active=True), self.request.user)
         query = self.request.query_params.get("q", "").strip()[:100].lstrip("@")
         if query:
             queryset = queryset.filter(
@@ -408,8 +509,12 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
             now = timezone.now()
             UserPresence.objects.filter(last_seen__lte=now - UserPresence.TIMEOUT).delete()
             UserPresence.objects.update_or_create(
-                user=request.user, session_id=session_id, defaults={"last_seen": now},
+                user=request.user, session_id=session_id,
+                defaults={"last_seen": now, "chats_open": serializer.validated_data["chats_open"]},
             )
+            if serializer.validated_data["chats_open"]:
+                from .notification_delivery import suppress_chat_deliveries
+                suppress_chat_deliveries(request.user.id)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -418,13 +523,23 @@ class PostViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
     def get_queryset(self):
-        queryset = visible_posts(self.request.user).select_related("author", "author__profile", "event", "quest").prefetch_related("likes", "comments")
+        authors = with_public_user_stats(User.objects.all(), self.request.user)
+        comments = Comment.objects.select_related("author", "author__profile").order_by("-created_at")
+        queryset = visible_posts(self.request.user).select_related("event", "quest").prefetch_related(
+            Prefetch("author", queryset=authors),
+            "likes",
+            Prefetch("comments", queryset=comments, to_attr="prefetched_comments"),
+        )
         author_id = self.request.query_params.get("author")
         kind = self.request.query_params.get("kind")
         event_id = self.request.query_params.get("event")
         if author_id:
+            if not author_id.isdigit():
+                return queryset.none()
             queryset = queryset.filter(author_id=author_id)
-        if event_id and event_id.isdigit():
+        if event_id:
+            if not event_id.isdigit():
+                return queryset.none()
             queryset = queryset.filter(event_id=event_id)
         if kind in (Post.Kind.POST, Post.Kind.REEL):
             queryset = queryset.filter(kind=kind)
@@ -487,13 +602,26 @@ class CommentViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        queryset = Comment.objects.filter(post__in=visible_posts(self.request.user)).select_related("author", "author__profile", "post")
+        queryset = Comment.objects.filter(post__in=visible_posts(self.request.user)).select_related("author", "author__profile", "post", "parent", "parent__author", "parent__author__profile")
         post_id = self.request.query_params.get("post")
-        return queryset.filter(post_id=post_id) if post_id else queryset
+        if post_id:
+            if not post_id.isdigit():
+                return queryset.none()
+            queryset = queryset.filter(post_id=post_id)
+        return queryset
 
+    @transaction.atomic
     def perform_create(self, serializer):
-        get_object_or_404(visible_posts(self.request.user), pk=serializer.validated_data["post"].pk)
-        serializer.save(author=self.request.user)
+        post = get_object_or_404(visible_posts(self.request.user), pk=serializer.validated_data["post"].pk)
+        comment = serializer.save(author=self.request.user)
+        recipient = comment.parent.author if comment.parent_id else post.author
+        if recipient != self.request.user:
+            Notification.objects.get_or_create(
+                recipient=recipient,
+                actor=self.request.user,
+                comment=comment,
+                kind=Notification.Kind.COMMENT_REPLY,
+            )
 
     def perform_update(self, serializer):
         comment = self.get_object()
@@ -514,12 +642,19 @@ class ConversationViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        return Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user).prefetch_related("participants__profile", "participants__presence_sessions", "messages").order_by("-created_at")
+        participants = with_public_user_stats(User.objects.all(), self.request.user).prefetch_related("presence_sessions")
+        visible_messages = Message.objects.exclude(hidden_for=self.request.user).select_related("sender", "sender__profile")
+        return Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user).select_related("event").prefetch_related(
+            Prefetch("participants", queryset=participants),
+            Prefetch("messages", queryset=visible_messages, to_attr="visible_messages"),
+        ).order_by("-updated_at")
 
     def create(self, request, *args, **kwargs):
         raise MethodNotAllowed("POST")
 
     def perform_update(self, serializer):
+        if serializer.instance.event_id:
+            raise ValidationError("Event chat names follow the event. Edit the event name instead.")
         title = serializer.validated_data.get("title", "").strip()
         serializer.save(title=title)
 
@@ -529,7 +664,10 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def direct(self, request):
-        target = get_object_or_404(User, id=request.data.get("user_id"))
+        user_id = request.data.get("user_id")
+        if user_id is None or not (isinstance(user_id, int) or (isinstance(user_id, str) and str(user_id).isdigit())):
+            return Response({"detail": "user_id must be a valid integer."}, status=status.HTTP_400_BAD_REQUEST)
+        target = get_object_or_404(User, id=int(user_id))
         if target == request.user:
             return Response({"detail": "Choose someone else to start a conversation."}, status=400)
         with transaction.atomic():
@@ -552,18 +690,21 @@ class MessageViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = Message.objects.select_related("sender", "sender__profile", "conversation").filter(conversation__participants=self.request.user).exclude(hidden_for=self.request.user)
         conversation_id = self.request.query_params.get("conversation")
-        return queryset.filter(conversation_id=conversation_id) if conversation_id else queryset
+        if conversation_id:
+            if not conversation_id.isdigit():
+                return queryset.none()
+            queryset = queryset.filter(conversation_id=conversation_id)
+        return queryset
 
     def perform_create(self, serializer):
         conversation = serializer.validated_data["conversation"]
         if not conversation.participants.filter(id=self.request.user.id).exists():
             raise PermissionDenied("You are not part of this conversation.")
         message = serializer.save(sender=self.request.user)
+        Conversation.objects.filter(pk=conversation.pk).update(updated_at=timezone.now())
         conversation.hidden_for.clear()
-        Notification.objects.bulk_create([
-            Notification(recipient=person, actor=self.request.user, conversation=conversation, message=message, kind=Notification.Kind.MESSAGE)
-            for person in conversation.participants.exclude(id=self.request.user.id)
-        ])
+        from .notification_delivery import queue_message
+        queue_message(message)
 
     def perform_update(self, serializer):
         message = self.get_object()
@@ -592,22 +733,53 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
 
-    def get_queryset(self):
-        ended_attendances = Attendance.objects.filter(
-            user=self.request.user,
-            status=Attendance.Status.ACCEPTED,
-            event__ends_at__lte=timezone.now(),
-        )
-        Notification.objects.bulk_create([
-            Notification(
-                recipient=self.request.user,
-                attendance=attendance,
-                kind=Notification.Kind.EVENT_ENDED,
+    @action(detail=False, methods=["get"], url_path="delivery-config")
+    def delivery_config(self, request):
+        from .notification_delivery import webpush_public_key
+        return Response({"webpush_public_key": webpush_public_key()})
+
+    @action(detail=False, methods=["get", "put", "delete"])
+    def device(self, request):
+        from .notification_delivery import validate_address
+        try:
+            device_id = UUID(str(request.query_params.get("id") if request.method == "GET" else request.data.get("id")))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"id": "Provide a valid device ID."})
+        device = NotificationDevice.objects.filter(pk=device_id).first()
+        if device and device.user_id != request.user.id:
+            raise PermissionDenied("This device belongs to another account.")
+        if request.method == "DELETE":
+            if device:
+                device.enabled = False; device.save(update_fields=["enabled"])
+                device.deliveries.filter(status="PENDING").update(status="SUPPRESSED")
+            return Response(status=204)
+        if request.method == "PUT":
+            transport = request.data.get("transport")
+            address = validate_address(transport, request.data.get("address", {}))
+            device, _ = NotificationDevice.objects.update_or_create(
+                pk=device_id, defaults={"user": request.user, "transport": transport, "address": address, "enabled": True},
             )
-            for attendance in ended_attendances
-        ], ignore_conflicts=True)
-        return Notification.objects.filter(recipient=self.request.user).select_related(
-            "actor", "actor__profile", "attendance", "attendance__event", "conversation", "message"
+            if transport != "LOCAL":
+                NotificationDevice.objects.filter(transport=transport, address=address).exclude(pk=device_id).update(enabled=False)
+        if not device:
+            return Response({"enabled": False})
+        return Response({"id": str(device.id), "transport": device.transport, "enabled": device.enabled})
+
+    @action(detail=False, methods=["post"], url_path="poll-delivery")
+    def poll_delivery(self, request):
+        from .notification_delivery import poll_local
+        try:
+            device_id = UUID(str(request.data.get("id")))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"id": "Provide a valid device ID."})
+        device = get_api_object_or_404(NotificationDevice, pk=device_id, user=request.user, enabled=True, transport="LOCAL")
+        return Response({"deliveries": poll_local(device)})
+
+    def get_queryset(self):
+        from .notification_delivery import ensure_ended_notifications
+        ensure_ended_notifications(self.request.user.id)
+        return Notification.objects.filter(recipient=self.request.user).exclude(kind=Notification.Kind.MESSAGE).select_related(
+            "actor", "actor__profile", "attendance", "attendance__event", "conversation", "message", "comment", "comment__post"
         )
 
     @action(detail=False, methods=["post"], url_path="mark-read")

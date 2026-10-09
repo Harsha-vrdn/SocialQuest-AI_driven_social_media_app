@@ -1,13 +1,30 @@
+import {MessageList} from './MessageList';
+import {EventDateTimeField, EventDateTimePicker} from './EventDateTimePicker';
+import {dateParts, localDateTimeValue, updateEventSchedule, type EventSchedule} from './eventDateTime';
+import {ImageViewer} from './ImageViewer';
+import {RelativeTime, RelativeTimeProvider} from './PostTime';
+import {ProfileEditor, type ProfileDraft} from './ProfileEditor';
+import {locateHostVenue} from './hostingLocation';
+import {QuestAttribution} from './QuestAttribution';
+import {useFonts} from 'expo-font';
+import {darkStyles, glassStyles, socialStyles, notificationStyles} from './appStyles';
+import {accents, colors, type Accent} from './theme';
+import {MotionProvider, SoftPressable as Pressable, MotionModal as Modal, ScreenTransition, LikeFeedback} from './Motion';
+import {EventArtwork} from './EventArtwork';
+import {LinearGradient} from 'expo-linear-gradient';
+import {useDeviceNotifications, DeliveryNotice} from './useDeviceNotifications';
+import {PostComposer} from './PostComposer';
+import {GlassBackdrop, GlassPreferenceProvider} from './GlassBackdrop';
 import { StatusBar } from 'expo-status-bar';
 import Constants from 'expo-constants';
-import { useFonts } from 'expo-font';
 import { File } from 'expo-file-system';
 import { NavigationBar } from 'expo-navigation-bar';
 import * as ImagePicker from 'expo-image-picker';
+import { FlipType, ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import * as Location from 'expo-location';
-import { PressStart2P_400Regular } from '@expo-google-fonts/press-start-2p';
-import { PixelifySans_400Regular, PixelifySans_700Bold } from '@expo-google-fonts/pixelify-sans';
-import { useEffect, useRef, useState } from 'react';
+import * as SecureStore from 'expo-secure-store';
+import {Ionicons} from '@expo/vector-icons';
+import { type ComponentProps, type ReactNode, useEffect, useRef, useState } from 'react';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import {
   Alert,
@@ -16,16 +33,15 @@ import {
   Image,
   Keyboard,
   KeyboardAvoidingView,
-  Modal,
   NativeModules,
   Platform,
-  Pressable,
   Share,
   ScrollView,
-  StyleSheet,
   Text,
   TextInput,
+  type ViewProps,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -41,18 +57,21 @@ const expoHost = expoHostUri.replace(/^.*?:\/\//, '').split(':')[0];
 const API_URL = (configuredApiUrl || (expoHost ? 'http://' + expoHost + ':8000/api' : 'http://YOUR_LAN_IP:8000/api')).replace(/\/+$/, '');
 type Tab = 'Home' | 'Explore' | 'Chats' | 'Notifications' | 'Reels' | 'Profile';
 type User = { id: number; username: string; display_name?: string; bio?: string; city?: string; avatar?: string; xp?: number; karma?: number; follower_count?: number; following_count?: number; is_followed_by_me?: boolean; is_online?: boolean };
-type PeoplePanel = { kind: 'search' | 'followers' | 'following'; person?: User };
-type EventItem = { id: number; name: string; description: string; cover_image?: string; location_name: string; starts_at: string; ends_at: string; accepted_count: number; capacity: number; host: User; my_attendance_status?: string | null; is_finished?: boolean; quest_status?: string; recommendation_reason?: string };
-type CommentItem = { id: number; author: User; body: string; created_at: string };
-type Post = { id: number; kind: 'POST' | 'REEL'; body: string; media?: string; location_name?: string; quest_title?: string; recommendation_reason?: string; author: User; created_at: string; like_count: number; comment_count: number; liked_by_me?: boolean; recent_comments?: CommentItem[] };
-type Quest = { id: number; kind: 'MAIN' | 'SIDE'; title: string; instructions: string; xp_reward: number; my_submission?: { status: string } | null };
-type Conversation = { id: number; title?: string; display_name: string; participants: User[]; latest_message?: { body: string; created_at: string; deleted_for_everyone?: boolean } };
+type PeoplePanel = { kind: 'search' | 'followers' | 'following' | 'invite'; person?: User; eventId?: number };
+type EventItem = { id: number; name: string; description: string; cover_image?: string; location_name: string; latitude?: number | null; longitude?: number | null; starts_at: string; ends_at: string; accepted_count: number; capacity: number; privacy: 'PUBLIC' | 'PRIVATE'; host: User; my_attendance_status?: string | null; is_finished?: boolean; quest_status?: string; recommendation_reason?: string };
+type EventEditor = { id?: number; name: string; description: string; location_name: string; latitude?: number | null; longitude?: number | null; starts_at: string; ends_at: string; capacity: string; privacy: 'PUBLIC' | 'PRIVATE' };
+type CommentItem = { id: number; parent?: number | null; author: User; body: string; created_at: string };
+type Post = { id: number; kind: 'POST' | 'REEL'; body: string; media?: string; location_name?: string; quest_title?: string; event_name?: string; event?: number | null; recommendation_reason?: string; author: User; created_at: string; like_count: number; comment_count: number; liked_by_me?: boolean; recent_comments?: CommentItem[] };
+type Quest = { id: number; event: number; event_name?: string; kind: 'MAIN' | 'SIDE'; title: string; instructions: string; xp_reward: number; my_submission?: { status: string } | null };
+type Conversation = { id: number; is_group?: boolean; event?: number | null; event_name?: string; title?: string; display_name: string; participants: User[]; latest_message?: { body: string; created_at: string; deleted_for_everyone?: boolean } };
 type ChatMessage = { id: number; body: string; sender: User; created_at: string; edited_at?: string | null; deleted_for_everyone?: boolean };
 type Reaction = 'LIKE' | 'DISLIKE' | 'NONE';
 type RatingItem = { id: number; target: User; reaction: Reaction };
 type AttendanceItem = { id: number; user: User; status: string };
-type ProofItem = { id: number; quest_title: string; xp_reward: number; participant: User; media: string; media_type: string; caption: string; status: string };
-type NotificationItem = { id: number; kind: 'RSVP' | 'RSVP_ACCEPTED' | 'RSVP_DENIED' | 'MESSAGE' | 'EVENT_ENDED'; text: string; event?: { id: number; name: string } | null; conversation_id?: number | null; created_at: string; is_read: boolean };
+type NotificationItem = { id: number; kind: 'EVENT_INVITE' | 'INVITE_ACCEPTED' | 'RSVP' | 'RSVP_ACCEPTED' | 'RSVP_DENIED' | 'EVENT_ENDED' | 'COMMENT_REPLY'; text: string; event?: { id: number; name: string } | null; comment_post_id?: number | null; created_at: string; is_read: boolean };
+type PhotoEditorState = { original: ImagePicker.ImagePickerAsset; working: ImagePicker.ImagePickerAsset };
+type PhotoOperation = 'rotate-left' | 'rotate-right' | 'mirror';
+type IoniconName = ComponentProps<typeof Ionicons>['name'];
 
 const rows = <T,>(data: T[] | { results?: T[] } | null | undefined): T[] => Array.isArray(data) ? data : data?.results || [];
 const nameOf = (user?: User | null) => user?.display_name || user?.username || 'SocialQuest member';
@@ -60,47 +79,95 @@ const initial = (user?: User | null) => nameOf(user).trim().slice(0, 1).toUpperC
 const dateOf = (date: string) => new Date(date).toLocaleDateString('en', { month: 'short', day: 'numeric' });
 const reactionLabel = (reaction: Reaction) => reaction === 'LIKE' ? '♥ Like' : reaction === 'DISLIKE' ? '× Dislike' : '— None';
 const chatEmojis = ['😊', '😂', '❤️', '👍', '🎉', '✨', '👋', '🙌'];
-const PIXEL_FONT = 'PressStart2P_400Regular';
-const COPY_FONT = 'PixelifySans_400Regular';
-const COPY_FONT_BOLD = 'PixelifySans_700Bold';
-let activeStyles: any;
+const AUTH_TOKEN_KEY = 'socialquest_auth_token';
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+let activeStyles = darkStyles;
+const iconLabelRow = {alignItems: 'center', flexDirection: 'row', gap: 5} as const;
+const avatarAccents = [accents.purple, accents.sky, accents.mint];
+const notificationAccent = (kind: NotificationItem['kind']) => kind === 'COMMENT_REPLY' ? accents.purple
+  : kind === 'RSVP_ACCEPTED' || kind === 'INVITE_ACCEPTED' ? accents.mint
+  : kind === 'RSVP_DENIED' ? accents.danger : accents.purple;
 
 function Avatar({ user, large = false }: { user?: User | null; large?: boolean }) {
   const styles = activeStyles;
+  const tone = avatarAccents[Math.abs(user?.id || 0) % avatarAccents.length];
   return user?.avatar
     ? <Image style={[styles.avatar, large && styles.avatarLarge]} source={{ uri: user.avatar }} />
-    : <View style={[styles.avatar, large && styles.avatarLarge]}><Text style={[styles.avatarText, large && styles.avatarLargeText]}>{initial(user)}</Text></View>;
+    : <View style={[styles.avatar, {backgroundColor: tone.surface}, large && styles.avatarLarge]}><Text style={[styles.avatarText, {color: tone.text}, large && styles.avatarLargeText]}>{initial(user)}</Text></View>;
 }
 
-function Empty({ icon, title, body }: { icon: string; title: string; body: string }) {
+function Empty({ icon, title, body, style, ...viewProps }: ViewProps & { icon: string; title: string; body: string }) {
   const styles = activeStyles;
-  return <View style={styles.empty}><Text style={styles.emptyIcon}>{icon}</Text><Text style={styles.emptyTitle}>{title}</Text><Text style={styles.emptyBody}>{body}</Text></View>;
+  // Preserve any layout and measurement props supplied by the parent list.
+  return <View {...viewProps} style={[styles.empty, style]}><Text style={styles.emptyIcon}>{icon}</Text><Text style={styles.emptyTitle}>{title}</Text><Text style={styles.emptyBody}>{body}</Text></View>;
+}
+
+function GroupAvatar() {
+  return <View style={[activeStyles.avatar, {backgroundColor: colors.accentSoft}]}><Ionicons name="people" size={23} color={colors.accent} /></View>;
+}
+
+function InteractivePostImage({ post, onLike }: { post: Post; onLike: (post: Post) => void }) {
+  const styles = activeStyles;
+  const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heartTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [showHeart, setShowHeart] = useState(false);
+  const [viewerOpen, setViewerOpen] = useState(false);
+
+  useEffect(() => () => {
+    if (tapTimer.current) clearTimeout(tapTimer.current);
+    if (heartTimer.current) clearTimeout(heartTimer.current);
+  }, []);
+
+  const handlePress = () => {
+    if (tapTimer.current) {
+      clearTimeout(tapTimer.current);
+      tapTimer.current = null;
+      if (!post.liked_by_me) onLike(post);
+      setShowHeart(true);
+      if (heartTimer.current) clearTimeout(heartTimer.current);
+      heartTimer.current = setTimeout(() => setShowHeart(false), 650);
+      return;
+    }
+    tapTimer.current = setTimeout(() => {
+      tapTimer.current = null;
+      setViewerOpen(true);
+    }, 230);
+  };
+
+  return <><Pressable accessibilityRole="button" accessibilityLabel="Open photo" accessibilityHint="Open fullscreen to pinch or double-tap to zoom. Double-tap here to like." onPress={handlePress} style={styles.postImageTouch}>
+    <Image style={styles.postImage} source={{ uri: post.media }} />
+    {showHeart ? <LikeFeedback style={styles.postMediaHeart}><Ionicons name="heart" size={76} color="#fff" /></LikeFeedback> : null}
+  </Pressable>{viewerOpen && post.media ? <ImageViewer key={post.media} uri={post.media} onClose={() => setViewerOpen(false)} /> : null}</>;
 }
 
 function PostCard({ post, onLike, mine, onEdit, onDelete, onShare, onComments, onOpenProfile }: { post: Post; onLike: (post: Post) => void; mine: boolean; onEdit: (post: Post) => void; onDelete: (post: Post) => void; onShare: (post: Post) => void; onComments: (post: Post) => void; onOpenProfile: (user: User) => void }) {
   const styles = activeStyles;
-  return <View style={styles.post}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(post.author) + "'s profile"} style={styles.postHead} onPress={() => onOpenProfile(post.author)}><Avatar user={post.author} /><View style={{ flex: 1, minWidth: 0 }}><Text style={styles.personName}>{nameOf(post.author)}</Text><Text style={styles.personMeta}>@{post.author.username}{post.location_name ? ' · ' + post.location_name : ''}</Text></View></Pressable>{post.recommendation_reason ? <Text style={styles.recommendationTag}>For you · {post.recommendation_reason}</Text> : null}{post.quest_title ? <Text style={styles.questPostTag}>✦ Quest proof · {post.quest_title}</Text> : null}{post.body ? <Text style={styles.postBody}>{post.body}</Text> : null}{post.media ? post.kind === 'POST' ? <Image style={styles.postImage} source={{ uri: post.media }} /> : <ReelVideo uri={post.media} /> : null}<View style={styles.postFooter}><Pressable accessibilityRole="button" accessibilityLabel={post.liked_by_me ? "Unlike post" : "Like post"} onPress={() => onLike(post)}><Text style={[styles.postManageText, post.liked_by_me && { color: "#ff68b4" }]}>♥ {post.like_count}</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Open comments" onPress={() => onComments(post)}><Text style={styles.postManageText}>◌ {post.comment_count} replies</Text></Pressable><Pressable onPress={() => onShare(post)}><Text style={styles.postManageText}>↗ Share</Text></Pressable>{mine ? <View style={styles.postManage}><Pressable onPress={() => onEdit(post)}><Text style={styles.postManageText}>Edit</Text></Pressable><Pressable onPress={() => onDelete(post)}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View> : null}</View></View>;
+  return <View style={styles.post}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(post.author) + "'s profile"} style={styles.postHead} onPress={() => onOpenProfile(post.author)}><Avatar user={post.author} /><View style={{ flex: 1, minWidth: 0 }}><Text style={styles.personName}>{nameOf(post.author)}</Text><Text style={styles.personMeta}>@{post.author.username}{post.location_name ? ' · ' + post.location_name : ''}</Text><RelativeTime value={post.created_at} /></View></Pressable>{post.recommendation_reason ? <Text style={styles.recommendationTag}>For you · {post.recommendation_reason}</Text> : null}<QuestAttribution quest={post.quest_title} event={post.event_name} />{post.body ? <Text style={styles.postBody}>{post.body}</Text> : null}{post.media ? post.kind === 'POST' ? <InteractivePostImage post={post} onLike={onLike} /> : <ReelVideo uri={post.media} /> : null}<View style={styles.postFooter}><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel={post.liked_by_me ? "Unlike post" : "Like post"} onPress={() => onLike(post)}><Ionicons name={post.liked_by_me ? 'heart' : 'heart-outline'} size={18} color={post.liked_by_me ? colors.rose : colors.muted} /><Text style={[styles.postManageText, post.liked_by_me && { color: colors.rose }]}>{post.like_count}</Text></Pressable><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel="Open comments" onPress={() => onComments(post)}><Ionicons name="chatbubble-outline" size={17} color={colors.muted} /><Text style={styles.postManageText}>{post.comment_count} replies</Text></Pressable><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel="Share post" onPress={() => onShare(post)}><Ionicons name="paper-plane-outline" size={18} color={colors.muted} /><Text style={styles.postManageText}>Share</Text></Pressable>{mine ? <View style={styles.postManage}><Pressable style={styles.postAction} onPress={() => onEdit(post)}><Text style={styles.postManageText}>Edit</Text></Pressable><Pressable style={styles.postAction} onPress={() => onDelete(post)}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View> : null}</View><Pressable accessibilityRole="button" accessibilityLabel="Open replies" onPress={() => onComments(post)} style={styles.postRepliesLink}><Text style={styles.postRepliesLinkText}>{post.comment_count ? 'View ' + post.comment_count + (post.comment_count === 1 ? ' reply' : ' replies') : 'Start the conversation'}</Text></Pressable></View>;
 }
 
 function ReelVideo({ uri }: { uri: string }) {
   const player = useVideoPlayer(uri);
-  return <VideoView player={player} nativeControls contentFit="contain" style={{ width: '100%', height: 230, backgroundColor: '#050916' }} />;
+  return <VideoView player={player} nativeControls contentFit="contain" style={{ width: '100%', height: 230, borderRadius: 12, overflow: 'hidden', backgroundColor: '#050916' }} />;
 }
 
 export default function App() {
-  const [fontsLoaded, fontError] = useFonts({ PressStart2P_400Regular, PixelifySans_400Regular, PixelifySans_700Bold });
-  if (!fontsLoaded && !fontError) return <View style={{ flex: 1, backgroundColor: '#071022' }} />;
-  return <SafeAreaProvider><NavigationBar style="light" /><SocialQuestApp /></SafeAreaProvider>;
+  const [fontsLoaded, fontError] = useFonts({DepartureMono: require('./assets/fonts/DepartureMono-Regular.otf')});
+  if (!fontsLoaded && !fontError) return <View style={{flex: 1, backgroundColor: colors.background}} />;
+  return <SafeAreaProvider><RelativeTimeProvider><MotionProvider><GlassPreferenceProvider><NavigationBar style="light" /><SocialQuestApp /></GlassPreferenceProvider></MotionProvider></RelativeTimeProvider></SafeAreaProvider>;
 }
 
 function SocialQuestApp() {
   const insets = useSafeAreaInsets();
-  const darkMode = true;
+  const {width} = useWindowDimensions();
   const styles = darkStyles;
   activeStyles = styles;
+  const [appHeaderHeight, setAppHeaderHeight] = useState(0);
   const [token, setToken] = useState('');
+  const [authReady, setAuthReady] = useState(false);
   const [me, setMe] = useState<User | null>(null);
   const [tab, setTab] = useState<Tab>('Home');
+  const currentTab = useRef(tab); currentTab.current = tab;
+  const presenceSync = useRef<((online: boolean) => Promise<void>) | null>(null);
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -109,6 +176,7 @@ function SocialQuestApp() {
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const uploadInFlight = useRef(false);
+  const photoEditInFlight = useRef(false);
   const likeInFlight = useRef(new Set<number>());
   const sessionToken = useRef(token);
   sessionToken.current = token;
@@ -116,7 +184,6 @@ function SocialQuestApp() {
   const [hostedEvents, setHostedEvents] = useState<EventItem[]>([]);
   const [joinedEvents, setJoinedEvents] = useState<EventItem[]>([]);
   const [eventRequests, setEventRequests] = useState<AttendanceItem[]>([]);
-  const [eventProofs, setEventProofs] = useState<ProofItem[]>([]);
   const [messageOptions, setMessageOptions] = useState<ChatMessage | null>(null);
   const sendInFlight = useRef(false);
   const [people, setPeople] = useState<User[]>([]);
@@ -136,6 +203,8 @@ function SocialQuestApp() {
   const [query, setQuery] = useState('');
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeChat, setActiveChat] = useState<Conversation | null>(null);
+  const [chatMembersOpen, setChatMembersOpen] = useState(false);
+  const openingEventChat = useRef(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const activeChatId = useRef<number | null>(null);
   activeChatId.current = activeChat?.id || null;
@@ -144,6 +213,14 @@ function SocialQuestApp() {
   const [chatEditor, setChatEditor] = useState<{ kind: 'conversation' | 'message'; id: number; value: string } | null>(null);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<EventItem | null>(null);
+  const [eventEditor, setEventEditor] = useState<EventEditor | null>(null);
+  const [eventDateField, setEventDateField] = useState<keyof EventSchedule | null>(null);
+  const eventEditorVersion = useRef(0);
+  const eventLocationRequest = useRef(0);
+  const eventSaveInFlight = useRef(false);
+  const [eventLocating, setEventLocating] = useState(false);
+  const [eventLocationStatus, setEventLocationStatus] = useState('');
+  const [profileEditorOpen, setProfileEditorOpen] = useState(false);
   const [eventQuests, setEventQuests] = useState<Quest[]>([]);
   const [eventPosts, setEventPosts] = useState<Post[]>([]);
   const [ratingTargets, setRatingTargets] = useState<User[]>([]);
@@ -152,15 +229,34 @@ function SocialQuestApp() {
   const [composeOpen, setComposeOpen] = useState(false);
   const [moment, setMoment] = useState('');
   const [momentMedia, setMomentMedia] = useState<ImagePicker.ImagePickerAsset | null>(null);
+  const [photoEditor, setPhotoEditor] = useState<PhotoEditorState | null>(null);
+  const [photoEditorBusy, setPhotoEditorBusy] = useState(false);
   const [momentLocation, setMomentLocation] = useState('');
   const [proofQuest, setProofQuest] = useState<Quest | null>(null);
+  const composerDrafts = useRef(new Map<string, {caption: string; media: ImagePicker.ImagePickerAsset | null; location: string}>());
   const [editingPost, setEditingPost] = useState<Post | null>(null);
   const [editBody, setEditBody] = useState('');
   const [editLocation, setEditLocation] = useState('');
   const [commentPost, setCommentPost] = useState<Post | null>(null);
+  const activeCommentPostId = useRef<number | null>(null);
+  const commentPanelVersion = useRef(0);
+  const commentRequestVersion = useRef(0);
+  const commentInFlight = useRef(false);
+  const [commentSubmitting, setCommentSubmitting] = useState(false);
   const [comments, setComments] = useState<CommentItem[]>([]);
   const [commentBody, setCommentBody] = useState('');
   const [editingComment, setEditingComment] = useState<CommentItem | null>(null);
+  const [replyingTo, setReplyingTo] = useState<CommentItem | null>(null);
+  const commentInputRef = useRef<TextInput>(null);
+  const [profilePosts, setProfilePosts] = useState<Post[]>([]);
+  const [profilePostsLoading, setProfilePostsLoading] = useState(false);
+  const [profilePostsError, setProfilePostsError] = useState('');
+  const [profilePostsOwner, setProfilePostsOwner] = useState<number | null>(null);
+  const [profileSection, setProfileSection] = useState<'POST' | 'REEL' | 'EVENTS'>('POST');
+  const profileUserId = selectedUser?.id || (tab === 'Profile' ? me?.id : undefined);
+  const currentProfileId = useRef(profileUserId);
+  currentProfileId.current = profileUserId;
+  const profileRequestVersion = useRef(0);
 
   const api = async (path: string, options: any = {}, authToken = token): Promise<any> => {
     const headers: any = { ...(authToken ? { Authorization: 'Token ' + authToken } : {}), ...(options.headers || {}) };
@@ -177,7 +273,9 @@ function SocialQuestApp() {
     const data = response.status === 204 ? null : await response.json().catch(() => ({}));
     if (authToken && sessionToken.current !== authToken) throw new Error('Session changed.');
     if (response.status === 401 && authToken) {
+      activeCommentPostId.current = null; commentPanelVersion.current += 1; commentRequestVersion.current += 1;
       sessionToken.current = ''; setToken(''); setMe(null); setActiveChat(null); setMessages([]);
+      void SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
       setPosts([]); setReels([]); setEvents([]); setPeople([]); setFollowing([]); setConversations([]); setNotifications([]);
       setSelectedEvent(null); setSelectedUser(null); setComposeOpen(false); setCommentPost(null); setEditingPost(null); setChatEditor(null); setMessageOptions(null);
       throw new Error('Your session expired. Please log in again.');
@@ -192,6 +290,32 @@ function SocialQuestApp() {
       data.results.push(...rows(remaining)); data.next = null;
     }
     return data;
+  };
+
+  useEffect(() => {
+    eventEditorVersion.current += 1; eventLocationRequest.current += 1;
+    setEventEditor(null); setEventDateField(null); setEventLocating(false); setProfileEditorOpen(false);
+    composerDrafts.current.clear();
+  }, [token]);
+
+  const saveProfile = async (draft: ProfileDraft, avatar: ImagePicker.ImagePickerAsset | null) => {
+    if (!token || !me) throw new Error('Log in to edit your profile.');
+    const ownerId = me.id;
+    const data = new FormData();
+    data.append('display_name', draft.display_name);
+    data.append('bio', draft.bio);
+    data.append('city', draft.city);
+    if (avatar) data.append('avatar', new File(avatar.uri));
+    const updated: User = await api('/people/me/', {method: 'PATCH', body: data});
+    if (sessionToken.current !== token || updated.id !== ownerId) return;
+    setMe(updated);
+    setSelectedUser(current => current?.id === ownerId ? updated : current);
+    const updateAuthor = (items: Post[]) => items.map(post => post.author.id === ownerId ? {...post, author: updated} : post);
+    setPosts(updateAuthor); setReels(updateAuthor); setEventPosts(updateAuthor); setProfilePosts(updateAuthor);
+  };
+  const openProfileEditor = () => {
+    if (!token || !me) return;
+    setSelectedUser(null); setPeoplePanel(null); setProfileEditorOpen(true);
   };
 
   const loadMe = async () => {
@@ -210,8 +334,34 @@ function SocialQuestApp() {
     setPosts(rows<Post>(result[0]));
     setReels(rows<Post>(result[1]));
   };
+  const loadProfilePosts = async (userId: number) => {
+    if (currentProfileId.current !== userId) return;
+    const version = ++profileRequestVersion.current;
+    const isCurrentProfile = () => currentProfileId.current === userId && profileRequestVersion.current === version;
+    setProfilePostsLoading(true);
+    setProfilePostsError('');
+    try {
+      // The recommended feed is capped and ranked. A profile needs every visible
+      // post by this author, including reels and older posts (api follows pages).
+      const result = rows<Post>(await api('/posts/?author=' + userId));
+      if (!isCurrentProfile()) return;
+      setProfilePosts(result);
+      setProfilePostsOwner(userId);
+    } catch (error: any) {
+      if (isCurrentProfile()) setProfilePostsError(error.message || 'Could not load this profile’s moments.');
+    } finally {
+      if (isCurrentProfile()) setProfilePostsLoading(false);
+    }
+  };
+  const refreshVisibleProfile = async () => {
+    if (currentProfileId.current) await loadProfilePosts(currentProfileId.current);
+  };
   const loadFollowing = async () => setFollowing(rows<User>(await api('/people/following/')));
-  const loadChats = async () => setConversations(rows<Conversation>(await api('/conversations/')));
+  const loadChats = async () => {
+    const chats = rows<Conversation>(await api('/conversations/'));
+    setConversations(chats);
+    setActiveChat(current => current ? chats.find(chat => chat.id === current.id) || (current.event ? null : current) : null);
+  };
   const loadMessages = async (id: number) => { const result = rows<ChatMessage>(await api('/messages/?conversation=' + id)); if (activeChatId.current === id) setMessages(result); };
   const loadNotifications = async () => setNotifications(rows<NotificationItem>(await api('/notifications/')));
 
@@ -223,9 +373,9 @@ function SocialQuestApp() {
     const version = ++peopleRequestVersion.current;
     setPeopleLoading(true); setPeopleError('');
     try {
-      const path = panel.kind === 'search' ? '/people/' : '/people/' + panel.person!.id + '/' + panel.kind + '/';
+      const path = panel.kind === 'search' || panel.kind === 'invite' ? '/people/' : '/people/' + panel.person!.id + '/' + panel.kind + '/';
       const result = rows<User>(await api(path + '?q=' + encodeURIComponent(search.trim())));
-      if (version === peopleRequestVersion.current) setPeopleResults(result.filter(person => panel.kind !== 'search' || person.id !== me?.id));
+      if (version === peopleRequestVersion.current) setPeopleResults(result.filter(person => (panel.kind !== 'search' && panel.kind !== 'invite') || person.id !== me?.id));
     } catch (error: any) {
       if (version === peopleRequestVersion.current) { setPeopleResults([]); setPeopleError(error.message); }
     } finally { if (version === peopleRequestVersion.current) setPeopleLoading(false); }
@@ -235,6 +385,21 @@ function SocialQuestApp() {
     setSelectedUser(null); setPeoplePanel(panel); setPeopleQuery(''); setPeopleResults([]);
     void loadPeopleList(panel);
   };
+  const openInviteList = (eventId: number) => {
+    const panel: PeoplePanel = {kind: 'invite', eventId};
+    setSelectedUser(null); setPeoplePanel(panel); setPeopleQuery(''); setPeopleResults([]);
+    void loadPeopleList(panel);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void SecureStore.getItemAsync(AUTH_TOKEN_KEY).then(savedToken => {
+      if (cancelled || !savedToken) return;
+      sessionToken.current = savedToken;
+      setToken(savedToken);
+    }).catch(() => {}).finally(() => { if (!cancelled) setAuthReady(true); });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', state => setAppActive(state === 'active'));
@@ -256,16 +421,19 @@ function SocialQuestApp() {
           await fetch(API_URL + '/people/presence/', {
             method: online ? 'PUT' : 'DELETE', signal: controller.signal,
             headers: {Authorization: 'Token ' + token, 'Content-Type': 'application/json'},
-            body: JSON.stringify({session_id: sessionId}),
+            body: JSON.stringify({session_id: sessionId, chats_open: online && currentTab.current === 'Chats'}),
           });
         } finally { clearTimeout(timeout); }
       }).catch(() => {});
+      return queue;
     };
+    presenceSync.current = sendPresence;
     sendPresence(AppState.currentState === 'active');
     const subscription = AppState.addEventListener('change', state => sendPresence(state === 'active'));
     const timer = setInterval(() => { if (AppState.currentState === 'active') sendPresence(true); }, 20000);
     return () => { clearInterval(timer); subscription.remove(); sendPresence(false); };
   }, [token]);
+  useEffect(() => { presenceSync.current?.(AppState.currentState === 'active'); }, [tab]);
   useEffect(() => {
     if (!token || tab !== 'Chats' || !appActive) return;
     let cancelled = false;
@@ -279,7 +447,7 @@ function SocialQuestApp() {
         const chats = rows<Conversation>(await api('/conversations/', {signal: controller.signal}));
         if (!cancelled) {
           setConversations(chats);
-          setActiveChat(current => current ? chats.find(chat => chat.id === current.id) || current : null);
+          setActiveChat(current => current ? chats.find(chat => chat.id === current.id) || (current.event ? null : current) : null);
         }
       } catch (_) {
         if (!cancelled) {
@@ -308,6 +476,15 @@ function SocialQuestApp() {
     return () => { cancelled = true; };
   }, [token, selectedUser?.id]);
 
+  useEffect(() => {
+    profileRequestVersion.current += 1;
+    setProfilePosts([]); setProfilePostsOwner(null); setProfilePostsError('');
+    setProfileSection('POST');
+    if (token && profileUserId) void loadProfilePosts(profileUserId);
+    else setProfilePostsLoading(false);
+    return () => { profileRequestVersion.current += 1; };
+  }, [token, profileUserId, !!selectedUser]);
+
   const refresh = async (task: () => Promise<unknown>) => { setRefreshing(true); try { await task(); } catch (error: any) { Alert.alert('Could not refresh', error.message); } finally { setRefreshing(false); } };
 
   useEffect(() => {
@@ -315,7 +492,8 @@ function SocialQuestApp() {
     void Promise.all([loadMe(), loadDiscover(), loadFeed(), loadChats(), loadNotifications(), loadFollowing()]).catch(error => Alert.alert('Could not load your account', error.message));
   }, [token]);
   useEffect(() => {
-    if (!activeChat || !token || tab !== 'Chats') return;
+    if (!activeChat) { setMessages([]); setChatMembersOpen(false); return; }
+    if (!token || tab !== 'Chats') return;
     setMessages([]);
     void loadMessages(activeChat.id).catch(error => Alert.alert('Could not load chat', error.message));
     const timer = setInterval(() => void loadMessages(activeChat.id).catch(() => {}), 4000);
@@ -337,6 +515,7 @@ function SocialQuestApp() {
         ? { username: username.trim(), password }
         : { username: username.trim(), password, email: email.trim(), ...(displayName.trim() ? { display_name: displayName.trim() } : {}) };
       const data = await api('/auth/' + mode + '/', { method: 'POST', body: JSON.stringify(body) }, '');
+      await SecureStore.setItemAsync(AUTH_TOKEN_KEY, data.token);
       sessionToken.current = data.token;
       setToken(data.token);
       setMe(data.user);
@@ -350,12 +529,16 @@ function SocialQuestApp() {
   };
 
   const logout = async () => {
+    await presenceSync.current?.(false);
+    await deviceNotifications.disable();
     try { await api('/auth/logout/', { method: 'POST' }); } catch (_) {}
+    await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY).catch(() => {});
     sessionToken.current = '';
     setToken('');
     setMe(null);
     setPosts([]); setReels([]); setEvents([]); setPeople([]); setFollowing([]); setConversations([]); setNotifications([]);
-    setHostedEvents([]); setJoinedEvents([]); setEventRequests([]); setEventProofs([]); setMessageOptions(null); setChatEditor(null);
+    setHostedEvents([]); setJoinedEvents([]); setEventRequests([]); setMessageOptions(null); setChatEditor(null);
+    activeCommentPostId.current = null; commentPanelVersion.current += 1; commentRequestVersion.current += 1;
     setSelectedEvent(null); setSelectedUser(null); setComposeOpen(false); setCommentPost(null); setEditingPost(null); setProofQuest(null); setMoment(''); setMomentMedia(null);
     setActiveChat(null);
     setMessages([]);
@@ -401,21 +584,38 @@ function SocialQuestApp() {
     if (!activeChat || !message.trim() || sendInFlight.current) return;
     sendInFlight.current = true;
     const body = message.trim();
+    const conversationId = activeChat.id;
     setMessage('');
     setEmojiPickerOpen(false);
     try {
-      await api('/messages/', { method: 'POST', body: JSON.stringify({ conversation: activeChat.id, body }) });
-      await Promise.all([loadMessages(activeChat.id), loadChats()]);
+      const sent = await api('/messages/', { method: 'POST', body: JSON.stringify({ conversation: conversationId, body }) });
+      if (activeChatId.current === conversationId) setMessages(current => current.some(item => item.id === sent.id) ? current : [...current, sent]);
+      // A refresh failure must not turn an acknowledged send into a retry.
+      await Promise.allSettled([loadMessages(conversationId), loadChats()]);
     } catch (error: any) {
-      setMessage(current => current || body);
-      Alert.alert('Message not sent', error.message);
+      if (sessionToken.current === token) {
+        if (activeChatId.current === conversationId) setMessage(current => current || body);
+        Alert.alert('Message not sent', error.message);
+      }
     } finally { sendInFlight.current = false; }
+  };
+
+  const openEventChat = async () => {
+    if (!selectedEvent || openingEventChat.current) return;
+    openingEventChat.current = true;
+    try {
+      const chat: Conversation = await api('/events/' + selectedEvent.id + '/chat/', {method: 'POST', body: '{}'});
+      setConversations(current => [chat, ...current.filter(item => item.id !== chat.id)]);
+      setSelectedEvent(null); setTab('Chats'); setActiveChat(chat);
+    } catch (error: any) { Alert.alert('Could not open event chat', error.message); }
+    finally { openingEventChat.current = false; }
   };
 
   const showChatOptions = () => {
     if (!activeChat) return;
-    Alert.alert('Chat options', 'A chat name is shared with the other participant. Removing a chat only clears it from your inbox.', [
-      { text: 'Edit chat name', onPress: () => setChatEditor({ kind: 'conversation', id: activeChat.id, value: activeChat.title || '' }) },
+    Alert.alert('Chat options', activeChat.event ? 'This group includes the host and accepted participants. Its name follows the event.' : 'A chat name is shared with the other participants. Removing a chat only clears it from your inbox.', [
+      ...(activeChat.is_group ? [{text: 'View participants', onPress: () => setChatMembersOpen(true)}] : []),
+      ...(!activeChat.event ? [{ text: 'Edit chat name', onPress: () => setChatEditor({ kind: 'conversation' as const, id: activeChat.id, value: activeChat.title || '' }) }] : []),
       { text: 'Remove from my inbox', style: 'destructive', onPress: () => void api('/conversations/' + activeChat.id + '/', { method: 'DELETE' }).then(async () => { setActiveChat(null); setMessages([]); await loadChats(); }).catch((error: any) => Alert.alert('Could not remove chat', error.message)) },
       { text: 'Cancel', style: 'cancel' },
     ]);
@@ -457,11 +657,96 @@ function SocialQuestApp() {
     if (!selectedEvent) return;
     try {
       await api('/events/' + selectedEvent.id + '/join/', { method: 'POST', body: '{}' });
-      Alert.alert('Request sent', 'The host can now review your public XP and karma.');
-      const updated = await api('/events/' + selectedEvent.id + '/');
-      setSelectedEvent(updated);
+      Alert.alert(selectedEvent.my_attendance_status === 'INVITED' ? 'Invitation accepted' : 'Request sent', selectedEvent.my_attendance_status === 'INVITED' ? 'You are going to this adventure.' : 'The host can now review your public XP and karma.');
+      await openEvent(selectedEvent.id);
       await loadDiscover(query.trim());
     } catch (error: any) { Alert.alert('Could not request entry', error.message); }
+  };
+
+  const cancelRsvp = async () => {
+    if (!selectedEvent) return;
+    try {
+      await api('/events/' + selectedEvent.id + '/cancel-rsvp/', {method: 'POST', body: '{}'});
+      await openEvent(selectedEvent.id);
+      await loadDiscover(query.trim());
+    } catch (error: any) { Alert.alert('Could not cancel RSVP', error.message); }
+  };
+
+  const invitePerson = async (person: User) => {
+    if (!peoplePanel?.eventId) return;
+    try {
+      await api('/events/' + peoplePanel.eventId + '/invite/', {method: 'POST', body: JSON.stringify({user_id: person.id})});
+      Alert.alert('Invitation sent', nameOf(person) + ' can now open and accept this private event.');
+    } catch (error: any) { Alert.alert('Could not invite person', error.message); }
+  };
+
+  const editDateValue = (value: string) => {
+    if (!value) return '';
+    return localDateTimeValue(dateParts(new Date(value)));
+  };
+  const closeEventEditor = () => {
+    eventEditorVersion.current += 1; eventLocationRequest.current += 1;
+    setEventEditor(null); setEventDateField(null); setEventLocating(false); setEventLocationStatus('');
+  };
+  const detectEventLocation = async () => {
+    const request = ++eventLocationRequest.current;
+    const editor = eventEditorVersion.current;
+    const isCurrent = () => request === eventLocationRequest.current && editor === eventEditorVersion.current;
+    setEventLocating(true); setEventLocationStatus('Finding your location…');
+    try {
+      const place = await locateHostVenue();
+      if (!isCurrent()) return;
+      setEventEditor(current => current ? {...current, ...place} : current);
+      setEventLocationStatus('Location detected. Check the venue before publishing.');
+    } catch (error: any) {
+      if (isCurrent()) setEventLocationStatus(error.message || 'Location is unavailable. Enter the venue below.');
+    } finally { if (isCurrent()) setEventLocating(false); }
+  };
+  const changeEventLocation = (value: string) => {
+    eventLocationRequest.current += 1;
+    setEventLocating(false); setEventLocationStatus('');
+    setEventEditor(current => current ? {...current, location_name: value, latitude: null, longitude: null} : current);
+  };
+  const openEventEditor = (event?: EventItem) => {
+    eventEditorVersion.current += 1; eventLocationRequest.current += 1;
+    setEventDateField(null);
+    setEventLocating(false); setEventLocationStatus('');
+    const start = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    start.setMinutes(Math.ceil(start.getMinutes() / 5) * 5, 0, 0);
+    const end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+    setEventEditor(event ? {
+      id: event.id, name: event.name, description: event.description, location_name: event.location_name,
+      latitude: event.latitude ?? null, longitude: event.longitude ?? null,
+      starts_at: editDateValue(event.starts_at), ends_at: editDateValue(event.ends_at), capacity: String(event.capacity), privacy: event.privacy,
+    } : {name: '', description: '', location_name: '', latitude: null, longitude: null, starts_at: editDateValue(start.toISOString()), ends_at: editDateValue(end.toISOString()), capacity: '12', privacy: 'PUBLIC'});
+    if (!event) void detectEventLocation();
+  };
+  const saveEvent = async () => {
+    if (!eventEditor || busy || eventLocating || eventSaveInFlight.current) return;
+    const capacity = Number(eventEditor.capacity);
+    const starts = new Date(eventEditor.starts_at);
+    const ends = new Date(eventEditor.ends_at);
+    if (!eventEditor.name.trim() || !eventEditor.description.trim() || !eventEditor.location_name.trim() || !Number.isFinite(starts.getTime()) || !Number.isFinite(ends.getTime()) || ends <= starts || !Number.isInteger(capacity) || capacity < 2) {
+      return Alert.alert('Check event details', 'Add a name, description, venue, an end time after the start, and a whole-number capacity of at least 2.');
+    }
+    eventSaveInFlight.current = true; setBusy(true);
+    try {
+      const payload = {...eventEditor, capacity, starts_at: starts.toISOString(), ends_at: ends.toISOString()};
+      delete (payload as any).id;
+      const saved = await api(eventEditor.id ? '/events/' + eventEditor.id + '/' : '/events/', {method: eventEditor.id ? 'PATCH' : 'POST', body: JSON.stringify(payload)});
+      if (!eventEditor.id) await api('/events/' + saved.id + '/generate-quests/', {method: 'POST', body: '{}'}).catch(() => {});
+      closeEventEditor();
+      await Promise.allSettled([loadMe(), loadDiscover(query.trim()), openEvent(saved.id)]);
+    } catch (error: any) { Alert.alert('Could not save event', error.message); }
+    finally { eventSaveInFlight.current = false; setBusy(false); }
+  };
+  const deleteEvent = () => {
+    if (!selectedEvent) return;
+    const eventId = selectedEvent.id;
+    Alert.alert('Delete this event?', 'The event, its quests, and its group chat messages will be removed. Private moments will stay private.', [
+      {text: 'Keep event', style: 'cancel'},
+      {text: 'Delete', style: 'destructive', onPress: () => void api('/events/' + eventId + '/', {method: 'DELETE'}).then(async () => { setSelectedEvent(null); await Promise.all([loadMe(), loadDiscover(query.trim())]); }).catch((error: any) => Alert.alert('Could not delete event', error.message))},
+    ]);
   };
 
   const openEvent = async (eventId: number) => {
@@ -474,10 +759,10 @@ function SocialQuestApp() {
       setSelectedEvent(event);
       setEventQuests(rows<Quest>(questData));
       setEventPosts(rows<Post>(postData));
-      setEventRequests([]); setEventProofs([]);
+      setEventRequests([]);
       if (event.host.id === me?.id) {
-        const [requests, proofs] = await Promise.all([api('/events/' + eventId + '/requests/'), api('/events/' + eventId + '/submissions/')]);
-        setEventRequests(rows<AttendanceItem>(requests)); setEventProofs(rows<ProofItem>(proofs));
+        const requests = await api('/events/' + eventId + '/requests/');
+        setEventRequests(rows<AttendanceItem>(requests));
       }
       setRatingTargets([]);
       setEventRatings([]);
@@ -492,20 +777,28 @@ function SocialQuestApp() {
     } catch (error: any) { Alert.alert('Could not open event', error.message); }
   };
 
-  const reviewEventItem = async (id: number, decision: string, proof = false) => {
+  const reviewEventItem = async (id: number, decision: string) => {
     if (!selectedEvent) return;
     try {
-      await api(proof ? '/submissions/' + id + '/review/' : '/events/' + selectedEvent.id + '/review-request/', { method: 'POST', body: JSON.stringify(proof ? { decision } : { attendance_id: id, decision }) });
+      await api('/events/' + selectedEvent.id + '/review-request/', { method: 'POST', body: JSON.stringify({ attendance_id: id, decision }) });
       await openEvent(selectedEvent.id);
     } catch (error: any) { Alert.alert('Could not save review', error.message); }
   };
 
+  const openComposer = (quest: Quest | null) => {
+    const draft = composerDrafts.current.get(quest ? 'quest:' + quest.id : 'post');
+    setMoment(draft?.caption || ''); setMomentMedia(draft?.media || null); setMomentLocation(draft?.location || '');
+    setProofQuest(quest); setComposeOpen(true);
+  };
+  const closeComposer = (discard: boolean) => {
+    const key = proofQuest ? 'quest:' + proofQuest.id : 'post';
+    if (discard) composerDrafts.current.delete(key);
+    else composerDrafts.current.set(key, {caption: moment, media: momentMedia, location: momentLocation});
+    setMoment(''); setMomentMedia(null); setMomentLocation(''); setProofQuest(null); setComposeOpen(false);
+  };
   const beginQuestProof = (quest: Quest) => {
-    setProofQuest(quest);
-    setMoment('');
-    setMomentMedia(null);
-    setMomentLocation('');
-    setComposeOpen(true);
+    if (!selectedEvent || selectedEvent.quest_status !== 'ACTIVE' || selectedEvent.my_attendance_status !== 'ACCEPTED' || quest.my_submission) return;
+    openComposer({...quest, event: selectedEvent.id, event_name: selectedEvent.name});
   };
 
   const rateAttendee = async (targetId: number, reaction: Reaction) => {
@@ -517,17 +810,18 @@ function SocialQuestApp() {
   };
 
   const openNotification = async (notification: NotificationItem) => {
+    if (!notification.is_read) {
+      setNotifications(current => current.map(item => item.id === notification.id ? { ...item, is_read: true } : item));
+      void api('/notifications/mark-read/', { method: 'POST', body: JSON.stringify({ ids: [notification.id] }) }).catch(() => {});
+    }
     try {
-      if (notification.event) {
+      if (notification.comment_post_id) {
+        const post = await api('/posts/' + notification.comment_post_id + '/');
+        setTab('Home');
+        await openComments(post);
+      } else if (notification.event) {
         await openEvent(notification.event.id);
         setTab('Explore');
-      } else if (notification.conversation_id) {
-        const chats = await api('/conversations/');
-        const conversation = rows<Conversation>(chats).find(item => item.id === notification.conversation_id);
-        if (conversation) {
-          setActiveChat(conversation);
-          setTab('Chats');
-        }
       }
     } catch (error: any) { Alert.alert('Could not open notification', error.message); }
   };
@@ -540,17 +834,77 @@ function SocialQuestApp() {
     } catch (_) {}
   };
 
-  const choosePhoto = async () => {
+  const choosePhoto = async (videoOnly = false) => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) return Alert.alert('Photos are off', 'Allow photo access to attach an image to this post.');
-    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images', 'videos'], allowsEditing: false, quality: 0.82 });
-    if (!result.canceled) setMomentMedia(result.assets[0]);
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: videoOnly ? ['videos'] : ['images', 'videos'], allowsEditing: false, quality: 0.82 });
+    if (!result.canceled) {
+      const asset = result.assets[0];
+      const fileSize = asset.fileSize ?? new File(asset.uri).size;
+      if (typeof fileSize === 'number' && fileSize > MAX_UPLOAD_BYTES) return Alert.alert('File is too large', 'Choose a photo or video that is 50 MB or smaller.');
+      if (asset.type === 'video') setMomentMedia(asset);
+      else setPhotoEditor({ original: asset, working: asset });
+    }
   };
   const takePhoto = async () => {
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) return Alert.alert('Camera is off', 'Allow camera access to take a photo for this post.');
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], allowsEditing: true, quality: 0.82 });
-    if (!result.canceled) setMomentMedia(result.assets[0]);
+    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], allowsEditing: false, quality: 0.82 });
+    if (!result.canceled) {
+      const asset = result.assets[0];
+      setPhotoEditor({ original: asset, working: asset });
+    }
+  };
+  const saveEditedImage = async (configure: (context: ReturnType<typeof ImageManipulator.manipulate>) => void) => {
+    if (!photoEditor || photoEditInFlight.current) return;
+    const source = photoEditor.working;
+    photoEditInFlight.current = true;
+    setPhotoEditorBusy(true);
+    try {
+      const context = ImageManipulator.manipulate(source.uri);
+      configure(context);
+      const rendered = await context.renderAsync();
+      const result = await rendered.saveAsync({ compress: 0.86, format: SaveFormat.JPEG });
+      const working: ImagePicker.ImagePickerAsset = {
+        ...source,
+        assetId: null,
+        base64: null,
+        exif: null,
+        fileName: 'socialquest-photo.jpg',
+        fileSize: undefined,
+        height: result.height,
+        mimeType: 'image/jpeg',
+        type: 'image',
+        uri: result.uri,
+        width: result.width,
+      };
+      setPhotoEditor(current => current?.working.uri === source.uri ? { ...current, working } : current);
+    } catch (_) {
+      Alert.alert('Could not edit photo', 'That edit could not be applied. Your original photo is still safe.');
+    } finally {
+      photoEditInFlight.current = false;
+      setPhotoEditorBusy(false);
+    }
+  };
+  const transformPhoto = (operation: PhotoOperation) => void saveEditedImage(context => {
+    if (operation === 'rotate-left') context.rotate(-90);
+    if (operation === 'rotate-right') context.rotate(90);
+    if (operation === 'mirror') context.flip(FlipType.Horizontal);
+  });
+  const cropPhoto = (ratio: number) => {
+    if (!photoEditor) return;
+    const { width, height } = photoEditor.working;
+    if (!width || !height) return Alert.alert('Crop unavailable', 'We could not read this photo’s dimensions.');
+    let cropWidth = width;
+    let cropHeight = height;
+    if (width / height > ratio) cropWidth = Math.floor(height * ratio);
+    else cropHeight = Math.floor(width / ratio);
+    void saveEditedImage(context => context.crop({
+      originX: Math.floor((width - cropWidth) / 2),
+      originY: Math.floor((height - cropHeight) / 2),
+      width: cropWidth,
+      height: cropHeight,
+    }));
   };
   const tagCurrentLocation = async () => {
     const permission = await Location.requestForegroundPermissionsAsync();
@@ -565,31 +919,35 @@ function SocialQuestApp() {
   };
   const share = async () => {
     if (uploadInFlight.current) return;
-    if (proofQuest && !momentMedia) return Alert.alert('Add quest proof', 'Attach a photo or reel to complete this quest.');
+    if (proofQuest && !momentMedia) return Alert.alert('Add your quest moment', 'Choose a photo or video reel to complete this quest.');
     if (!proofQuest && !moment.trim() && !momentMedia) return Alert.alert('Add a moment', 'Write a few words or attach a photo before posting.');
-    if (momentMedia?.fileSize && momentMedia.fileSize > 50 * 1024 * 1024) return Alert.alert('File too large', 'Choose a photo or video smaller than 50 MB.');
     uploadInFlight.current = true; setBusy(true);
     try {
+      const uploadMedia = momentMedia;
+      const uploadSize = uploadMedia ? (uploadMedia.fileSize ?? new File(uploadMedia.uri).size) : 0;
+      if (typeof uploadSize === 'number' && uploadSize > MAX_UPLOAD_BYTES) throw new Error('Choose a photo or video that is 50 MB or smaller.');
       const data = new FormData();
       if (proofQuest) {
         data.append('quest', String(proofQuest.id));
         data.append('caption', moment.trim());
-        data.append('media_type', momentMedia?.type === 'video' ? 'REEL' : 'IMAGE');
+        data.append('media_type', uploadMedia?.type === 'video' ? 'REEL' : 'IMAGE');
       } else {
-        data.append('kind', momentMedia?.type === 'video' ? 'REEL' : 'POST');
+        data.append('kind', uploadMedia?.type === 'video' ? 'REEL' : 'POST');
         data.append('body', moment.trim());
         if (momentLocation) data.append('location_name', momentLocation);
       }
-      if (momentMedia) data.append('media', new File(momentMedia.uri));
+      if (uploadMedia) data.append('media', new File(uploadMedia.uri));
       await api(proofQuest ? '/submissions/' : '/posts/', { method: 'POST', body: data });
       setMoment('');
       setMomentMedia(null);
       setMomentLocation('');
-      const refreshEventId = proofQuest && selectedEvent?.id;
+      const completedQuest = proofQuest;
+      composerDrafts.current.delete(completedQuest ? 'quest:' + completedQuest.id : 'post');
+      const refreshEventId = completedQuest?.event;
       setProofQuest(null);
       setComposeOpen(false);
-      if (refreshEventId) await openEvent(refreshEventId);
-      else await loadFeed();
+      await Promise.allSettled([refreshVisibleProfile(), loadFeed(), loadMe(), ...(refreshEventId ? [openEvent(refreshEventId)] : [])]);
+      if (completedQuest) Alert.alert('Quest complete! ✦', '+' + completedQuest.xp_reward + ' XP earned. Your ' + (uploadMedia?.type === 'video' ? 'reel' : 'photo') + ' is now part of ' + (completedQuest.event_name || 'the event') + '.');
     } catch (error: any) { Alert.alert(proofQuest ? 'Could not share quest proof' : 'Could not share moment', error.message); } finally { uploadInFlight.current = false; setBusy(false); }
   };
 
@@ -599,7 +957,7 @@ function SocialQuestApp() {
     try {
       const result = await api('/posts/' + post.id + '/like/', { method: post.liked_by_me ? 'DELETE' : 'POST' });
       const update = (item: Post) => item.id === post.id ? { ...item, liked_by_me: result.liked, like_count: result.like_count } : item;
-      setPosts(current => current.map(update)); setReels(current => current.map(update)); setEventPosts(current => current.map(update));
+      setPosts(current => current.map(update)); setReels(current => current.map(update)); setEventPosts(current => current.map(update)); setProfilePosts(current => current.map(update));
     } catch (error: any) { Alert.alert('Could not update like', error.message); }
     finally { likeInFlight.current.delete(post.id); }
   };
@@ -643,6 +1001,7 @@ function SocialQuestApp() {
     try {
       await api('/posts/' + editingPost.id + '/', { method: 'PATCH', body: JSON.stringify({ body: editBody.trim(), location_name: editLocation.trim() }) });
       setEditingPost(null);
+      await refreshVisibleProfile();
       await loadFeed();
       if (selectedEvent) await openEvent(selectedEvent.id);
     } catch (error: any) { Alert.alert('Could not save post', error.message); }
@@ -650,62 +1009,137 @@ function SocialQuestApp() {
   const deletePost = (post: Post) => {
     Alert.alert('Delete this post?', 'This cannot be undone.', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: () => void api('/posts/' + post.id + '/', { method: 'DELETE' }).then(async () => { await loadFeed(); if (selectedEvent) await openEvent(selectedEvent.id); }).catch((error: any) => Alert.alert('Could not delete post', error.message)) },
+      { text: 'Delete', style: 'destructive', onPress: () => void api('/posts/' + post.id + '/', { method: 'DELETE' }).then(async () => { setProfilePosts(current => current.filter(item => item.id !== post.id)); await refreshVisibleProfile(); await loadFeed(); if (selectedEvent) await openEvent(selectedEvent.id); }).catch((error: any) => Alert.alert('Could not delete post', error.message)) },
     ]);
   };
-  const loadComments = async (postId: number) => setComments(rows<CommentItem>(await api('/comments/?post=' + postId)));
+  const loadComments = async (postId: number) => {
+    if (activeCommentPostId.current !== postId) return;
+    const version = ++commentRequestVersion.current;
+    const result = rows<CommentItem>(await api('/comments/?post=' + postId));
+    if (activeCommentPostId.current === postId && version === commentRequestVersion.current) setComments(result);
+  };
   const openComments = async (post: Post) => {
+    activeCommentPostId.current = post.id;
+    const panelVersion = ++commentPanelVersion.current;
     setCommentPost(post);
     setComments(post.recent_comments || []);
     setCommentBody('');
     setEditingComment(null);
-    try { await loadComments(post.id); } catch (error: any) { Alert.alert('Could not load comments', error.message); }
+    setReplyingTo(null);
+    try { await loadComments(post.id); } catch (error: any) {
+      if (panelVersion === commentPanelVersion.current) Alert.alert('Could not load comments', error.message);
+    }
+  };
+  const closeComments = () => {
+    activeCommentPostId.current = null;
+    commentPanelVersion.current += 1; commentRequestVersion.current += 1;
+    Keyboard.dismiss();
+    setCommentPost(null);
+    setCommentBody('');
+    setEditingComment(null);
+    setReplyingTo(null);
+  };
+  const replyToComment = (comment: CommentItem) => {
+    if (commentInFlight.current) return;
+    const mention = '@' + comment.author.username + ' ';
+    setEditingComment(null);
+    setReplyingTo(comment);
+    setCommentBody(current => current.startsWith(mention) ? current : mention + current);
+    requestAnimationFrame(() => commentInputRef.current?.focus());
+  };
+  const clearReplyTarget = () => {
+    const mention = replyingTo ? '@' + replyingTo.author.username + ' ' : '';
+    if (mention) setCommentBody(current => current.startsWith(mention) ? current.slice(mention.length) : current);
+    setReplyingTo(null);
   };
   const updateCommentCount = (postId: number, change: number) => {
     const adjust = (post: Post) => post.id === postId ? { ...post, comment_count: Math.max(0, post.comment_count + change) } : post;
     setPosts(current => current.map(adjust));
+    setReels(current => current.map(adjust));
     setEventPosts(current => current.map(adjust));
+    setProfilePosts(current => current.map(adjust));
     setCommentPost(current => current?.id === postId ? adjust(current) : current);
   };
   const saveComment = async () => {
     const body = commentBody.trim();
-    if (!commentPost || !body) return;
+    if (!commentPost || !body || commentInFlight.current) return;
+    commentInFlight.current = true; setCommentSubmitting(true);
+    const postId = commentPost.id;
+    const panelVersion = commentPanelVersion.current;
+    const isCurrentPanel = () => activeCommentPostId.current === postId && commentPanelVersion.current === panelVersion;
+    let saved = false;
     try {
       const isNewComment = !editingComment;
       if (editingComment) await api('/comments/' + editingComment.id + '/', { method: 'PATCH', body: JSON.stringify({ body }) });
-      else await api('/comments/', { method: 'POST', body: JSON.stringify({ post: commentPost.id, body }) });
+      else await api('/comments/', { method: 'POST', body: JSON.stringify({ post: postId, parent: replyingTo?.id || null, body }) });
+      saved = true;
+      if (isNewComment) updateCommentCount(postId, 1);
+      if (!isCurrentPanel()) return;
       setCommentBody('');
       setEditingComment(null);
-      if (isNewComment) updateCommentCount(commentPost.id, 1);
-      await loadComments(commentPost.id);
-    } catch (error: any) { Alert.alert('Could not save comment', error.message); }
+      setReplyingTo(null);
+      await Promise.all([loadComments(postId), loadNotifications()]);
+    } catch (error: any) {
+      if (isCurrentPanel()) Alert.alert(saved ? 'Reply saved' : 'Could not save comment', saved ? 'Your reply was saved. Reopen the comments to refresh them.' : error.message);
+    } finally { commentInFlight.current = false; setCommentSubmitting(false); }
+  };
+  const commentThreadIds = (rootId: number) => {
+    const ids = new Set([rootId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      comments.forEach(comment => {
+        if (comment.parent && ids.has(comment.parent) && !ids.has(comment.id)) {
+          ids.add(comment.id);
+          changed = true;
+        }
+      });
+    }
+    return ids;
   };
   const showCommentOptions = (comment: CommentItem) => {
-    if (comment.author.id !== me?.id) return;
+    if (commentInFlight.current || comment.author.id !== me?.id) return;
+    const deletedIds = commentThreadIds(comment.id);
     Alert.alert('Your comment', 'Edit it or delete it permanently.', [
-      { text: 'Edit', onPress: () => { setEditingComment(comment); setCommentBody(comment.body); } },
-      { text: 'Delete', style: 'destructive', onPress: () => void api('/comments/' + comment.id + '/', { method: 'DELETE' }).then(() => { if (commentPost) { setComments(current => current.filter(item => item.id !== comment.id)); updateCommentCount(commentPost.id, -1); } }).catch((error: any) => Alert.alert('Could not delete comment', error.message)) },
+      { text: 'Edit', onPress: () => { setReplyingTo(null); setEditingComment(comment); setCommentBody(comment.body); requestAnimationFrame(() => commentInputRef.current?.focus()); } },
+      { text: 'Delete', style: 'destructive', onPress: () => void api('/comments/' + comment.id + '/', { method: 'DELETE' }).then(() => { if (commentPost) { setComments(current => current.filter(item => !deletedIds.has(item.id))); updateCommentCount(commentPost.id, -deletedIds.size); } }).catch((error: any) => Alert.alert('Could not delete comment', error.message)) },
       { text: 'Cancel', style: 'cancel' },
     ]);
   };
+
+  const openDeviceNotification = async (notice: DeliveryNotice) => {
+    if (notice.recipient_id !== me?.id) return;
+    closePeople(); setSelectedEvent(null); closeComments();
+    if (notice.kind === 'MESSAGE' && notice.conversation_id) {
+      const conversation = await api('/conversations/' + notice.conversation_id + '/');
+      setActiveChat(conversation); setTab('Chats');
+    } else if (notice.post_id) {
+      const post = await api('/posts/' + notice.post_id + '/');
+      setTab('Home'); await openComments(post);
+    } else if (notice.event_id) { setTab('Explore'); await openEvent(notice.event_id); }
+    else { setTab('Notifications'); await loadNotifications(); }
+  };
+  const deviceNotifications = useDeviceNotifications({token, userId:me?.id, chatsOpen:tab === 'Chats', api, open:openDeviceNotification});
+  const notificationPermissionCard = <View style={notificationStyles.card}><Text style={notificationStyles.copy}>{deviceNotifications.message}</Text><Pressable accessibilityRole="button" disabled={deviceNotifications.busy} style={styles.secondary} onPress={() => void (deviceNotifications.enabled ? deviceNotifications.disable() : deviceNotifications.enable())}><Text style={styles.secondaryText}>{deviceNotifications.busy ? 'Please wait…' : deviceNotifications.enabled ? 'Turn off notifications' : deviceNotifications.settingsNeeded ? 'Open notification settings' : 'Enable notifications'}</Text></Pressable></View>;
+
+  if (!authReady) return <View style={styles.auth}><Text style={styles.authWordBrand}>SocialQuest</Text><Text style={styles.copy}>Restoring your adventure…</Text></View>;
 
   if (!token) {
     return <View style={styles.auth}>
       <StatusBar style="light" />
       <View style={[styles.authArt, { paddingTop: insets.top + 24 }]}>
-        <View pointerEvents="none" style={styles.authGrid}>{Array.from({ length: 18 }, (_, index) => <View key={'row-' + index} style={[styles.authGridRow, { top: index * 16 }]} />)}{Array.from({ length: 16 }, (_, index) => <View key={'column-' + index} style={[styles.authGridColumn, { left: index * 24 }]} />)}</View>
-        <View pointerEvents="none" style={styles.authGlow} /><View pointerEvents="none" style={styles.authOrbitLarge} /><View pointerEvents="none" style={styles.authOrbitSmall} />
-        <View style={styles.authArtContent}><View style={styles.authWordmark}><View style={styles.bigMark}><Text style={styles.markText}>S</Text></View><Text style={styles.authWordBrand}>SocialQuest</Text></View><Text style={styles.authKicker}>REAL WORLD · REAL PEOPLE</Text><Text style={styles.authDisplayTitle}>Social{`\n`}<Text style={styles.authDisplayTitleAccent}>Quest.</Text></Text><Text style={styles.authSword}>⚔</Text></View>
+        <LinearGradient colors={['#3C2578', colors.field, colors.background]} style={styles.authBackdrop} /><View pointerEvents="none" style={styles.authOrbitLarge} /><View pointerEvents="none" style={styles.authOrbitSmall} />
+        <View style={styles.authArtContent}><View style={styles.authWordmark}><View style={styles.bigMark}><Text style={styles.markText}>S</Text></View><Text style={styles.authWordBrand}>SocialQuest</Text></View><Text style={styles.authKicker}>REAL WORLD · REAL PEOPLE</Text><Text style={[styles.authDisplayTitle, width < 360 && styles.authDisplayTitleCompact]}>A little adventure.{`\n`}<Text style={styles.authDisplayTitleAccent}>A real connection.</Text></Text></View>
       </View>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.authForm}>
         <ScrollView contentContainerStyle={[styles.authContent, { paddingBottom: insets.bottom + 34 }]} keyboardShouldPersistTaps="handled">
           <Text style={styles.eyebrow}>{mode === 'login' ? 'WELCOME IN' : 'START YOUR STORY'}</Text>
           <Text style={styles.authTitle}>{mode === 'login' ? 'Find your people.' : 'Start your story.'}</Text>
           <Text style={styles.authDescription}>{mode === 'login' ? 'Log in and see what your community is up to.' : 'A few details and you are ready for your first quest.'}</Text>
-          {mode === 'register' && <><Text style={styles.authLabel}>DISPLAY NAME</Text><TextInput style={styles.input} value={displayName} onChangeText={setDisplayName} placeholder="What should people call you?" placeholderTextColor="#8491ad" autoCapitalize="words" /></>}
-          <Text style={styles.authLabel}>USERNAME</Text><TextInput style={styles.input} value={username} onChangeText={setUsername} placeholder="your_username" placeholderTextColor="#8491ad" autoCapitalize="none" />
-          {mode === 'register' && <><Text style={styles.authLabel}>EMAIL</Text><TextInput style={styles.input} value={email} onChangeText={setEmail} placeholder="you@example.com" placeholderTextColor="#8491ad" keyboardType="email-address" autoCapitalize="none" /></>}
-          <Text style={styles.authLabel}>PASSWORD</Text><TextInput style={styles.input} value={password} onChangeText={setPassword} placeholder="••••••••" placeholderTextColor="#8491ad" secureTextEntry autoCapitalize="none" onSubmitEditing={authenticate} />
+          {mode === 'register' && <><Text style={styles.authLabel}>DISPLAY NAME</Text><TextInput style={styles.input} value={displayName} onChangeText={setDisplayName} placeholder="What should people call you?" placeholderTextColor={colors.muted} autoCapitalize="words" /></>}
+          <Text style={styles.authLabel}>USERNAME</Text><TextInput style={styles.input} value={username} onChangeText={setUsername} placeholder="your_username" placeholderTextColor={colors.muted} autoCapitalize="none" />
+          {mode === 'register' && <><Text style={styles.authLabel}>EMAIL</Text><TextInput style={styles.input} value={email} onChangeText={setEmail} placeholder="you@example.com" placeholderTextColor={colors.muted} keyboardType="email-address" autoCapitalize="none" /></>}
+          <Text style={styles.authLabel}>PASSWORD</Text><TextInput style={styles.input} value={password} onChangeText={setPassword} placeholder="••••••••" placeholderTextColor={colors.muted} secureTextEntry autoCapitalize="none" onSubmitEditing={authenticate} />
           <Pressable style={[styles.primary, busy && styles.dim]} onPress={authenticate} disabled={busy}><Text style={styles.primaryText}>{busy ? 'Please wait…' : mode === 'login' ? 'Log in →' : 'Create my account →'}</Text></Pressable>
           <Pressable onPress={() => setMode(mode === 'login' ? 'register' : 'login')}><Text style={styles.switchText}>{mode === 'login' ? 'New here?  Create an account' : 'Already a member?  Log in'}</Text></Pressable>
           <Text style={styles.authNote}>By continuing, you agree to build a kind, consent-first community.</Text>
@@ -714,110 +1148,228 @@ function SocialQuestApp() {
     </View>;
   }
 
-  const home = <FlatList data={posts} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><View style={socialStyles.homeHeading}><Text style={styles.eyebrow}>YOUR NEXT ADVENTURE</Text><Pressable accessibilityRole="button" accessibilityLabel="Search people" style={socialStyles.searchIconButton} onPress={() => openPeopleList('search')}><SearchIcon /></Pressable></View><Text style={styles.homeGreeting}>Hello,</Text><Text style={styles.title}>{nameOf(me)} <Text style={styles.homeSpark}>✦</Text></Text><View style={styles.questFilters}><Pressable style={[styles.questFilter, styles.questFilterActive]} onPress={() => void refresh(loadFeed)}><Text style={[styles.questFilterText, styles.questFilterTextActive]}>For you</Text></Pressable><Pressable style={styles.questFilter} onPress={() => void findNearbyEvents()}><Text style={styles.questFilterText}>Nearby</Text></Pressable><Pressable style={styles.questFilter} onPress={() => setTab('Reels')}><Text style={styles.questFilterText}>Reels</Text></Pressable></View><View style={styles.questSectionHeader}><Text style={styles.questSectionTitle}>Recommended quests</Text><Pressable onPress={() => setTab('Explore')}><Text style={styles.questSeeAll}>See all</Text></Pressable></View><View style={styles.mobileQuestDeck}>{events.slice(0, 2).map((event, index) => <Pressable key={event.id} style={styles.mobileQuestCard} onPress={() => void openEvent(event.id)}><View style={[styles.mobileQuestArt, index % 2 ? styles.mobileQuestArtAlt : null]}>{event.cover_image ? <Image style={styles.mobileQuestCover} source={{ uri: event.cover_image }} /> : <Text style={styles.mobileQuestIcon}>✦</Text>}<Text style={styles.mobileQuestDate}>{dateOf(event.starts_at).toUpperCase()}</Text><Text style={styles.mobileQuestStatus}>{event.quest_status === 'ACTIVE' ? 'LIVE NOW' : 'QUEST READY'}</Text></View><View style={styles.mobileQuestCopy}><Text numberOfLines={1} style={styles.mobileQuestName}>{event.name}</Text><Text numberOfLines={1} style={styles.mobileQuestMeta}>{event.location_name} · {event.accepted_count}/{event.capacity} joined</Text><Text style={styles.mobileQuestXp}>{event.accepted_count}/{event.capacity} going</Text></View></Pressable>)}</View><Pressable style={styles.homeComposer} onPress={() => { setProofQuest(null); setComposeOpen(true); }}><Avatar user={me} /><View style={styles.homeComposerCopy}><Text style={styles.homeComposerPrompt}>What happened on your quest today?</Text><Text style={styles.homeComposerAction}>＋ Add photo / reel     Share a moment</Text></View></Pressable></View>} ListEmptyComponent={<Empty icon="✦" title="Your feed is ready." body="Share a moment from your next adventure." />} renderItem={({ item }) => <PostCard onLike={post => void toggleLike(post)} post={item} mine={item.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={post => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + post.id + '/')} onComments={post => void openComments(post)} onOpenProfile={setSelectedUser} />} />;
-  const explore = <FlatList data={events} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(() => loadDiscover(query.trim()))} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>MAKE A PLAN</Text><Text style={styles.title}>Find your next <Text style={styles.serif}>story.</Text></Text><Text style={styles.copy}>Search events, places, hosts, and people.</Text><Pressable style={[styles.nearbyButton, nearbyActive && styles.nearbyButtonActive]} onPress={() => void findNearbyEvents()}><Text style={[styles.nearbyButtonText, nearbyActive && styles.nearbyButtonTextActive]}>⌖ {nearbyActive ? 'Showing events near you' : 'Find events near me'}</Text></Pressable><View style={styles.searchRow}><TextInput style={styles.searchInput} value={query} onChangeText={setQuery} placeholder="Search events or people" returnKeyType="search" onSubmitEditing={search} /><Pressable style={styles.searchButton} onPress={search}><Text style={styles.searchText}>Search</Text></Pressable></View>{query.trim() ? <View style={styles.matches}><Text style={styles.section}>PEOPLE · {people.length}</Text>{people.length ? people.map(person => <Pressable key={person.id} style={styles.personCard} onPress={() => setSelectedUser(person)}><Avatar user={person} /><View><Text style={styles.personName}>{nameOf(person)}</Text><Text style={styles.personMeta}>@{person.username} · ★ {person.karma ?? 0} · {person.xp || 0} XP</Text></View></Pressable>) : <Text style={styles.muted}>No matching people.</Text>}</View> : null}</View>} ListEmptyComponent={<Empty icon="⌖" title="No matching events." body="Try a place, event name, or host." />} renderItem={({ item }) => <View style={styles.eventCard}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + item.name} onPress={() => void openEvent(item.id)}><View style={styles.eventArt}><Text style={styles.eventDate}>{dateOf(item.starts_at).toUpperCase()}</Text><Text style={styles.eventIcon}>✦</Text><Text style={styles.eventBadge}>{item.quest_status === 'ACTIVE' ? 'QUEST LIVE' : 'QUEST READY'}</Text></View><View style={styles.eventText}><Text style={styles.eventName}>{item.name}</Text><Text style={styles.eventMeta}>{item.location_name} · {item.accepted_count}/{item.capacity} going</Text>{item.recommendation_reason ? <Text style={styles.eventRecommendation}>For you · {item.recommendation_reason}</Text> : null}</View></Pressable><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.host) + "'s profile"} style={styles.eventHostLink} onPress={() => setSelectedUser(item.host)}><Text style={[styles.hostMeta, styles.eventHostLinkText]}>Hosted by {nameOf(item.host)} · ★ {item.host.karma ?? 0}</Text></Pressable></View>} />;
-  const reelsView = <FlatList data={reels} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>SMALL MOMENTS, ON REPEAT</Text><Text style={styles.title}>Quest <Text style={styles.serif}>reels.</Text></Text><Text style={styles.copy}>Keep the good moments moving.</Text></View>} ListEmptyComponent={<Empty icon="◉" title="No reels yet." body="The next great moment could be yours." />} renderItem={({ item, index }) => <View style={[styles.reel, { height: 'auto', minHeight: 300 }, index % 2 ? styles.reelBlue : styles.reelPurple]}>{item.media ? <ReelVideo uri={item.media} /> : <Text style={styles.reelIcon}>◉</Text>}<Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.author) + "'s profile"} onPress={() => setSelectedUser(item.author)}><Text style={styles.reelAuthor}>{nameOf(item.author)}</Text></Pressable><Text style={styles.reelBody}>{item.body || 'A moment worth keeping.'}</Text><Pressable style={styles.reelShare} onPress={() => void shareResource('A SocialQuest reel', 'Come see this community reel on SocialQuest.', '/s/post/' + item.id + '/')}><Text style={styles.reelShareText}>↗ Share</Text></Pressable></View>} />;
+  const rootComments = comments.filter(comment => !comment.parent || !comments.some(candidate => candidate.id === comment.parent));
+  const renderCommentThread = (comment: CommentItem, depth = 0): ReactNode => {
+    const childComments = comments.filter(candidate => candidate.parent === comment.id);
+    return <View key={comment.id} style={[styles.commentThread, depth > 0 && styles.commentThreadChild]}>
+      <Pressable onLongPress={() => showCommentOptions(comment)} style={[styles.commentCard, depth > 0 && styles.subcommentCard]}>
+        <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(comment.author) + "'s profile"} onPress={() => { closeComments(); setSelectedUser(comment.author); }}><Avatar user={comment.author} /></Pressable>
+        <View style={styles.commentCopy}>
+          <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(comment.author) + "'s profile"} onPress={() => { closeComments(); setSelectedUser(comment.author); }}><Text style={styles.personName}>{nameOf(comment.author)}</Text></Pressable>
+          <Text style={styles.commentBody}>{comment.body}</Text>
+          <View style={styles.commentActions}>
+            <Text style={styles.personMeta}>{dateOf(comment.created_at)}{comment.author.id === me?.id ? ' · hold to manage' : ''}</Text>
+            <Pressable accessibilityRole="button" accessibilityLabel={'Reply to ' + nameOf(comment.author)} onPress={() => replyToComment(comment)} onLongPress={() => showCommentOptions(comment)} style={styles.commentReply}><Text style={styles.commentReplyText}>Reply</Text></Pressable>
+          </View>
+        </View>
+      </Pressable>
+      {childComments.map(child => renderCommentThread(child, depth + 1))}
+    </View>;
+  };
+
+  const home = <FlatList data={posts} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><View style={socialStyles.homeHeading}><Text style={styles.eyebrow}>YOUR NEXT ADVENTURE</Text><Pressable accessibilityRole="button" accessibilityLabel="Search people" style={socialStyles.searchIconButton} onPress={() => openPeopleList('search')}><GlassBackdrop /><SearchIcon /></Pressable></View><Text style={styles.homeGreeting}>Hello,</Text><Text style={styles.title}>{nameOf(me)} <Text style={styles.homeSpark}>✦</Text></Text><View style={styles.questFilters}><Pressable accessibilityRole="button" accessibilityState={{selected: true}} style={[styles.questFilter, styles.questFilterActive]} onPress={() => void refresh(loadFeed)}><Text style={[styles.questFilterText, styles.questFilterTextActive]}>For you</Text></Pressable><Pressable accessibilityRole="button" style={styles.questFilter} onPress={() => void findNearbyEvents()}><Text style={styles.questFilterText}>Nearby</Text></Pressable><Pressable accessibilityRole="button" style={styles.questFilter} onPress={() => setTab('Reels')}><Text style={styles.questFilterText}>Reels</Text></Pressable></View><View style={styles.questSectionHeader}><Text style={styles.questSectionTitle}>Recommended quests</Text><Pressable onPress={() => setTab('Explore')}><Text style={styles.questSeeAll}>See all</Text></Pressable></View><View style={styles.mobileQuestDeck}>{events.slice(0, 2).map((event, index) => <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + event.name} key={event.id} style={styles.mobileQuestCard} onPress={() => void openEvent(event.id)}><EventArtwork image={event.cover_image} date={dateOf(event.starts_at)} live={event.quest_status === 'ACTIVE'} alternate={index % 2 === 1} compact /><View style={styles.mobileQuestCopy}><Text numberOfLines={2} style={styles.mobileQuestName}>{event.name}</Text><Text numberOfLines={1} style={styles.mobileQuestMeta}>{event.location_name}</Text><Text style={styles.mobileQuestXp}>{event.accepted_count}/{event.capacity} going</Text></View></Pressable>)}</View><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.homeComposer} onPress={() => openComposer(null)}><Avatar user={me} /><View style={styles.homeComposerCopy}><Text style={styles.homeComposerPrompt}>A moment worth sharing?</Text><View style={socialStyles.homeComposerActionRow}><Ionicons name="add-circle-outline" size={17} color={colors.accent} /><Text style={styles.homeComposerAction}>Share a photo, reel, or thought</Text></View></View></Pressable>{!deviceNotifications.enabled ? <Pressable accessibilityRole="button" accessibilityLabel="Set up notifications" style={styles.notificationNudge} onPress={() => setTab('Notifications')}><Ionicons name="notifications-outline" size={19} color={colors.gold} /><View style={{flex: 1}}><Text style={styles.notificationNudgeTitle}>Stay in the loop</Text><Text style={styles.personMeta}>A heads-up for your next adventure.</Text></View><Ionicons name="chevron-forward" size={16} color={colors.muted} /></Pressable> : null}</View>} ListEmptyComponent={<Empty icon="✦" title="Your feed is ready." body="Share a moment from your next adventure." />} renderItem={({ item }) => <PostCard onLike={post => void toggleLike(post)} post={item} mine={item.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={post => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + post.id + '/')} onComments={post => void openComments(post)} onOpenProfile={setSelectedUser} />} />;
+  const explore = <FlatList data={events} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(() => loadDiscover(query.trim()))} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>MAKE A PLAN</Text><Text style={styles.title}>Find your next <Text style={styles.serif}>story.</Text></Text><Text style={styles.copy}>Search events, places, hosts, and people.</Text><Pressable style={styles.primary} onPress={() => openEventEditor()}><View style={iconLabelRow}><Text style={styles.primaryText}>Host an adventure</Text><Ionicons name="add-circle-outline" size={19} color="#fff" /></View></Pressable><Pressable style={[styles.nearbyButton, iconLabelRow, nearbyActive && styles.nearbyButtonActive]} onPress={() => void findNearbyEvents()}><Ionicons name="navigate-outline" size={17} color={nearbyActive ? '#FFFFFF' : colors.accent} /><Text style={[styles.nearbyButtonText, nearbyActive && styles.nearbyButtonTextActive]}>{nearbyActive ? 'Showing events near you' : 'Find events near me'}</Text></Pressable><View style={styles.searchRow}><TextInput style={styles.searchInput} placeholderTextColor={colors.muted} value={query} onChangeText={setQuery} placeholder="Search events or people" returnKeyType="search" onSubmitEditing={search} /><Pressable style={styles.searchButton} onPress={search}><Text style={styles.searchText}>Search</Text></Pressable></View>{query.trim() ? <View style={styles.matches}><Text style={styles.section}>PEOPLE · {people.length}</Text>{people.length ? people.map(person => <Pressable key={person.id} style={styles.personCard} onPress={() => setSelectedUser(person)}><Avatar user={person} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(person)}</Text><Text style={styles.personMeta}>@{person.username} · ★ {person.karma ?? 0} · {person.xp || 0} XP</Text></View></Pressable>) : <Text style={styles.muted}>No matching people.</Text>}</View> : null}</View>} ListEmptyComponent={<Empty icon="⌖" title="No matching events." body="Try a place, event name, or host." />} renderItem={({ item }) => <View style={styles.eventCard}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + item.name} onPress={() => void openEvent(item.id)}><EventArtwork image={item.cover_image} date={dateOf(item.starts_at)} live={item.quest_status === 'ACTIVE'} alternate={item.id % 2 === 0} /><View style={styles.eventText}><Text style={styles.eventName}>{item.name}</Text><Text style={styles.eventMeta}>{item.location_name} · {item.accepted_count}/{item.capacity} going</Text>{item.recommendation_reason ? <Text style={styles.eventRecommendation}>For you · {item.recommendation_reason}</Text> : null}</View></Pressable><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.host) + "'s profile"} style={styles.eventHostLink} onPress={() => setSelectedUser(item.host)}><Text style={[styles.hostMeta, styles.eventHostLinkText]}>Hosted by {nameOf(item.host)} · ★ {item.host.karma ?? 0}</Text></Pressable></View>} />;
+  const reelsView = <FlatList data={reels} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>SMALL MOMENTS, ON REPEAT</Text><Text style={styles.title}>Quest <Text style={styles.serif}>reels.</Text></Text><Text style={styles.copy}>Keep the good moments moving.</Text></View>} ListEmptyComponent={<Empty icon="◉" title="No reels yet." body="The next great moment could be yours." />} renderItem={({ item, index }) => <View style={[styles.reel, { height: 'auto', minHeight: 300 }, index % 2 ? styles.reelBlue : styles.reelPurple]}>{item.media ? <ReelVideo uri={item.media} /> : <Ionicons name="play-circle-outline" size={54} color="#fff" />}<Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.author) + "'s profile"} onPress={() => setSelectedUser(item.author)}><Text style={styles.reelAuthor}>{nameOf(item.author)}</Text></Pressable><RelativeTime value={item.created_at} /><QuestAttribution quest={item.quest_title} event={item.event_name} /><Text style={styles.reelBody}>{item.body || 'A moment worth keeping.'}</Text><Pressable style={[styles.reelShare, iconLabelRow]} onPress={() => void shareResource('A SocialQuest reel', 'Come see this community reel on SocialQuest.', '/s/post/' + item.id + '/')}><Ionicons name="paper-plane-outline" size={16} color="#fff" /><Text style={styles.reelShareText}>Share</Text></Pressable></View>} />;
   const activeChatPerson = activeChat?.participants.find(person => person.id !== me?.id);
-  const chats = activeChat ? <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0} style={styles.chatScreen}><View style={styles.chatHeader}><Pressable accessibilityRole="button" accessibilityLabel="Back to conversations" style={styles.chatBackButton} onPress={() => { setEmojiPickerOpen(false); Keyboard.dismiss(); setActiveChat(null); }}><Text style={styles.back}>‹</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(activeChatPerson) + "'s profile"} style={styles.chatPerson} onPress={() => activeChatPerson && setSelectedUser(activeChatPerson)}><Avatar user={activeChatPerson} /><View style={styles.chatIdentity}><Text style={styles.chatTitle}>{activeChat.display_name}</Text><Text style={styles.chatSubtitle}>Direct conversation</Text></View></Pressable>{appActive && activeChatPerson?.is_online ? <Text style={socialStyles.online}>● Online</Text> : null}<Pressable accessibilityRole="button" accessibilityLabel="Manage chat" style={styles.chatMenu} onPress={showChatOptions}><Text style={styles.chatMenuText}>•••</Text></Pressable></View><FlatList style={styles.messageScroller} inverted data={[...messages].reverse()} keyExtractor={item => String(item.id)} contentContainerStyle={styles.messageList} onRefresh={() => void refresh(() => loadMessages(activeChat.id))} refreshing={refreshing} ListEmptyComponent={<Empty icon="✦" title="This is a new conversation." body="A thoughtful hello is plenty." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel="Message options" delayLongPress={300} onLongPress={() => showMessageOptions(item)} style={[styles.bubble, item.sender.id === me?.id && styles.bubbleMine]}><Text style={[styles.bubbleText, item.sender.id === me?.id && styles.bubbleMineText, item.deleted_for_everyone && styles.bubbleDeletedText]}>{item.deleted_for_everyone ? 'Message deleted' : item.body}</Text>{!item.deleted_for_everyone ? <Text style={[styles.bubbleTime, item.sender.id === me?.id && styles.bubbleMineTime]}>{item.sender.id === me?.id ? 'You · ' : ''}{new Date(item.created_at).toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' })}{item.edited_at ? ' · edited' : ''}</Text> : null}</Pressable>} />{emojiPickerOpen ? <View style={styles.emojiPicker}>{chatEmojis.map(emoji => <Pressable key={emoji} accessibilityRole="button" accessibilityLabel={'Add ' + emoji} style={styles.emojiChoice} onPress={() => { setMessage(current => current + emoji); setEmojiPickerOpen(false); }}><Text style={styles.emojiChoiceText}>{emoji}</Text></Pressable>)}</View> : null}<View style={styles.composer}><View style={styles.composerMark}><Text style={styles.composerMarkText}>✦</Text></View><Pressable accessibilityRole="button" accessibilityLabel="Add an emoji" style={styles.emojiTrigger} onPress={() => setEmojiPickerOpen(current => !current)}><Text style={styles.emojiTriggerText}>☺</Text></Pressable><TextInput style={styles.messageInput} value={message} onChangeText={setMessage} maxLength={2000} accessibilityLabel="Message" placeholder="Write a thoughtful message…" placeholderTextColor={darkMode ? '#bda895' : '#858695'} multiline /><Pressable accessibilityRole="button" accessibilityLabel="Hide keyboard" style={styles.keyboardDismiss} onPress={Keyboard.dismiss}><Text style={styles.keyboardDismissText}>⌄</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Send message" style={styles.send} onPress={send}><Text style={styles.sendText}>↑</Text></Pressable></View></KeyboardAvoidingView> : <FlatList data={conversations} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadChats)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>YOUR INBOX</Text><View style={styles.chatIntroTitle}><Text style={styles.title}>Messages</Text><View style={styles.chatCount}><Text style={styles.chatCountText}>{conversations.length}</Text></View></View><Text style={styles.copy}>Keep the good energy going after you meet.</Text><Text style={[styles.section, { marginTop: 22 }]}>START A NEW CHAT</Text>{following.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.contacts}>{following.map(person => <Pressable key={person.id} style={styles.contact} onPress={() => void openChat(person)} onLongPress={() => setSelectedUser(person)}><Avatar user={person} /><Text numberOfLines={1} style={styles.contactName}>{nameOf(person)}</Text></Pressable>)}</ScrollView> : <Text style={styles.chatFollowHint}>Follow someone to start a chat with them.</Text>}<Text style={styles.section}>CONVERSATIONS</Text></View>} ListEmptyComponent={<Empty icon="✉" title="Your conversations will live here." body="Start with someone you met in Explore." />} renderItem={({ item }) => <Pressable style={styles.conversation} onPress={() => setActiveChat(item)} onLongPress={() => { const person = item.participants.find(person => person.id !== me?.id); if (person) setSelectedUser(person); }}><Avatar user={item.participants.find(person => person.id !== me?.id)} /><View style={styles.conversationCopy}><View style={styles.conversationTop}><Text numberOfLines={1} style={styles.personName}>{item.display_name}</Text><Text style={styles.conversationTime}>{item.latest_message ? dateOf(item.latest_message.created_at) : ''}</Text></View><Text numberOfLines={1} style={styles.personMeta}>{item.latest_message?.deleted_for_everyone ? 'Message deleted' : item.latest_message?.body || 'Start with a simple hello'}</Text>{appActive && item.participants.some(person => person.id !== me?.id && person.is_online) ? <Text style={socialStyles.online}>● Online</Text> : null}</View></Pressable>} />;
-  const notificationsView = <FlatList data={notifications} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadNotifications)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>STAY IN THE LOOP</Text><Text style={styles.title}>Your <Text style={styles.serif}>notifications.</Text></Text><Text style={styles.copy}>RSVP activity, host decisions, and new messages appear here.</Text><Pressable style={styles.outline} onPress={() => void markNotificationsRead()}><Text style={styles.outlineText}>Mark all read</Text></Pressable></View>} ListEmptyComponent={<Empty icon="✦" title="Nothing new yet." body="RSVP activity and messages will show up here." />} renderItem={({ item }) => <Pressable style={[styles.notificationCard, !item.is_read && styles.notificationUnread]} onPress={() => void openNotification(item)}><View style={styles.notificationIcon}><Text style={styles.personName}>{item.kind === 'MESSAGE' ? '✉' : '✦'}</Text></View><View style={styles.notificationCopy}><Text style={styles.notificationText}>{item.text}</Text><Text style={styles.personMeta}>{item.event?.name || (item.kind === 'MESSAGE' ? 'Open chat' : 'SocialQuest')} · {dateOf(item.created_at)}</Text></View></Pressable>} />;
-  const profile = <ScrollView contentContainerStyle={styles.profile}><View style={styles.profileTop}><Avatar user={me} large /><View><Text style={styles.eyebrow}>YOUR ADVENTURE LOG</Text><Text style={styles.profileName}>{nameOf(me)}</Text><Text style={styles.personMeta}>@{me?.username} · {me?.city || 'Everywhere'}</Text></View></View><Text style={styles.profileBio}>{me?.bio || 'Here for the little adventures that turn into real stories.'}</Text><View style={styles.scores}><Score label="XP EARNED" value={String(me?.xp || 0)} /><Score label="KARMA" value={String(me?.karma ?? 0)} /></View><View style={socialStyles.followScores}><Score label="FOLLOWERS ›" value={String(me?.follower_count || 0)} onPress={() => me && openPeopleList('followers', me)} /><Score label="FOLLOWING ›" value={String(me?.following_count || 0)} onPress={() => me && openPeopleList('following', me)} /></View><Text style={styles.profileHelp}>XP tracks completed quests. Karma comes from fellow guests after events. Both are public and independent.</Text><Text style={[styles.section, { marginTop: 24 }]}>YOUR EVENTS</Text>{[...hostedEvents, ...joinedEvents.filter(event => !hostedEvents.some(hosted => hosted.id === event.id))].map(event => <Pressable key={event.id} style={styles.personCard} onPress={() => void openEvent(event.id)}><View style={{ flex: 1 }}><Text style={styles.personName}>{event.name}</Text><Text style={styles.personMeta}>{event.host.id === me?.id ? 'Hosting' : 'Attending'} · {dateOf(event.starts_at)} · {event.location_name}</Text></View></Pressable>)}<Pressable style={styles.secondary} onPress={() => me && void shareResource('A SocialQuest profile', 'Meet ' + nameOf(me) + ' on SocialQuest.', '/?view=profile&profile=' + me.id)}><Text style={styles.secondaryText}>↗ Share profile</Text></Pressable><Pressable style={styles.logout} onPress={logout}><Text style={styles.logoutText}>↪ Log out</Text></Pressable></ScrollView>;
+  const chats = activeChat ? <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={Platform.OS === 'ios' ? appHeaderHeight : 0} style={styles.chatScreen}><View style={[styles.chatHeader, glassStyles.toolbar]}><GlassBackdrop native /><Pressable accessibilityRole="button" accessibilityLabel="Back to conversations" style={styles.chatBackButton} onPress={() => { setEmojiPickerOpen(false); Keyboard.dismiss(); setActiveChat(null); }}><Ionicons name="chevron-back" size={24} color={colors.text} /></Pressable><Pressable accessibilityRole="button" accessibilityLabel={activeChat.is_group ? 'View group participants' : 'Open ' + nameOf(activeChatPerson) + "'s profile"} style={styles.chatPerson} onPress={() => activeChat.is_group ? setChatMembersOpen(true) : activeChatPerson && setSelectedUser(activeChatPerson)}>{activeChat.is_group ? <GroupAvatar /> : <Avatar user={activeChatPerson} />}<View style={styles.chatIdentity}><Text numberOfLines={2} style={styles.chatTitle}>{activeChat.display_name}</Text><Text style={[styles.chatSubtitle, appActive && !activeChat.is_group && activeChatPerson?.is_online && socialStyles.online]}>{activeChat.is_group ? (activeChat.event ? 'Event group' : 'Group chat') + ' · ' + activeChat.participants.length + ' participants' : appActive && activeChatPerson?.is_online ? '● Online' : 'Direct conversation'}</Text></View></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Manage chat" style={styles.chatMenu} onPress={showChatOptions}><Ionicons name="ellipsis-horizontal" size={23} color={colors.text} /></Pressable></View><MessageList key={activeChat.id} currentUserId={me?.id} style={styles.messageScroller} data={messages} keyExtractor={item => String(item.id)} contentContainerStyle={styles.messageList} keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} keyboardShouldPersistTaps="handled" onRefresh={() => void refresh(() => loadMessages(activeChat.id))} refreshing={refreshing} ListEmptyComponent={<Empty icon="✦" title="This is a new conversation." body="A thoughtful hello is plenty." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel="Message options" delayLongPress={300} onLongPress={() => showMessageOptions(item)} style={[styles.bubble, item.sender.id === me?.id && styles.bubbleMine]}>{activeChat.is_group && item.sender.id !== me?.id ? <Text style={styles.groupSender}>{nameOf(item.sender)}</Text> : null}<Text style={[styles.bubbleText, item.sender.id === me?.id && styles.bubbleMineText, item.deleted_for_everyone && styles.bubbleDeletedText]}>{item.deleted_for_everyone ? 'Message deleted' : item.body}</Text>{!item.deleted_for_everyone ? <Text style={[styles.bubbleTime, item.sender.id === me?.id && styles.bubbleMineTime]}>{item.sender.id === me?.id ? 'You · ' : ''}{new Date(item.created_at).toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' })}{item.edited_at ? ' · edited' : ''}</Text> : null}</Pressable>} />{emojiPickerOpen ? <View style={styles.emojiPicker}>{chatEmojis.map(emoji => <Pressable key={emoji} accessibilityRole="button" accessibilityLabel={'Add ' + emoji} style={styles.emojiChoice} onPress={() => { setMessage(current => current + emoji); setEmojiPickerOpen(false); }}><Text style={styles.emojiChoiceText}>{emoji}</Text></Pressable>)}</View> : null}<View style={[styles.composer, glassStyles.toolbar]}><GlassBackdrop native /><View style={styles.composerMark}><Ionicons name="sparkles-outline" size={20} color={colors.sky} /></View><Pressable accessibilityRole="button" accessibilityLabel="Add an emoji" style={styles.emojiTrigger} onPress={() => setEmojiPickerOpen(current => !current)}><Ionicons name="happy-outline" size={22} color={colors.muted} /></Pressable><TextInput numberOfLines={1} style={styles.messageInput} value={message} onChangeText={setMessage} maxLength={2000} accessibilityLabel="Message" placeholder="Message…" placeholderTextColor={colors.muted} multiline /><Pressable accessibilityRole="button" accessibilityLabel="Hide keyboard" style={styles.keyboardDismiss} onPress={Keyboard.dismiss}><Ionicons name="chevron-down" size={20} color={colors.muted} /></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Send message" style={styles.send} onPress={send}><Ionicons name="arrow-up" size={22} color="#FFFFFF" /></Pressable></View></KeyboardAvoidingView> : <FlatList data={conversations} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadChats)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>YOUR INBOX</Text><View style={styles.chatIntroTitle}><Text style={styles.title}>Messages</Text><View style={styles.chatCount}><Text style={styles.chatCountText}>{conversations.length}</Text></View></View><Text style={styles.copy}>Keep the good energy going after you meet.</Text><Text style={[styles.section, { marginTop: 22 }]}>START A NEW CHAT</Text>{following.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.contacts}>{following.map(person => <Pressable key={person.id} style={styles.contact} onPress={() => void openChat(person)} onLongPress={() => setSelectedUser(person)}><Avatar user={person} /><Text numberOfLines={1} style={styles.contactName}>{nameOf(person)}</Text></Pressable>)}</ScrollView> : <Text style={styles.chatFollowHint}>Follow someone to start a chat with them.</Text>}<Text style={styles.section}>CONVERSATIONS</Text></View>} ListEmptyComponent={<Empty icon="✉" title="Your conversations will live here." body="Start with someone you met in Explore." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel={'Open chat: ' + item.display_name} style={styles.conversation} onPress={() => setActiveChat(item)} onLongPress={() => { if (item.is_group) {setActiveChat(item); setChatMembersOpen(true); return;} const person = item.participants.find(person => person.id !== me?.id); if (person) setSelectedUser(person); }}>{item.is_group ? <GroupAvatar /> : <Avatar user={item.participants.find(person => person.id !== me?.id)} />}<View style={styles.conversationCopy}><View style={styles.conversationTop}><Text numberOfLines={1} style={styles.personName}>{item.display_name}</Text><Text style={styles.conversationTime}>{item.latest_message ? dateOf(item.latest_message.created_at) : ''}</Text></View><Text numberOfLines={1} style={styles.personMeta}>{item.latest_message?.deleted_for_everyone ? 'Message deleted' : item.latest_message?.body || (item.is_group ? 'Say hello to your event group' : 'Start with a simple hello')}</Text>{item.is_group ? <Text style={styles.personMeta}>{item.participants.length} participants · {item.event ? 'Event group' : 'Group chat'}</Text> : null}{appActive && item.participants.some(person => person.id !== me?.id && person.is_online) ? <Text style={socialStyles.online}>● Online</Text> : null}</View></Pressable>} />;
+  const notificationsView = <FlatList data={notifications} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadNotifications)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>STAY IN THE LOOP</Text><Text style={styles.title}>Your <Text style={styles.serif}>notifications.</Text></Text><Text style={styles.copy}>Comment replies, RSVP activity, and host decisions appear here.</Text><Pressable style={styles.outline} onPress={() => void markNotificationsRead()}><Text style={styles.outlineText}>Mark all read</Text></Pressable>{notificationPermissionCard}</View>} ListEmptyComponent={<Empty icon="✦" title="Nothing new yet." body="Comment replies and RSVP activity will show up here." />} renderItem={({ item }) => <Pressable style={[styles.notificationCard, !item.is_read && styles.notificationUnread]} onPress={() => void openNotification(item)}><View style={[styles.notificationIcon, {backgroundColor: notificationAccent(item.kind).surface}]}><Ionicons name={item.kind === 'COMMENT_REPLY' ? 'chatbubble-ellipses-outline' : 'notifications-outline'} size={21} color={notificationAccent(item.kind).text} /></View><View style={styles.notificationCopy}><Text style={styles.notificationText}>{item.text}</Text><Text style={styles.personMeta}>{item.event?.name || (item.kind === 'COMMENT_REPLY' ? 'Open replies' : 'SocialQuest')} · {dateOf(item.created_at)}</Text></View></Pressable>} />;
+  const ownProfileEvents = [...hostedEvents, ...joinedEvents.filter(event => !hostedEvents.some(hosted => hosted.id === event.id))];
+  const visibleProfilePosts = profilePostsOwner === profileUserId ? profilePosts : [];
+  const filteredProfilePosts = visibleProfilePosts.filter(post => post.kind === profileSection);
+  const renderProfilePost = (post: Post) => <PostCard post={post} mine={post.author.id === me?.id}
+    onLike={item => void toggleLike(item)} onEdit={beginEditPost} onDelete={deletePost}
+    onShare={item => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + item.id + '/')}
+    onComments={item => void openComments(item)} onOpenProfile={setSelectedUser} />;
+  const profileTabs = (includeEvents: boolean) => <View style={socialStyles.profileTabs}>
+    {(['POST', 'REEL', ...(includeEvents ? ['EVENTS'] : [])] as Array<'POST' | 'REEL' | 'EVENTS'>).map(section => {
+      const label = section === 'POST' ? 'Posts' : section === 'REEL' ? 'Reels' : 'Events';
+      const count = section === 'EVENTS' ? ownProfileEvents.length : visibleProfilePosts.filter(post => post.kind === section).length;
+      return <Pressable key={section} accessibilityRole="tab" accessibilityLabel={label} accessibilityState={{selected: profileSection === section}}
+        style={[socialStyles.profileTab, profileSection === section && socialStyles.profileTabActive]} onPress={() => setProfileSection(section)}>
+        <GlassBackdrop accent={profileSection === section} />
+        <Text style={[socialStyles.profileTabText, profileSection === section && socialStyles.profileTabTextActive]}>{label}</Text>
+        <Text style={socialStyles.profileTabCount}>{section !== 'EVENTS' && (profilePostsLoading || profilePostsError) ? '—' : count}</Text>
+      </Pressable>;
+    })}
+  </View>;
+  const profileLoadNotice = profileSection !== 'EVENTS' && (profilePostsLoading || profilePostsError) ? <View style={socialStyles.profileNotice}>
+    <Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{profilePostsLoading ? 'Loading quest moments…' : profilePostsError}</Text>
+    {profilePostsError && !profilePostsLoading ? <Pressable accessibilityRole="button" style={[styles.secondary, iconLabelRow]} onPress={() => void refreshVisibleProfile()}><Ionicons name="refresh-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Try again</Text></Pressable> : null}
+  </View> : null;
+  const profileEmpty = !profilePostsLoading && !profilePostsError ? <Empty icon={profileSection === 'REEL' ? '◉' : '✦'}
+    title={profileSection === 'REEL' ? 'No reels yet.' : 'No posts yet.'}
+    body={profileUserId === me?.id ? 'Share a moment from your next quest. It will appear here.' : 'This adventurer hasn’t shared any visible moments here yet.'} /> : null;
+  const profile = <FlatList<Post | EventItem>
+    data={profileSection === 'EVENTS' ? ownProfileEvents : filteredProfilePosts}
+    keyExtractor={item => ('kind' in item ? 'post-' : 'event-') + item.id}
+    contentContainerStyle={[styles.profile, socialStyles.profileList]}
+    onRefresh={() => void refresh(async () => { await Promise.all([loadMe(), refreshVisibleProfile()]); })} refreshing={refreshing}
+    ListHeaderComponent={<View><View style={styles.profileTop}><Avatar user={me} large /><View style={styles.profileIdentity}><Text style={styles.eyebrow}>YOUR ADVENTURE LOG</Text><Text style={styles.profileName}>{nameOf(me)}</Text><Text style={styles.personMeta}>@{me?.username} · {me?.city || 'Everywhere'}</Text></View></View><Pressable accessibilityRole="button" style={[styles.secondary, iconLabelRow]} onPress={openProfileEditor}><Ionicons name="create-outline" size={18} color={colors.accent} /><Text style={styles.secondaryText}>Edit profile</Text></Pressable><Text style={styles.profileBio}>{me?.bio || 'Here for the little adventures that turn into real stories.'}</Text><View style={styles.scores}><Score tone="gold" label="XP EARNED" value={String(me?.xp || 0)} /><Score tone="mint" label="KARMA" value={String(me?.karma ?? 0)} /></View><View style={socialStyles.followScores}><Score tone="neutral" label="FOLLOWERS ›" value={String(me?.follower_count || 0)} onPress={() => me && openPeopleList('followers', me)} /><Score tone="neutral" label="FOLLOWING ›" value={String(me?.following_count || 0)} onPress={() => me && openPeopleList('following', me)} /></View><Text style={styles.profileHelp}>XP tracks completed quests. Karma comes from fellow guests after events. Both are public and independent.</Text>{profileTabs(true)}{profileLoadNotice}</View>}
+    ListEmptyComponent={profileSection === 'EVENTS' ? <Empty icon="⌖" title="Your quest log is ready." body="Events you host or join will appear here." /> : profileEmpty}
+    renderItem={({item}) => 'kind' in item ? renderProfilePost(item) : <Pressable accessibilityRole="button" style={styles.personCard} onPress={() => void openEvent(item.id)}><View style={{flex: 1}}><Text style={styles.personName}>{item.name}</Text><Text style={styles.personMeta}>{item.host.id === me?.id ? 'Hosting' : 'Attending'} · {dateOf(item.starts_at)} · {item.location_name}</Text></View></Pressable>}
+    ListFooterComponent={<View><Pressable style={[styles.secondary, iconLabelRow]} onPress={() => me && void shareResource('A SocialQuest profile', 'Meet ' + nameOf(me) + ' on SocialQuest.', '/?view=profile&profile=' + me.id)}><Ionicons name="share-social-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Share profile</Text></Pressable><Pressable style={[styles.logout, iconLabelRow]} onPress={logout}><Ionicons name="log-out-outline" size={19} color={colors.danger} /><Text style={styles.logoutText}>Log out</Text></Pressable></View>}
+  />;
   const unreadCount = notifications.filter(item => !item.is_read).length;
-  const mobileTabs: Array<{ tab: Tab; label: string; icon: string }> = [
-    { tab: 'Home', label: 'Home', icon: '⌂' },
-    { tab: 'Explore', label: 'Events', icon: '⌖' },
-    { tab: 'Chats', label: 'Chats', icon: '✉' },
-    { tab: 'Notifications', label: 'Alerts', icon: '♢' },
-    { tab: 'Reels', label: 'Reels', icon: '◉' },
-    { tab: 'Profile', label: 'Profile', icon: '♙' },
+  const mobileTabs: Array<{ tab: Tab; label: string; icon: IoniconName; activeIcon: IoniconName }> = [
+    { tab: 'Home', label: 'Home', icon: 'home-outline', activeIcon: 'home' },
+    { tab: 'Explore', label: 'Events', icon: 'compass-outline', activeIcon: 'compass' },
+    { tab: 'Chats', label: 'Chats', icon: 'chatbubble-ellipses-outline', activeIcon: 'chatbubble-ellipses' },
+    { tab: 'Notifications', label: 'Alerts', icon: 'notifications-outline', activeIcon: 'notifications' },
+    { tab: 'Reels', label: 'Reels', icon: 'play-circle-outline', activeIcon: 'play-circle' },
+    { tab: 'Profile', label: 'Profile', icon: 'person-circle-outline', activeIcon: 'person-circle' },
   ];
   const view = tab === 'Home' ? home : tab === 'Explore' ? explore : tab === 'Chats' ? chats : tab === 'Notifications' ? notificationsView : tab === 'Reels' ? reelsView : profile;
 
   return <View style={styles.app}>
     <StatusBar style="light" />
-    <View style={[styles.appHeader, { paddingTop: insets.top + 13 }]}><Pressable style={styles.brandRow} onPress={() => setTab('Home')}><View style={styles.smallMark}><Text style={styles.smallMarkText}>S</Text></View><Text style={styles.appBrand}>socialquest</Text></Pressable><View style={styles.headerRight}><Pressable accessibilityRole="button" accessibilityLabel="Notifications" style={styles.headerAction} onPress={() => { setTab('Notifications'); void markNotificationsRead(); }}><Text style={styles.headerActionText}>♢</Text>{unreadCount ? <Text style={styles.headerNotificationBadge}>{unreadCount > 9 ? '9+' : unreadCount}</Text> : null}</Pressable><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.headerCompose} onPress={() => { setProofQuest(null); setComposeOpen(true); }}><Text style={styles.headerComposeText}>＋</Text></Pressable></View></View>
-    <View style={styles.content}>{view}</View>
-    <View style={[styles.nav, { paddingBottom: Math.max(insets.bottom, 8) }]}>{mobileTabs.map(item => <Pressable key={item.tab} style={styles.navItem} onPress={() => { setTab(item.tab); if (item.tab !== 'Chats') setActiveChat(null); if (item.tab === 'Profile') void refresh(loadMe); if (item.tab === 'Notifications') void markNotificationsRead(); }}><View><Text style={[styles.navIcon, tab === item.tab && styles.navActive]}>{item.icon}</Text>{item.tab === 'Notifications' && unreadCount ? <Text style={styles.navBadge}>{unreadCount > 9 ? '9+' : unreadCount}</Text> : null}</View><Text numberOfLines={1} style={[styles.navLabel, tab === item.tab && styles.navActive]}>{item.label}</Text></Pressable>)}</View>
+    <View style={[styles.appHeader, { paddingTop: insets.top + 13 }]} onLayout={({ nativeEvent }) => setAppHeaderHeight(current => current === nativeEvent.layout.height ? current : nativeEvent.layout.height)}><Pressable style={styles.brandRow} onPress={() => setTab('Home')}><View style={styles.smallMark}><Text style={styles.smallMarkText}>S</Text></View><Text style={styles.appBrand}>socialquest</Text></Pressable><View style={styles.headerRight}><Pressable accessibilityRole="button" accessibilityLabel="Notifications" style={styles.headerAction} onPress={() => { setTab('Notifications'); void markNotificationsRead(); }}><GlassBackdrop /><Ionicons name="notifications-outline" size={21} color={colors.muted} />{unreadCount ? <Text style={styles.headerNotificationBadge}>{unreadCount > 9 ? '9+' : unreadCount}</Text> : null}</Pressable><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.headerCompose} onPress={() => openComposer(null)}><Ionicons name="add" size={25} color="#fff" /></Pressable></View></View>
+    <ScreenTransition style={styles.content} transitionKey={tab}>{view}</ScreenTransition>
+    <View style={[styles.nav, glassStyles.toolbar, { paddingBottom: Math.max(insets.bottom - 8, 10) }]}><GlassBackdrop native radius={26} />{mobileTabs.map(item => <Pressable key={item.tab} accessibilityRole="tab" accessibilityLabel={item.label} accessibilityState={{selected: tab === item.tab}} style={[styles.navItem, glassStyles.navItem, tab === item.tab && glassStyles.navSelected]} onPress={() => { setTab(item.tab); if (item.tab !== 'Chats') setActiveChat(null); if (item.tab === 'Profile') void refresh(loadMe); if (item.tab === 'Notifications') void markNotificationsRead(); }}><View><Ionicons name={tab === item.tab ? item.activeIcon : item.icon} size={21} color={tab === item.tab ? colors.sky : colors.muted} />{item.tab === 'Notifications' && unreadCount ? <Text style={styles.navBadge}>{unreadCount > 9 ? '9+' : unreadCount}</Text> : null}</View><Text numberOfLines={1} style={[styles.navLabel, tab === item.tab && styles.navActive]}>{item.label}</Text></Pressable>)}</View>
 
-    <Modal visible={composeOpen} transparent animationType="slide" onRequestClose={() => { Keyboard.dismiss(); setComposeOpen(false); }}>
-      <KeyboardAvoidingView style={styles.modalKeyboardAvoider} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
-      <Pressable style={styles.overlay} onPress={() => { Keyboard.dismiss(); setComposeOpen(false); }}>
-        <Pressable style={styles.sheet} onPress={event => event.stopPropagation()}>
-          <View style={styles.handle} />
-          <Pressable accessibilityRole="button" accessibilityLabel="Hide keyboard" style={styles.sheetKeyboardDismiss} onPress={Keyboard.dismiss}><Text style={styles.sheetKeyboardDismissText}>⌄ Hide keyboard</Text></Pressable>
-          <Text style={styles.sheetTitle}>{proofQuest ? 'Share quest proof.' : 'Share a moment.'}</Text>
-          <Text style={styles.sheetCopy}>{proofQuest ? proofQuest.title + ' · Add the photo or reel that shows you completed it. This will appear in the event’s Quest moments.' : 'A few honest words, a photo, or an optional place tag can help someone else feel less alone.'}</Text>
-          <TextInput style={styles.momentInput} maxLength={proofQuest ? 280 : 1200} value={moment} onChangeText={setMoment} placeholder={proofQuest ? 'What made this moment memorable?' : 'What happened today?'} multiline />
-          <View style={styles.mediaActions}>
-            <Pressable style={styles.mediaAction} onPress={() => void choosePhoto()}><Text style={styles.mediaActionText}>▧ Photo / video library</Text></Pressable>
-            <Pressable style={styles.mediaAction} onPress={() => void takePhoto()}><Text style={styles.mediaActionText}>◉ Camera</Text></Pressable>
-            <Pressable style={styles.mediaAction} onPress={() => void tagCurrentLocation()}><Text style={styles.mediaActionText}>⌖ Tag location</Text></Pressable>
-          </View>
-          {momentMedia ? <View style={styles.attachment}>{momentMedia.type === 'video' ? <Text style={styles.attachmentTitle}>◉ Video</Text> : <Image style={styles.attachmentImage} source={{ uri: momentMedia.uri }} />}<View><Text style={styles.attachmentTitle}>{momentMedia.type === 'video' ? 'Video attached' : 'Photo attached'}</Text><Pressable onPress={() => setMomentMedia(null)}><Text style={styles.removeAttachment}>Remove</Text></Pressable></View></View> : null}
-          {momentLocation && !proofQuest ? <View style={styles.locationTag}><Text style={styles.locationTagText}>⌖ {momentLocation}</Text><Pressable onPress={() => setMomentLocation('')}><Text style={styles.removeAttachment}>Remove</Text></Pressable></View> : null}
-          <Pressable disabled={busy} style={[styles.primary, busy && styles.dim]} onPress={share}><Text style={styles.primaryText}>{proofQuest ? 'Share quest proof →' : 'Share with the community →'}</Text></Pressable>
-        </Pressable>
-      </Pressable>
+    <Modal visible={chatMembersOpen && !!activeChat} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setChatMembersOpen(false)}>
+      <View style={[styles.app, {paddingTop: Math.max(insets.top, 24)}]}><View style={styles.groupHeader}><Text style={[styles.sheetTitle, {flex: 1}]}>Participants</Text><Pressable accessibilityRole="button" accessibilityLabel="Close participants" style={styles.commentsClose} onPress={() => setChatMembersOpen(false)}><Ionicons name="close" size={22} color={colors.text} /></Pressable></View>
+        <Text style={[styles.sheetCopy, {paddingHorizontal: 20}]}>{activeChat?.display_name}</Text><FlatList data={activeChat?.participants || []} contentContainerStyle={styles.list} keyExtractor={person => String(person.id)} renderItem={({item}) => <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item) + "'s profile"} style={styles.personCard} onPress={() => {setChatMembersOpen(false); setSelectedUser(item);}}><Avatar user={item} /><View style={{flex: 1}}><Text style={styles.personName}>{nameOf(item)}{item.id === me?.id ? ' (you)' : ''}</Text><Text style={styles.personMeta}>@{item.username}</Text></View></Pressable>} />
+      </View>
+    </Modal>
+    {profileEditorOpen && token && me ? <ProfileEditor key={me.id} user={me} onSave={saveProfile} onClose={() => setProfileEditorOpen(false)} /> : null}
+    <Modal visible={!!eventEditor} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => {if (!busy) {if (eventDateField) setEventDateField(null); else closeEventEditor();}}}>
+      <KeyboardAvoidingView style={styles.app} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        {eventEditor && eventDateField ? <EventDateTimePicker key={eventDateField} label={eventDateField === 'starts_at' ? 'Start time' : 'End time'} value={eventEditor[eventDateField]} minimum={eventDateField === 'ends_at' ? eventEditor.starts_at : undefined} onCancel={() => setEventDateField(null)} onConfirm={value => {
+          setEventEditor(current => current && {...current, ...updateEventSchedule(current, eventDateField, value)});
+          setEventDateField(null);
+        }} /> : null}<ScrollView style={eventDateField ? {display: 'none'} : undefined} contentContainerStyle={[styles.profile, {paddingTop: Math.max(insets.top, 24)}]} keyboardShouldPersistTaps="handled">
+          <Text style={styles.eyebrow}>HOST CONSOLE</Text><Text style={styles.sheetTitle}>{eventEditor?.id ? 'Edit adventure' : 'Host an adventure'}</Text><Text style={styles.sheetCopy}>Choose a place, pick a date, and bring people together. You can change every detail later.</Text>
+          <Text style={styles.authLabel}>EVENT NAME</Text><TextInput style={styles.input} accessibilityLabel="Event name" placeholder="Event name" placeholderTextColor={colors.muted} maxLength={120} value={eventEditor?.name || ''} onChangeText={value => setEventEditor(current => current && {...current, name:value})} />
+          <Text style={styles.authLabel}>DESCRIPTION</Text><TextInput style={[styles.input, {minHeight:120, textAlignVertical: 'top'}]} accessibilityLabel="Event description" placeholder="What will people do?" placeholderTextColor={colors.muted} maxLength={2000} multiline value={eventEditor?.description || ''} onChangeText={value => setEventEditor(current => current && {...current, description:value})} />
+          <Text style={styles.authLabel}>VENUE</Text><Pressable accessibilityRole="button" disabled={busy || eventLocating} style={[styles.outline, iconLabelRow, eventLocating && styles.dim]} onPress={() => void detectEventLocation()}><Ionicons name="locate-outline" size={18} color={colors.accent} /><Text style={styles.outlineText}>{eventLocating ? 'Detecting location…' : 'Detect my location'}</Text></Pressable>{eventLocationStatus ? <Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{eventLocationStatus}</Text> : null}
+          <TextInput style={styles.input} accessibilityLabel="Event location" placeholder="Venue or address" placeholderTextColor={colors.muted} maxLength={160} value={eventEditor?.location_name || ''} onChangeText={changeEventLocation} />
+          <Text style={styles.authLabel}>WHEN</Text>
+          <EventDateTimeField label="Starts at" disabled={busy} value={eventEditor?.starts_at || ''} onPress={() => {Keyboard.dismiss(); setEventDateField('starts_at');}} />
+          <EventDateTimeField label="Ends at" disabled={busy} value={eventEditor?.ends_at || ''} onPress={() => {Keyboard.dismiss(); setEventDateField('ends_at');}} />
+          <Text style={styles.personMeta}>Times are local to your device. If you move the start beyond the end, the end adjusts to keep the same duration.</Text>
+          <Text style={styles.authLabel}>CAPACITY</Text><TextInput style={styles.input} accessibilityLabel="Capacity" placeholder="Capacity" placeholderTextColor={colors.muted} keyboardType="number-pad" value={eventEditor?.capacity || ''} onChangeText={value => setEventEditor(current => current && {...current, capacity:value})} />
+          <View style={styles.ratingActions}>{(['PUBLIC', 'PRIVATE'] as const).map(privacy => <Pressable key={privacy} style={[styles.ratingChoice, eventEditor?.privacy === privacy && styles.ratingChoiceSelected]} onPress={() => setEventEditor(current => current && {...current, privacy})}><Text style={[styles.ratingChoiceText, eventEditor?.privacy === privacy && styles.ratingChoiceSelectedText]}>{privacy === 'PUBLIC' ? 'Public event' : 'Invite only'}</Text></Pressable>)}</View>
+          <Pressable disabled={busy || eventLocating} style={[styles.primary, (busy || eventLocating) && styles.dim]} onPress={() => void saveEvent()}><Text style={styles.primaryText}>{busy ? 'Saving…' : eventEditor?.id ? 'Save event' : 'Publish and generate quests'}</Text></Pressable>
+          <Pressable disabled={busy} style={styles.secondary} onPress={closeEventEditor}><Text style={styles.secondaryText}>Cancel</Text></Pressable>
+        </ScrollView>
       </KeyboardAvoidingView>
     </Modal>
-    <Modal visible={!!selectedUser || !!peoplePanel} transparent animationType="slide" onRequestClose={closePeople}>
+
+    <PostComposer
+      visible={composeOpen}
+      editingPhoto={!!photoEditor}
+      busy={busy}
+      media={momentMedia}
+      caption={moment}
+      location={momentLocation}
+      author={me}
+      quest={proofQuest}
+      onCaption={setMoment}
+      onLocation={setMomentLocation}
+      onLibrary={videoOnly => void choosePhoto(videoOnly)}
+      onCamera={() => void takePhoto()}
+      onEdit={() => momentMedia && setPhotoEditor({original: momentMedia, working: momentMedia})}
+      onRemove={() => setMomentMedia(null)}
+      onLocate={() => void tagCurrentLocation()}
+      onClose={closeComposer}
+      onPublish={() => void share()}
+    />
+    <Modal visible={!!photoEditor} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => !photoEditorBusy && setPhotoEditor(null)}>
+      <View style={[styles.photoEditorScreen, { paddingTop: insets.top + 10, paddingBottom: Math.max(insets.bottom, 16) }]}>
+        <View style={styles.photoEditorHeader}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Cancel photo edits" disabled={photoEditorBusy} style={styles.photoEditorHeaderAction} onPress={() => setPhotoEditor(null)}><Text style={styles.photoEditorCancel}>Cancel</Text></Pressable>
+          <Text style={styles.photoEditorTitle}>EDIT PHOTO</Text>
+          <Pressable accessibilityRole="button" accessibilityLabel="Use edited photo" disabled={photoEditorBusy} style={[styles.photoEditorHeaderAction, styles.photoEditorDoneButton, photoEditorBusy && styles.dim]} onPress={() => { if (photoEditor) setMomentMedia(photoEditor.working); setPhotoEditor(null); }}><Text style={styles.photoEditorDone}>Done</Text></Pressable>
+        </View>
+        <View style={styles.photoEditorStage}>
+          {photoEditor ? <Image key={photoEditor.working.uri} style={styles.photoEditorImage} source={{ uri: photoEditor.working.uri }} resizeMode="contain" /> : null}
+          <View pointerEvents="none" style={styles.cropGrid}><View style={[styles.cropGridLine, styles.cropGridVerticalOne]} /><View style={[styles.cropGridLine, styles.cropGridVerticalTwo]} /><View style={[styles.cropGridLine, styles.cropGridHorizontalOne]} /><View style={[styles.cropGridLine, styles.cropGridHorizontalTwo]} /></View>
+          {photoEditorBusy ? <View style={styles.photoEditorLoading}><Text style={styles.photoEditorLoadingText}>APPLYING EDIT…</Text></View> : null}
+        </View>
+        <ScrollView style={styles.photoEditorControls} contentContainerStyle={styles.photoEditorControlsContent} showsVerticalScrollIndicator={false}>
+          <Text style={styles.photoEditorHint}>Center-crop for the feed, then rotate or mirror until the frame feels right.</Text>
+          <Text style={styles.photoEditorSectionLabel}>ASPECT RATIO</Text>
+          <View style={styles.photoEditorRow}>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => setPhotoEditor(current => current ? { ...current, working: current.original } : current)}><Text style={styles.photoEditorControlIcon}>↺</Text><Text style={styles.photoEditorControlText}>Original</Text></Pressable>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(1)}><View style={styles.ratioSquare} /><Text style={styles.photoEditorControlText}>Square</Text></Pressable>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(4 / 5)}><View style={styles.ratioPortrait} /><Text style={styles.photoEditorControlText}>Portrait</Text></Pressable>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(16 / 9)}><View style={styles.ratioLandscape} /><Text style={styles.photoEditorControlText}>Wide</Text></Pressable>
+          </View>
+          <Text style={styles.photoEditorSectionLabel}>TRANSFORM</Text>
+          <View style={styles.photoEditorRow}>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('rotate-left')}><Text style={styles.photoEditorControlIcon}>↶</Text><Text style={styles.photoEditorControlText}>Left</Text></Pressable>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('rotate-right')}><Text style={styles.photoEditorControlIcon}>↷</Text><Text style={styles.photoEditorControlText}>Right</Text></Pressable>
+            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('mirror')}><Text style={styles.photoEditorControlIcon}>⇆</Text><Text style={styles.photoEditorControlText}>Mirror</Text></Pressable>
+          </View>
+        </ScrollView>
+      </View>
+    </Modal>
+    <Modal visible={(!!selectedUser || !!peoplePanel) && !commentPost && !editingPost && !composeOpen} transparent animationType="slide" onRequestClose={closePeople}>
       <KeyboardAvoidingView style={styles.modalKeyboardAvoider} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-        <Pressable style={styles.overlay} onPress={closePeople}>
-          <Pressable style={[styles.sheet, socialStyles.peopleSheet]} onPress={event => event.stopPropagation()}>
+        <Pressable feedback="none" style={styles.overlay} onPress={closePeople}>
+          <Pressable feedback="none" style={[styles.sheet, socialStyles.peopleSheet]} onPress={event => event.stopPropagation()}>
             <View style={socialStyles.peopleHeading}>
-              {selectedUser && peoplePanel ? <Pressable accessibilityRole="button" accessibilityLabel="Back to people list" style={socialStyles.closeButton} onPress={() => { setSelectedUser(null); void loadPeopleList(peoplePanel, peopleQuery); }}><Text style={styles.secondaryText}>‹ Back</Text></Pressable> : peoplePanel?.person ? <Pressable accessibilityRole="button" accessibilityLabel="Back to profile" style={socialStyles.closeButton} onPress={() => { const owner = peoplePanel.person!; setPeoplePanel(null); setSelectedUser(owner); }}><Text style={styles.secondaryText}>‹ Profile</Text></Pressable> : <View />}
-              <Pressable accessibilityRole="button" accessibilityLabel="Close people" style={socialStyles.closeButton} onPress={closePeople}><Text style={styles.secondaryText}>Close ×</Text></Pressable>
+              {selectedUser && peoplePanel ? <Pressable accessibilityRole="button" accessibilityLabel="Back to people list" style={[socialStyles.closeButton, iconLabelRow]} onPress={() => { setSelectedUser(null); void loadPeopleList(peoplePanel, peopleQuery); }}><Ionicons name="chevron-back" size={18} color={colors.text} /><Text style={styles.secondaryText}>Back</Text></Pressable> : peoplePanel?.person ? <Pressable accessibilityRole="button" accessibilityLabel="Back to profile" style={[socialStyles.closeButton, iconLabelRow]} onPress={() => { const owner = peoplePanel.person!; setPeoplePanel(null); setSelectedUser(owner); }}><Ionicons name="chevron-back" size={18} color={colors.text} /><Text style={styles.secondaryText}>Profile</Text></Pressable> : <View />}
+              <Pressable accessibilityRole="button" accessibilityLabel="Close people" style={[socialStyles.closeButton, iconLabelRow]} onPress={closePeople}><Text style={styles.secondaryText}>Close</Text><Ionicons name="close" size={19} color={colors.text} /></Pressable>
             </View>
-            {selectedUser ? <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+            {selectedUser ? <FlatList<Post>
+              data={filteredProfilePosts} keyExtractor={post => String(post.id)} keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false} contentContainerStyle={socialStyles.profileList}
+              onRefresh={() => void refresh(refreshVisibleProfile)} refreshing={refreshing}
+              ListHeaderComponent={<View>
               <Avatar user={selectedUser} large />
               <Text style={styles.sheetTitle}>{nameOf(selectedUser)}</Text>
               <Text style={styles.sheetCopy}>@{selectedUser.username} · {selectedUser.city || 'Everywhere'}</Text>
               <View style={styles.userScoreLine}><Text style={styles.personName}>★ {selectedUser.karma ?? 0} karma</Text><Text style={styles.personName}>✦ {selectedUser.xp || 0} XP</Text></View>
               <View style={socialStyles.followScores}>
-                <Score label="FOLLOWERS ›" value={String(selectedUser.follower_count || 0)} onPress={() => openPeopleList('followers', selectedUser)} />
-                <Score label="FOLLOWING ›" value={String(selectedUser.following_count || 0)} onPress={() => openPeopleList('following', selectedUser)} />
+                <Score tone="neutral" label="FOLLOWERS ›" value={String(selectedUser.follower_count || 0)} onPress={() => openPeopleList('followers', selectedUser)} />
+                <Score tone="neutral" label="FOLLOWING ›" value={String(selectedUser.following_count || 0)} onPress={() => openPeopleList('following', selectedUser)} />
               </View>
               <Text style={styles.sheetCopy}>{selectedUser.bio || 'Here to turn small plans into meaningful stories.'}</Text>
               {selectedUser.id !== me?.id ? <>
                 <Pressable accessibilityRole="button" disabled={followBusy} style={[styles.secondary, followBusy && styles.dim]} onPress={() => void toggleFollow(selectedUser)}><Text style={styles.secondaryText}>{followBusy ? 'Updating…' : selectedUser.is_followed_by_me ? 'Following · Unfollow' : 'Follow'}</Text></Pressable>
-                <Pressable accessibilityRole="button" style={styles.primary} onPress={() => void openChat(selectedUser)}><Text style={styles.primaryText}>Send a message →</Text></Pressable>
-              </> : null}
-              <Pressable style={styles.secondary} onPress={() => void shareResource('A SocialQuest profile', 'Meet ' + nameOf(selectedUser) + ' on SocialQuest.', '/?view=profile&profile=' + selectedUser.id)}><Text style={styles.secondaryText}>↗ Share profile</Text></Pressable>
-            </ScrollView> : peoplePanel ? <>
-              <Text style={styles.sheetTitle}>{peoplePanel.kind === 'search' ? 'Search people' : peoplePanel.kind === 'followers' ? 'Followers' : 'Following'}</Text>
+                <Pressable accessibilityRole="button" style={styles.primary} onPress={() => void openChat(selectedUser)}><View style={iconLabelRow}><Text style={styles.primaryText}>Send a message</Text><Ionicons name="paper-plane-outline" size={18} color="#fff" /></View></Pressable>
+              </> : <Pressable accessibilityRole="button" style={styles.secondary} onPress={openProfileEditor}><Text style={styles.secondaryText}>Edit profile</Text></Pressable>}
+              <Pressable style={[styles.secondary, iconLabelRow]} onPress={() => void shareResource('A SocialQuest profile', 'Meet ' + nameOf(selectedUser) + ' on SocialQuest.', '/?view=profile&profile=' + selectedUser.id)}><Ionicons name="share-social-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Share profile</Text></Pressable>
+            {profileTabs(false)}{profileLoadNotice}</View>}
+              ListEmptyComponent={profileEmpty} renderItem={({item}) => renderProfilePost(item)}
+            /> : peoplePanel ? <>
+              <Text style={styles.sheetTitle}>{peoplePanel.kind === 'invite' ? 'Invite people' : peoplePanel.kind === 'search' ? 'Search people' : peoplePanel.kind === 'followers' ? 'Followers' : 'Following'}</Text>
               {peoplePanel.person ? <Text style={styles.personMeta}>@{peoplePanel.person.username}</Text> : null}
               <View style={styles.searchRow}>
-                <TextInput accessibilityLabel="Search people" style={styles.searchInput} value={peopleQuery} onChangeText={setPeopleQuery} placeholder="Name or username" placeholderTextColor="#aeb7cc" maxLength={100} autoCapitalize="none" autoCorrect={false} autoFocus={peoplePanel.kind === 'search'} returnKeyType="search" onSubmitEditing={() => { Keyboard.dismiss(); void loadPeopleList(peoplePanel, peopleQuery); }} />
+                <TextInput accessibilityLabel="Search people" style={styles.searchInput} value={peopleQuery} onChangeText={setPeopleQuery} placeholder="Name or username" placeholderTextColor={colors.muted} maxLength={100} autoCapitalize="none" autoCorrect={false} autoFocus={peoplePanel.kind === 'search'} returnKeyType="search" onSubmitEditing={() => { Keyboard.dismiss(); void loadPeopleList(peoplePanel, peopleQuery); }} />
                 <Pressable accessibilityRole="button" accessibilityLabel="Search" style={[styles.searchButton, {minWidth: 44, minHeight: 44}]} onPress={() => { Keyboard.dismiss(); void loadPeopleList(peoplePanel, peopleQuery); }}><SearchIcon /></Pressable>
               </View>
-              <FlatList style={socialStyles.peopleList} data={peopleLoading ? [] : peopleResults} keyboardShouldPersistTaps="handled" keyExtractor={person => String(person.id)} ListEmptyComponent={<View style={socialStyles.peopleEmpty}><Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{peopleLoading ? 'Loading people…' : peopleError || (peopleQuery.trim() ? 'No matching people. Try another name or username.' : peoplePanel.kind === 'followers' ? 'No followers yet.' : peoplePanel.kind === 'following' ? 'Not following anyone yet.' : 'No other members yet.')}</Text>{peopleError ? <Pressable style={styles.secondary} onPress={() => void loadPeopleList(peoplePanel, peopleQuery)}><Text style={styles.secondaryText}>Try again</Text></Pressable> : null}</View>} renderItem={({item}) => <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item) + "'s profile"} style={styles.personCard} onPress={() => { Keyboard.dismiss(); setSelectedUser(item); }}><Avatar user={item} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(item)}</Text><Text style={styles.personMeta}>@{item.username}{item.is_followed_by_me ? ' · Following' : ''}</Text></View><Text style={styles.secondaryText}>›</Text></Pressable>} />
+              <FlatList style={socialStyles.peopleList} data={peopleLoading ? [] : peopleResults} keyboardShouldPersistTaps="handled" keyExtractor={person => String(person.id)} ListEmptyComponent={<View style={socialStyles.peopleEmpty}><Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{peopleLoading ? 'Loading people…' : peopleError || (peopleQuery.trim() ? 'No matching people. Try another name or username.' : peoplePanel.kind === 'followers' ? 'No followers yet.' : peoplePanel.kind === 'following' ? 'Not following anyone yet.' : 'No other members yet.')}</Text>{peopleError ? <Pressable style={styles.secondary} onPress={() => void loadPeopleList(peoplePanel, peopleQuery)}><Text style={styles.secondaryText}>Try again</Text></Pressable> : null}</View>} renderItem={({item}) => <Pressable accessibilityRole="button" accessibilityLabel={(peoplePanel.kind === 'invite' ? 'Invite ' : 'Open ') + nameOf(item)} style={styles.personCard} onPress={() => { Keyboard.dismiss(); if (peoplePanel.kind === 'invite') void invitePerson(item); else setSelectedUser(item); }}><Avatar user={item} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(item)}</Text><Text style={styles.personMeta}>@{item.username}{item.is_followed_by_me ? ' · Following' : ''}</Text></View><Text style={styles.secondaryText}>{peoplePanel.kind === 'invite' ? 'Invite' : '›'}</Text></Pressable>} />
             </> : null}
           </Pressable>
         </Pressable>
       </KeyboardAvoidingView>
     </Modal>
-    <Modal visible={!!selectedEvent && !composeOpen && !selectedUser && !peoplePanel && !commentPost && !editingPost} transparent animationType="slide" onRequestClose={() => setSelectedEvent(null)}>
-      <Pressable style={styles.overlay} onPress={() => setSelectedEvent(null)}>
-        <Pressable style={styles.sheet} onPress={event => event.stopPropagation()}>
+    <Modal visible={!!selectedEvent && !eventEditor && !composeOpen && !selectedUser && !peoplePanel && !commentPost && !editingPost} transparent animationType="slide" onRequestClose={() => setSelectedEvent(null)}>
+      <Pressable feedback="none" style={styles.overlay} onPress={() => setSelectedEvent(null)}>
+        <Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}>
           {selectedEvent && <ScrollView showsVerticalScrollIndicator={false}>
             <View style={styles.handle} />
             <Text style={styles.eyebrow}>{dateOf(selectedEvent.starts_at).toUpperCase()} · {selectedEvent.location_name}</Text>
             <Text style={styles.sheetTitle}>{selectedEvent.name}</Text>
             <Text style={styles.sheetCopy}>{selectedEvent.description}</Text>
             <Pressable style={styles.eventHost} onPress={() => setSelectedUser(selectedEvent.host)}><Avatar user={selectedEvent.host} /><Text style={styles.hostMeta}>Hosted by {nameOf(selectedEvent.host)} · ★ {selectedEvent.host.karma ?? 0}</Text></Pressable>
-            <View style={styles.questNotice}><Text style={styles.section}>QUEST WINDOW</Text><Text style={styles.questNoticeText}>{selectedEvent.quest_status === 'ACTIVE' ? 'Quests are live. Join the event and upload proof to earn XP.' : selectedEvent.is_finished ? 'The quest window has ended.' : 'Quests unlock when this event starts.'}</Text></View>
+            {selectedEvent.host.id === me?.id || selectedEvent.my_attendance_status === 'ACCEPTED' ? <Pressable accessibilityRole="button" accessibilityLabel="Open event group chat" style={[styles.secondary, iconLabelRow]} onPress={() => void openEventChat()}><Ionicons name="people-outline" size={20} color={colors.accent} /><Text style={styles.secondaryText}>Event group chat</Text></Pressable> : null}
+            <View style={styles.questNotice}><Text style={styles.section}>QUEST WINDOW</Text><Text style={styles.questNoticeText}>{selectedEvent.quest_status === 'ACTIVE' ? 'Quests are live! Post a photo or reel to complete a quest and earn XP. ✦' : selectedEvent.is_finished ? 'The quest window has ended. Nicely done everyone! 🎉' : 'Quests unlock when this event starts. Stay ready! ⚔️'}</Text></View>
             <View style={styles.eventQuestList}>
               <Text style={styles.section}>THE QUEST LINE · {eventQuests.length}</Text>
               {eventQuests.length ? eventQuests.map(quest => <View key={quest.id} style={styles.eventQuest}>
                 <Text style={styles.eventQuestKind}>{quest.kind === 'MAIN' ? '✦ MAIN QUEST' : 'SIDE QUEST'} · +{quest.xp_reward} XP</Text>
                 <Text style={styles.eventQuestTitle}>{quest.title}</Text>
                 <Text style={styles.eventQuestCopy}>{quest.instructions}</Text>
-                {selectedEvent.quest_status === 'ACTIVE' && selectedEvent.my_attendance_status === 'ACCEPTED' ? quest.my_submission ? <Text style={styles.questProofState}>Proof {quest.my_submission.status.toLowerCase()}</Text> : <Pressable style={styles.questProofButton} onPress={() => beginQuestProof(quest)}><Text style={styles.questProofButtonText}>Upload proof</Text></Pressable> : null}
+                {quest.my_submission ? <Text style={styles.questProofState}>✓ Completed · +{quest.xp_reward} XP</Text> : selectedEvent.quest_status === 'ACTIVE' && selectedEvent.my_attendance_status === 'ACCEPTED' ? <><Pressable accessibilityRole="button" accessibilityLabel={'Complete quest: ' + quest.title} style={[styles.questProofButton, iconLabelRow]} onPress={() => beginQuestProof(quest)}><Ionicons name="checkmark-circle-outline" size={18} color="#FFFFFF" /><Text style={styles.questProofButtonText}>Complete quest</Text></Pressable><Text style={styles.personMeta}>Share a photo or reel to earn +{quest.xp_reward} XP.</Text></> : <Text style={styles.personMeta}>{selectedEvent.quest_status === 'EXPIRED' ? 'Quest ended' : selectedEvent.my_attendance_status !== 'ACCEPTED' ? 'Join this event to complete quests.' : 'Unlocks when the event begins.'}</Text>}
               </View>) : <Text style={styles.muted}>{selectedEvent.quest_status === 'SCHEDULED' ? 'Quests unlock when the event starts.' : 'Your quest list will appear here.'}</Text>}
             </View>
             <View style={styles.eventMoments}>
               <Text style={styles.section}>QUEST MOMENTS · {eventPosts.length}</Text>
-              <Text style={styles.sheetCopy}>Proofs shared by people who joined this adventure.</Text>
-              {eventPosts.length ? eventPosts.map(post => <PostCard onLike={post => void toggleLike(post)} key={post.id} post={post} mine={post.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={item => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + item.id + '/')} onComments={item => void openComments(item)} onOpenProfile={setSelectedUser} />) : <Text style={styles.muted}>Quest proofs will appear here as participants complete their quests.</Text>}
+              <Text style={styles.sheetCopy}>Snaps from people who actually showed up and did the thing. 🏆</Text>
+              {eventPosts.length ? eventPosts.map(post => <PostCard onLike={post => void toggleLike(post)} key={post.id} post={post} mine={post.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={item => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + item.id + '/')} onComments={item => void openComments(item)} onOpenProfile={setSelectedUser} />) : <Text style={styles.muted}>No snaps yet — be the first to complete a quest! 📸</Text>}
             </View>
             {selectedEvent.is_finished && selectedEvent.my_attendance_status === 'ACCEPTED' ? <View style={styles.ratingPanel}>
               <Text style={styles.ratingTitle}>RATE YOUR FELLOW GUESTS</Text>
@@ -832,758 +1384,63 @@ function SocialQuestApp() {
             </View> : null}
             {selectedEvent.host.id === me?.id ? <View style={styles.eventQuestList}>
               <Text style={styles.section}>HOST CONSOLE</Text>
+              <View style={styles.ratingActions}><Pressable style={styles.ratingChoice} onPress={() => openInviteList(selectedEvent.id)}><Text style={styles.ratingChoiceText}>Invite people</Text></Pressable><Pressable style={styles.ratingChoice} onPress={() => openEventEditor(selectedEvent)}><Text style={styles.ratingChoiceText}>Edit event</Text></Pressable><Pressable style={styles.ratingChoice} onPress={deleteEvent}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View>
               {eventRequests.filter(request => request.status === 'PENDING').map(request => <View key={request.id} style={styles.eventQuest}>
                 <Text style={styles.personName}>{nameOf(request.user)}</Text><Text style={styles.personMeta}>{request.user.xp || 0} XP · {request.user.karma ?? 0} karma</Text>
                 {!selectedEvent.is_finished ? <View style={styles.ratingActions}><Pressable style={styles.ratingChoice} onPress={() => void reviewEventItem(request.id, 'DENIED')}><Text style={styles.ratingChoiceText}>Decline</Text></Pressable><Pressable style={styles.ratingChoice} onPress={() => void reviewEventItem(request.id, 'ACCEPTED')}><Text style={styles.ratingChoiceText}>Accept</Text></Pressable></View> : <Text style={styles.muted}>Requests closed</Text>}
               </View>)}
-              <Text style={styles.section}>REVIEW QUEST PROOF</Text>
-              {eventProofs.length ? eventProofs.map(proof => <View key={proof.id} style={styles.eventQuest}>
-                <Text style={styles.eventQuestTitle}>{proof.quest_title}</Text><Text style={styles.personMeta}>{nameOf(proof.participant)} · {proof.xp_reward} XP</Text>
-                {proof.media_type === 'REEL' ? <ReelVideo uri={proof.media} /> : <Image style={styles.postImage} source={{ uri: proof.media }} />}
-                <Text style={styles.sheetCopy}>{proof.caption}</Text><Text style={styles.questProofState}>Proof {proof.status.toLowerCase()}</Text>
-                {proof.status !== 'APPROVED' ? <View style={styles.ratingActions}><Pressable style={styles.ratingChoice} onPress={() => void reviewEventItem(proof.id, 'REJECTED', true)}><Text style={styles.ratingChoiceText}>Reject</Text></Pressable><Pressable style={styles.ratingChoice} onPress={() => void reviewEventItem(proof.id, 'APPROVED', true)}><Text style={styles.ratingChoiceText}>Approve</Text></Pressable></View> : null}
-              </View>) : <Text style={styles.muted}>No proof submitted yet.</Text>}
             </View> : null}
-            <View style={styles.eventActionRow}><Pressable style={styles.eventShare} onPress={() => void shareResource('A SocialQuest adventure', 'Join me at ' + selectedEvent.name + ' on SocialQuest.', '/?view=event&event=' + selectedEvent.id)}><Text style={styles.eventShareText}>↗ Share</Text></Pressable>{selectedEvent.host.id === me?.id ? <View style={styles.hostPill}><Text style={styles.hostPillText}>You are hosting</Text></View> : selectedEvent.my_attendance_status ? <View style={styles.hostPill}><Text style={styles.hostPillText}>{selectedEvent.my_attendance_status.toLowerCase()}</Text></View> : selectedEvent.is_finished ? <View style={styles.hostPill}><Text style={styles.hostPillText}>Requests closed</Text></View> : <Pressable style={[styles.primary, styles.eventJoin]} onPress={join}><Text style={styles.primaryText}>Request to join</Text></Pressable>}</View>
+            <View style={styles.eventActionRow}><Pressable style={[styles.eventShare, iconLabelRow]} onPress={() => void shareResource('A SocialQuest adventure', 'Join me at ' + selectedEvent.name + ' on SocialQuest.', '/?view=event&event=' + selectedEvent.id)}><Ionicons name="paper-plane-outline" size={17} color="#fff" /><Text style={styles.eventShareText}>Share</Text></Pressable>{selectedEvent.host.id === me?.id ? <View style={styles.hostPill}><Text style={styles.hostPillText}>You are hosting</Text></View> : selectedEvent.is_finished ? <View style={styles.hostPill}><Text style={styles.hostPillText}>Requests closed</Text></View> : selectedEvent.my_attendance_status === 'INVITED' ? <View style={styles.inviteActions}><Pressable style={styles.ratingChoice} onPress={() => void cancelRsvp()}><Text style={styles.ratingChoiceText}>Decline</Text></Pressable><Pressable style={[styles.primary, styles.rowAction]} onPress={join}><Text style={styles.primaryText}>Accept invite</Text></Pressable></View> : selectedEvent.my_attendance_status === 'PENDING' || selectedEvent.my_attendance_status === 'ACCEPTED' ? <Pressable style={styles.hostPill} onPress={() => void cancelRsvp()}><Text style={styles.hostPillText}>{selectedEvent.my_attendance_status.toLowerCase()} · cancel</Text></Pressable> : <Pressable style={[styles.primary, styles.eventJoin]} onPress={join}><Text style={styles.primaryText}>{selectedEvent.my_attendance_status ? 'Request again' : 'Request to join'}</Text></Pressable>}</View>
           </ScrollView>}
         </Pressable>
       </Pressable>
     </Modal>
-    <Modal visible={!!commentPost} transparent animationType="slide" onRequestClose={() => setCommentPost(null)}><Pressable style={styles.overlay} onPress={() => setCommentPost(null)}><Pressable style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>Replies.</Text><Text style={styles.sheetCopy}>{commentPost?.body ? 'Keep the conversation kind and thoughtful.' : 'Leave a thoughtful reply.'}</Text><ScrollView style={styles.commentList} contentContainerStyle={styles.commentListContent} keyboardShouldPersistTaps="handled">{comments.length ? comments.map(comment => <Pressable key={comment.id} accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(comment.author) + "'s profile"} onPress={() => setSelectedUser(comment.author)} onLongPress={() => showCommentOptions(comment)} style={styles.commentCard}><Avatar user={comment.author} /><View style={styles.commentCopy}><Text style={styles.personName}>{nameOf(comment.author)}</Text><Text style={styles.commentBody}>{comment.body}</Text><Text style={styles.personMeta}>{dateOf(comment.created_at)}{comment.author.id === me?.id ? ' · hold to manage' : ''}</Text></View></Pressable>) : <Text style={styles.muted}>Be the first to reply.</Text>}</ScrollView><TextInput style={styles.commentInput} maxLength={500} value={commentBody} onChangeText={setCommentBody} placeholder={editingComment ? 'Edit your reply' : 'Add a kind reply…'} multiline /><View style={styles.editActions}>{editingComment ? <Pressable style={styles.cancelEdit} onPress={() => { setEditingComment(null); setCommentBody(''); }}><Text style={styles.cancelEditText}>Cancel edit</Text></Pressable> : null}<Pressable style={styles.primary} onPress={() => void saveComment()}><Text style={styles.primaryText}>{editingComment ? 'Save reply' : 'Reply'}</Text></Pressable></View></Pressable></Pressable></Modal>
-    <Modal visible={!!messageOptions} transparent animationType="slide" onRequestClose={() => setMessageOptions(null)}><Pressable style={styles.overlay} onPress={() => setMessageOptions(null)}><Pressable style={styles.sheet} onPress={event => event.stopPropagation()}><Text style={styles.sheetTitle}>Message options</Text>{messageOptions && <>
+    <Modal visible={!!commentPost} transparent animationType="slide" onRequestClose={closeComments}>
+      <KeyboardAvoidingView style={styles.modalKeyboardAvoider} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
+        <Pressable feedback="none" style={styles.overlay} onPress={closeComments}>
+          <Pressable feedback="none" style={[styles.sheet, styles.commentsSheet]} onPress={event => event.stopPropagation()}>
+            <View style={styles.handle} />
+            <View style={styles.commentsHeader}>
+              <View style={styles.commentsHeaderCopy}>
+                <Text style={styles.sheetTitle}>Replies</Text>
+                <Text numberOfLines={1} style={styles.commentPostPreview}>{commentPost ? nameOf(commentPost.author) + ' · ' + (commentPost.body || 'Shared a moment') : ''}</Text>
+              </View>
+              <Pressable accessibilityRole="button" accessibilityLabel="Close replies" onPress={closeComments} style={styles.commentsClose}><Ionicons name="close" size={23} color={colors.text} /></Pressable>
+            </View>
+            <Text style={styles.sheetCopy}>{comments.length ? 'Join the conversation.' : 'Be the first to leave a thoughtful reply.'}</Text>
+            <ScrollView style={styles.commentList} contentContainerStyle={styles.commentListContent} keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} keyboardShouldPersistTaps="handled">
+              {comments.length ? rootComments.map(comment => renderCommentThread(comment)) : <View style={styles.commentEmpty}><Text style={styles.muted}>No replies yet.</Text><Text style={styles.commentEmptyCopy}>A good conversation starts with one kind thought.</Text></View>}
+            </ScrollView>
+            {editingComment ? <View style={styles.commentEditing}><Text style={styles.commentEditingText}>Editing your reply</Text><Pressable accessibilityRole="button" accessibilityLabel="Cancel comment edit" onPress={() => { setEditingComment(null); setCommentBody(''); }}><Text style={styles.commentEditingCancel}>Cancel</Text></Pressable></View> : null}
+            {replyingTo ? <View style={styles.commentEditing}><Text numberOfLines={1} style={styles.commentEditingText}>Replying to @{replyingTo.author.username}</Text><Pressable accessibilityRole="button" accessibilityLabel="Stop replying to this comment" onPress={clearReplyTarget}><Ionicons name="close-circle-outline" size={21} color={colors.danger} /></Pressable></View> : null}
+            <View style={styles.commentComposer}>
+              <Avatar user={me} />
+              <TextInput numberOfLines={3} ref={commentInputRef} style={styles.commentInput} maxLength={500} value={commentBody} onChangeText={setCommentBody} editable={!commentSubmitting} placeholder={editingComment ? 'Edit your reply' : 'Add a reply…'} placeholderTextColor={colors.muted} multiline returnKeyType="default" blurOnSubmit={false} />
+              <Pressable accessibilityRole="button" accessibilityLabel={commentSubmitting ? 'Saving reply' : editingComment ? 'Save reply' : 'Post reply'} disabled={commentSubmitting || !commentBody.trim()} onPress={() => void saveComment()} style={[styles.commentSend, (commentSubmitting || !commentBody.trim()) && styles.commentSendDisabled]}>{commentSubmitting ? <Ionicons name="ellipsis-horizontal" size={20} color="#fff" /> : <Ionicons name={editingComment ? 'checkmark' : 'arrow-up'} size={22} color={(commentSubmitting || !commentBody.trim()) ? '#77849e' : '#fff'} />}</Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </KeyboardAvoidingView>
+    </Modal>
+    <Modal visible={!!messageOptions} transparent animationType="slide" onRequestClose={() => setMessageOptions(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setMessageOptions(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><Text style={styles.sheetTitle}>Message options</Text>{messageOptions && <>
       {messageOptions.sender.id === me?.id ? <Pressable style={styles.secondary} onPress={() => { setChatEditor({ kind: 'message', id: messageOptions.id, value: messageOptions.body }); setMessageOptions(null); }}><Text style={styles.secondaryText}>Edit message</Text></Pressable> : null}
       <Pressable style={styles.secondary} onPress={() => { void deleteMessage(messageOptions.id, 'me'); setMessageOptions(null); }}><Text style={styles.secondaryText}>Delete for me</Text></Pressable>
       {messageOptions.sender.id === me?.id ? <Pressable style={styles.secondary} onPress={() => { void deleteMessage(messageOptions.id, 'everyone'); setMessageOptions(null); }}><Text style={styles.postDeleteText}>Delete for everyone</Text></Pressable> : null}
       <Pressable style={styles.secondary} onPress={() => setMessageOptions(null)}><Text style={styles.secondaryText}>Cancel</Text></Pressable>
     </>}</Pressable></Pressable></Modal>
-    <Modal visible={!!chatEditor} transparent animationType="slide" onRequestClose={() => setChatEditor(null)}><Pressable style={styles.overlay} onPress={() => setChatEditor(null)}><Pressable style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>{chatEditor?.kind === 'conversation' ? 'Name this chat.' : 'Edit your message.'}</Text><Text style={styles.sheetCopy}>{chatEditor?.kind === 'conversation' ? 'This name is visible to everyone in the chat.' : 'Your updated message will be marked as edited.'}</Text><TextInput style={styles.momentInput} maxLength={chatEditor?.kind === 'conversation' ? 100 : 2000} value={chatEditor?.value || ''} onChangeText={value => setChatEditor(current => current ? { ...current, value } : current)} placeholder={chatEditor?.kind === 'conversation' ? 'Chat name (optional)' : 'Write your message'} multiline={chatEditor?.kind === 'message'} autoFocus /><View style={styles.editActions}><Pressable style={styles.cancelEdit} onPress={() => setChatEditor(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable style={styles.primary} onPress={() => void saveChatEditor()}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
-    <Modal visible={!!editingPost} transparent animationType="slide" onRequestClose={() => setEditingPost(null)}><Pressable style={styles.overlay} onPress={() => setEditingPost(null)}><Pressable style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>Edit your moment.</Text><TextInput style={styles.momentInput} maxLength={1200} value={editBody} onChangeText={setEditBody} placeholder="What happened?" multiline /><TextInput style={styles.editLocation} maxLength={120} value={editLocation} onChangeText={setEditLocation} placeholder="Location (optional)" /><View style={styles.editActions}><Pressable style={styles.cancelEdit} onPress={() => setEditingPost(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable style={styles.primary} onPress={savePostEdit}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
+    <Modal visible={!!chatEditor} transparent animationType="slide" onRequestClose={() => setChatEditor(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setChatEditor(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>{chatEditor?.kind === 'conversation' ? 'Name this chat.' : 'Edit your message.'}</Text><Text style={styles.sheetCopy}>{chatEditor?.kind === 'conversation' ? 'This name is visible to everyone in the chat.' : 'Your updated message will be marked as edited.'}</Text><TextInput style={styles.momentInput} maxLength={chatEditor?.kind === 'conversation' ? 100 : 2000} value={chatEditor?.value || ''} onChangeText={value => setChatEditor(current => current ? { ...current, value } : current)} placeholder={chatEditor?.kind === 'conversation' ? 'Chat name (optional)' : 'Write your message'} multiline={chatEditor?.kind === 'message'} autoFocus /><View style={styles.editActions}><Pressable style={styles.cancelEdit} onPress={() => setChatEditor(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable style={[styles.primary, styles.rowAction]} onPress={() => void saveChatEditor()}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
+    <Modal visible={!!editingPost} transparent animationType="slide" onRequestClose={() => setEditingPost(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setEditingPost(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>Edit your moment.</Text><TextInput style={styles.momentInput} maxLength={1200} value={editBody} onChangeText={setEditBody} placeholder="What happened?" multiline /><TextInput style={styles.editLocation} maxLength={120} value={editLocation} onChangeText={setEditLocation} placeholder="Location (optional)" /><View style={styles.editActions}><Pressable style={styles.cancelEdit} onPress={() => setEditingPost(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable style={[styles.primary, styles.rowAction]} onPress={savePostEdit}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
   </View>;
 }
 
-function Score({ label, value, onPress }: { label: string; value: string; onPress?: () => void }) {
+function Score({ label, value, onPress, tone = 'purple' }: { label: string; value: string; onPress?: () => void; tone?: Accent }) {
   const styles = activeStyles;
-  const content = <><Text style={styles.scoreValue}>{value}</Text><Text style={styles.scoreLabel}>{label}</Text></>;
-  return onPress ? <Pressable accessibilityRole="button" accessibilityLabel={value + ' ' + label.replace(' ›', '').toLowerCase()} style={styles.score} onPress={onPress}>{content}</Pressable> : <View style={styles.score}>{content}</View>;
+  const accent = accents[tone];
+  const cardStyle = styles.score;
+  const content = <><Text style={[styles.scoreValue, {color: accent.text}]}>{value}</Text><Text style={styles.scoreLabel}>{label}</Text></>;
+  return onPress ? <Pressable accessibilityRole="button" accessibilityLabel={value + ' ' + label.replace(' ›', '').toLowerCase()} style={cardStyle} onPress={onPress}>{content}</Pressable> : <View style={cardStyle}>{content}</View>;
 }
 
 function SearchIcon() {
-  return <View style={socialStyles.searchIcon} accessible={false}><View style={socialStyles.searchLens} /><View style={socialStyles.searchHandle} /></View>;
+  return <Ionicons name="search-outline" size={22} color={colors.text} accessible={false} />;
 }
-
-const socialStyles = StyleSheet.create({
-  homeHeading: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8},
-  searchIconButton: {minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#536c9d', backgroundColor: '#152444'},
-  searchIcon: {width: 22, height: 22},
-  searchLens: {width: 15, height: 15, borderRadius: 8, borderWidth: 2, borderColor: '#f8f5e8'},
-  searchHandle: {width: 10, height: 2, backgroundColor: '#f8f5e8', transform: [{rotate: '45deg'}], position: 'absolute', left: 12, top: 16},
-  online: {color: '#9cec4c', fontSize: 12, marginTop: 3},
-  followScores: {flexDirection: 'row', gap: 8, marginTop: 12},
-  peopleSheet: {height: '82%'},
-  peopleHeading: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8},
-  closeButton: {minHeight: 44, minWidth: 44, justifyContent: 'center'},
-  peopleList: {marginTop: 16, flex: 1},
-  peopleEmpty: {paddingVertical: 24},
-  personCopy: {flex: 1, minWidth: 0},
-});
-
-const lightStyles = StyleSheet.create({
-  app: { flex: 1, backgroundColor: '#f7f5ee' },
-  auth: { flex: 1, backgroundColor: '#f7f5ee' },
-  authHero: { backgroundColor: '#0a1020', minHeight: 210, padding: 28, paddingTop: 38, position: 'relative' },
-  themeToggle: { borderColor: '#ffffff66', borderRadius: 16, borderWidth: 1, paddingHorizontal: 10, paddingVertical: 7, position: 'absolute', right: 20, top: 20 },
-  themeToggleText: { color: '#fff', fontSize: 12, fontWeight: '800' },
-  bigMark: { alignItems: 'center', backgroundColor: '#d8ff59', borderRadius: 12, height: 42, justifyContent: 'center', width: 42 },
-  markText: { color: '#0a1020', fontFamily: 'Georgia', fontSize: 27, fontStyle: 'italic', fontWeight: '700' },
-  authBrand: { color: '#fff', fontSize: 34, fontWeight: '800', letterSpacing: -1.8, marginTop: 13 },
-  tagline: { color: '#aab2c6', fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginTop: 6 },
-  authForm: { flex: 1 },
-  authContent: { padding: 27, paddingBottom: 50 },
-  eyebrow: { color: '#ec745f', fontSize: 11, fontWeight: '800', letterSpacing: 1.1 },
-  authTitle: { color: '#0a1020', fontSize: 37, fontWeight: '800', letterSpacing: -1.8, lineHeight: 42, marginTop: 13 },
-  authDescription: { color: '#666779', fontSize: 17, lineHeight: 25, marginBottom: 15, marginTop: 11 },
-  input: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, color: '#0a1020', fontSize: 17, marginTop: 10, paddingHorizontal: 14, paddingVertical: 13 },
-  primary: { alignItems: 'center', backgroundColor: '#0a1020', borderRadius: 10, flex: 1, justifyContent: 'center', marginTop: 16, padding: 15 },
-  primaryText: { color: '#fff', fontSize: 15, fontWeight: '800' },
-  dim: { opacity: 0.55 },
-  switchText: { color: '#d65849', fontSize: 14, fontWeight: '700', marginTop: 20, textAlign: 'center' },
-  appHeader: { alignItems: 'center', backgroundColor: '#f7f5ee', borderBottomColor: '#e2dfd6', borderBottomWidth: 1, flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 18, paddingVertical: 13 },
-  brandRow: { alignItems: 'center', flexDirection: 'row', gap: 8 },
-  smallMark: { alignItems: 'center', backgroundColor: '#0a1020', borderRadius: 8, height: 28, justifyContent: 'center', width: 28 },
-  smallMarkText: { color: '#d8ff59', fontFamily: 'Georgia', fontSize: 19, fontStyle: 'italic', fontWeight: '700' },
-  appBrand: { flexShrink: 1, color: '#0a1020', fontSize: 21, fontWeight: '800', letterSpacing: -1.1 },
-  headerRight: { flexDirection: 'row', gap: 9 },
-  headerTheme: { alignItems: 'center', backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 17, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerThemeText: { color: '#0a1020', fontSize: 17 },
-  headerChat: { alignItems: 'center', backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 17, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerProfile: { alignItems: 'center', backgroundColor: '#d8ff59', borderRadius: 17, height: 34, justifyContent: 'center', width: 34 },
-  headerProfileText: { color: '#0a1020', fontSize: 13, fontWeight: '800' },
-  content: { flex: 1 },
-  list: { gap: 13, padding: 19, paddingBottom: 25 },
-  intro: { paddingTop: 9 },
-  title: { color: '#0a1020', fontSize: 37, fontWeight: '800', letterSpacing: -1.8, lineHeight: 41, marginTop: 10 },
-  serif: { fontFamily: 'Georgia', fontStyle: 'italic', fontWeight: '400' },
-  copy: { color: '#686979', fontSize: 16, lineHeight: 24, marginTop: 10 },
-  outline: { alignSelf: 'flex-start', borderColor: '#0a1020', borderRadius: 20, borderWidth: 1, marginTop: 16, paddingHorizontal: 14, paddingVertical: 10 },
-  outlineText: { color: '#0a1020', fontSize: 14, fontWeight: '800' },
-  secondary: { alignItems: 'center', borderColor: '#0a1020', borderRadius: 10, borderWidth: 1, justifyContent: 'center', marginTop: 12, padding: 14 },
-  secondaryText: { color: '#0a1020', fontSize: 15, fontWeight: '800' },
-  avatar: { alignItems: 'center', backgroundColor: '#8673e8', borderRadius: 18, height: 36, justifyContent: 'center', overflow: 'hidden', width: 36 },
-  avatarLarge: { borderRadius: 32, height: 64, width: 64 },
-  avatarText: { color: '#fff', fontSize: 14, fontWeight: '800' },
-  avatarLargeText: { fontSize: 25 },
-  post: { backgroundColor: '#fff', borderColor: '#e0ddd4', borderRadius: 13, borderWidth: 1, padding: 14 },
-  postHead: { alignItems: 'center', flexDirection: 'row', gap: 9 },
-  personName: { flexShrink: 1, color: '#0a1020', fontSize: 15, fontWeight: '800' },
-  personMeta: { flexShrink: 1, color: '#747484', fontSize: 13, marginTop: 2 },
-  recommendationTag: { alignSelf: 'flex-start', backgroundColor: '#e5efff', borderRadius: 12, color: '#3f5f8f', fontSize: 11, fontWeight: '800', marginTop: 11, paddingHorizontal: 8, paddingVertical: 5 },
-  questPostTag: { alignSelf: 'flex-start', backgroundColor: '#eff7d7', borderRadius: 12, color: '#506319', fontSize: 11, fontWeight: '800', marginTop: 11, paddingHorizontal: 8, paddingVertical: 5 },
-  postBody: { color: '#242635', fontSize: 17, lineHeight: 25, marginTop: 13 },
-  postImage: { borderRadius: 9, height: 190, marginTop: 13, width: '100%' },
-  postFooter: { flexWrap: 'wrap', borderTopColor: '#ece9e1', borderTopWidth: 1, flexDirection: 'row', gap: 20, marginTop: 14, paddingTop: 11 },
-  postManage: { borderLeftColor: '#e0ddd4', borderLeftWidth: 1, flexDirection: 'row', gap: 10, marginLeft: 'auto', paddingLeft: 10 },
-  postManageText: { color: '#0a1020', fontSize: 13, fontWeight: '800' },
-  postDeleteText: { color: '#c74d41', fontSize: 13, fontWeight: '800' },
-  searchRow: { flexDirection: 'row', gap: 8, marginTop: 17 },
-  searchInput: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, flex: 1, fontSize: 16, paddingHorizontal: 12, paddingVertical: 11 },
-  searchButton: { alignItems: 'center', backgroundColor: '#0a1020', borderRadius: 10, justifyContent: 'center', paddingHorizontal: 13 },
-  searchText: { color: '#fff', fontSize: 14, fontWeight: '800' },
-  matches: { marginTop: 20 },
-  section: { color: '#747484', fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 8 },
-  personCard: { alignItems: 'center', backgroundColor: '#fff', borderColor: '#e0ddd4', borderRadius: 10, borderWidth: 1, flexDirection: 'row', gap: 10, marginBottom: 7, padding: 10 },
-  muted: { color: '#858695', fontSize: 14 },
-  eventCard: { backgroundColor: '#fff', borderColor: '#dedbd2', borderWidth: 1, overflow: 'hidden' },
-  eventArt: { alignItems: 'center', backgroundColor: '#8673e8', height: 148, justifyContent: 'center' },
-  eventDate: { backgroundColor: '#fff', color: '#0a1020', fontSize: 11, fontWeight: '800', left: 10, padding: 7, position: 'absolute', top: 10 },
-  eventIcon: { color: '#fff', fontSize: 49 },
-  eventBadge: { backgroundColor: '#d8ff59', bottom: 10, color: '#0a1020', fontSize: 9, fontWeight: '800', left: 10, padding: 7, position: 'absolute' },
-  eventText: { padding: 14 },
-  eventName: { color: '#0a1020', fontSize: 23, fontWeight: '800', letterSpacing: -0.8 },
-  eventMeta: { color: '#686979', fontSize: 14, marginTop: 5 },
-  hostMeta: { color: '#4a4b5c', fontSize: 14, fontWeight: '600', marginTop: 12 },
-  eventHostLink: { borderTopColor: '#ece9e1', borderTopWidth: 1, paddingHorizontal: 14, paddingVertical: 12 },
-  eventHostLinkText: { marginTop: 0 },
-  eventRecommendation: { color: '#3f5f8f', fontSize: 12, fontWeight: '800', marginTop: 8 },
-  nearbyButton: { alignSelf: 'flex-start', borderColor: '#0a1020', borderRadius: 17, borderWidth: 1, marginTop: 16, paddingHorizontal: 12, paddingVertical: 8 },
-  nearbyButtonActive: { backgroundColor: '#d8ff59', borderColor: '#d8ff59' },
-  nearbyButtonText: { color: '#0a1020', fontSize: 12, fontWeight: '800' },
-  nearbyButtonTextActive: { color: '#0a1020' },
-  reel: { borderRadius: 15, height: 250, justifyContent: 'flex-end', padding: 17 },
-  reelPurple: { backgroundColor: '#6958c1' },
-  reelBlue: { backgroundColor: '#397e91' },
-  reelIcon: { color: '#d8ff59', fontSize: 32, marginBottom: 'auto' },
-  reelAuthor: { color: '#fff', fontSize: 15, fontWeight: '800' },
-  reelBody: { color: '#eef0ff', fontSize: 16, lineHeight: 23, marginTop: 5 },
-  reelShare: { alignSelf: 'flex-start', borderColor: '#ffffff88', borderRadius: 14, borderWidth: 1, marginTop: 12, paddingHorizontal: 10, paddingVertical: 7 },
-  reelShareText: { color: '#fff', fontSize: 12, fontWeight: '800' },
-  contacts: { gap: 13, paddingBottom: 22 },
-  chatFollowHint: { color: '#686979', fontSize: 14, lineHeight: 20, paddingBottom: 22 },
-  contact: { alignItems: 'center', width: 60 },
-  contactName: { color: '#383a49', fontSize: 11, fontWeight: '700', marginTop: 5, textAlign: 'center', width: 60 },
-  chatIntroTitle: { alignItems: 'center', flexDirection: 'row', gap: 9 },
-  chatCount: { alignItems: 'center', backgroundColor: '#d8ff59', borderRadius: 12, height: 24, justifyContent: 'center', minWidth: 24, paddingHorizontal: 7 },
-  chatCountText: { color: '#0a1020', fontSize: 11, fontWeight: '900' },
-  conversation: { alignItems: 'center', backgroundColor: '#fff', borderColor: '#e0ddd4', borderRadius: 14, borderWidth: 1, flexDirection: 'row', gap: 11, marginBottom: 8, padding: 12 },
-  conversationCopy: { flex: 1 },
-  conversationTop: { alignItems: 'center', flexDirection: 'row', gap: 8, justifyContent: 'space-between' },
-  conversationTime: { color: '#858695', fontSize: 10, fontWeight: '700' },
-  notificationCard: { alignItems: 'center', backgroundColor: '#fff', borderColor: '#e0ddd4', borderRadius: 11, borderWidth: 1, flexDirection: 'row', gap: 10, padding: 12 },
-  notificationUnread: { borderColor: '#ec745f', backgroundColor: '#fff5f2' },
-  notificationIcon: { alignItems: 'center', backgroundColor: '#d8ff59', borderRadius: 17, height: 34, justifyContent: 'center', width: 34 },
-  notificationCopy: { flex: 1 },
-  notificationText: { color: '#0a1020', fontSize: 15, fontWeight: '700', lineHeight: 21 },
-  chatScreen: { flex: 1 },
-  chatHeader: { alignItems: 'center', backgroundColor: '#fff', borderBottomColor: '#e2dfd6', borderBottomWidth: 1, flexDirection: 'row', gap: 10, paddingHorizontal: 15, paddingVertical: 13 },
-  chatBackButton: { alignItems: 'center', backgroundColor: '#f2efe8', borderRadius: 18, height: 36, justifyContent: 'center', width: 36 },
-  back: { color: '#d65849', fontSize: 27, fontWeight: '500', lineHeight: 29, marginTop: -3 },
-  chatPerson: { alignItems: 'center', flex: 1, flexDirection: 'row', gap: 10, minWidth: 0 },
-  chatIdentity: { flex: 1, minWidth: 0 },
-  chatTitle: { color: '#0a1020', flex: 1, fontSize: 18, fontWeight: '800' },
-  chatSubtitle: { color: '#858695', fontSize: 11, fontWeight: '700', marginTop: 2 },
-  chatPresence: { color: '#5da454', fontSize: 11, paddingHorizontal: 3 },
-  chatMenu: { alignItems: 'center', backgroundColor: '#f2efe8', borderRadius: 18, height: 36, justifyContent: 'center', width: 36 },
-  chatMenuText: { color: '#0a1020', fontSize: 15, fontWeight: '900', letterSpacing: 1, marginTop: -6 },
-  messageList: { backgroundColor: '#f7f5ee', flexGrow: 1, gap: 10, padding: 16, paddingTop: 20 },
-  bubble: { alignSelf: 'flex-start', backgroundColor: '#fff', borderColor: '#e0ddd4', borderRadius: 15, borderBottomLeftRadius: 4, borderWidth: 1, maxWidth: '82%', paddingHorizontal: 12, paddingVertical: 10 },
-  bubbleMine: { alignSelf: 'flex-end', backgroundColor: '#d8ff59', borderColor: '#d8ff59', borderBottomLeftRadius: 15, borderBottomRightRadius: 4 },
-  bubbleText: { color: '#0a1020', fontSize: 16, lineHeight: 23 },
-  bubbleMineText: { color: '#0a1020' },
-  bubbleDeletedText: { color: '#747484', fontStyle: 'italic' },
-  bubbleTime: { color: '#666779', fontSize: 11, marginTop: 5 },
-  bubbleMineTime: { color: '#5f4b2e' },
-  composer: { alignItems: 'center', backgroundColor: '#fff', borderTopColor: '#e2dfd6', borderTopWidth: 1, flexDirection: 'row', gap: 8, paddingHorizontal: 12, paddingVertical: 11 },
-  composerMark: { alignItems: 'center', backgroundColor: '#fff3ef', borderRadius: 17, height: 34, justifyContent: 'center', width: 34 },
-  composerMarkText: { color: '#d65849', fontSize: 16 },
-  emojiTrigger: { alignItems: 'center', justifyContent: 'center', height: 34, width: 28 },
-  emojiTriggerText: { color: '#d65849', fontSize: 20 },
-  emojiPicker: { alignItems: 'center', backgroundColor: '#fff', borderTopColor: '#e2dfd6', borderTopWidth: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 5, justifyContent: 'center', paddingHorizontal: 14, paddingVertical: 9 },
-  emojiChoice: { alignItems: 'center', backgroundColor: '#f7f5ee', borderRadius: 16, height: 32, justifyContent: 'center', width: 32 },
-  emojiChoiceText: { fontSize: 18 },
-  messageInput: { backgroundColor: '#f7f5ee', borderColor: '#dedbd2', borderRadius: 21, borderWidth: 1, flex: 1, fontSize: 16, maxHeight: 80, paddingHorizontal: 14, paddingVertical: 10 },
-  send: { alignItems: 'center', backgroundColor: '#0a1020', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
-  sendText: { color: '#d8ff59', fontSize: 21, fontWeight: '700' },
-  profile: { padding: 21, paddingTop: 30 },
-  profileTop: { flexWrap: 'wrap', alignItems: 'center', flexDirection: 'row', gap: 13 },
-  profileName: { color: '#0a1020', fontSize: 28, fontWeight: '800', letterSpacing: -1.2, marginTop: 6 },
-  profileBio: { color: '#4d4e5d', fontSize: 17, lineHeight: 25, marginTop: 23 },
-  scores: { flexDirection: 'row', gap: 8, marginTop: 24 },
-  score: { backgroundColor: '#fff', borderColor: '#dedbd2', borderWidth: 1, flex: 1, padding: 12 },
-  scoreValue: { color: '#0a1020', fontSize: 25, fontWeight: '800' },
-  scoreLabel: { color: '#747484', fontSize: 8, fontWeight: '800', letterSpacing: 0.8, marginTop: 5 },
-  profileHelp: { color: '#686979', fontSize: 15, lineHeight: 22, marginTop: 25 },
-  logout: { alignItems: 'center', borderColor: '#cf5548', borderRadius: 9, borderWidth: 1, marginTop: 25, padding: 14 },
-  logoutText: { color: '#c74d41', fontSize: 15, fontWeight: '800' },
-  nav: { backgroundColor: '#fff', borderTopColor: '#e2dfd6', borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', paddingBottom: 8, paddingTop: 9 },
-  navItem: { alignItems: 'center', flex: 1, minWidth: 0 },
-  navBadge: { backgroundColor: '#d65849', borderRadius: 8, color: '#fff', fontSize: 8, fontWeight: '800', minWidth: 15, overflow: 'hidden', paddingHorizontal: 3, position: 'absolute', right: -9, textAlign: 'center', top: -5 },
-  navIcon: { color: '#898996', fontSize: 18, lineHeight: 20 },
-  navLabel: { color: '#898996', fontSize: 10, fontWeight: '700', marginTop: 3 },
-  navActive: { color: '#0a1020', fontWeight: '800' },
-  empty: { alignItems: 'center', borderColor: '#d8d5cc', borderRadius: 12, borderStyle: 'dashed', borderWidth: 1, marginTop: 15, padding: 27 },
-  emptyIcon: { color: '#8673e8', fontSize: 30 },
-  emptyTitle: { color: '#0a1020', fontSize: 17, fontWeight: '800', marginTop: 7 },
-  emptyBody: { color: '#747484', fontSize: 15, lineHeight: 22, marginTop: 5, textAlign: 'center' },
-  overlay: { backgroundColor: '#090d1a99', flex: 1, justifyContent: 'flex-end' },
-  sheet: { backgroundColor: '#f7f5ee', borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '90%', padding: 22, paddingBottom: 34 },
-  handle: { alignSelf: 'center', backgroundColor: '#c9c6bd', borderRadius: 3, height: 4, marginBottom: 20, width: 36 },
-  sheetTitle: { color: '#0a1020', fontSize: 30, fontWeight: '800', letterSpacing: -1.4, marginTop: 9 },
-  sheetCopy: { color: '#686979', fontSize: 16, lineHeight: 24, marginTop: 9 },
-  momentInput: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, fontSize: 17, height: 120, marginTop: 18, padding: 13, textAlignVertical: 'top' },
-  commentList: { marginTop: 16, maxHeight: 280 },
-  commentListContent: { gap: 9, paddingBottom: 8 },
-  commentCard: { alignItems: 'flex-start', backgroundColor: '#fff', borderColor: '#e0ddd4', borderRadius: 10, borderWidth: 1, flexDirection: 'row', gap: 10, padding: 11 },
-  commentCopy: { flex: 1 },
-  commentBody: { color: '#242635', fontSize: 15, lineHeight: 21, marginTop: 4 },
-  commentInput: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, fontSize: 16, marginTop: 10, maxHeight: 180, minHeight: 96, paddingHorizontal: 13, paddingVertical: 10, textAlignVertical: 'top' },
-  mediaActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 11 },
-  mediaAction: { backgroundColor: '#ece9e1', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 9 },
-  mediaActionText: { color: '#0a1020', fontSize: 13, fontWeight: '800' },
-  attachment: { alignItems: 'center', backgroundColor: '#efede6', borderRadius: 10, flexDirection: 'row', gap: 10, marginTop: 12, padding: 9 },
-  attachmentImage: { borderRadius: 6, height: 46, width: 46 },
-  attachmentTitle: { color: '#0a1020', fontSize: 13, fontWeight: '800' },
-  removeAttachment: { color: '#c74d41', fontSize: 13, fontWeight: '800', marginTop: 4 },
-  locationTag: { alignItems: 'center', backgroundColor: '#eff6d0', borderRadius: 8, flexDirection: 'row', justifyContent: 'space-between', marginTop: 10, padding: 10 },
-  locationTagText: { color: '#303620', flex: 1, fontSize: 13, fontWeight: '700' },
-  editLocation: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, fontSize: 16, marginTop: 10, paddingHorizontal: 13, paddingVertical: 12 },
-  editActions: { flexDirection: 'row', gap: 10, marginTop: 4 },
-  cancelEdit: { alignItems: 'center', borderColor: '#0a1020', borderRadius: 10, borderWidth: 1, flex: 1, justifyContent: 'center', marginTop: 16, padding: 15 },
-  cancelEditText: { color: '#0a1020', fontSize: 15, fontWeight: '800' },
-  userScoreLine: { flexDirection: 'row', gap: 12, marginTop: 16 },
-  eventHost: { alignItems: 'center', flexDirection: 'row', gap: 9, marginTop: 18 },
-  questNotice: { backgroundColor: '#d8ff59', marginTop: 19, padding: 15 },
-  questNoticeText: { color: '#313622', fontSize: 15, lineHeight: 22 },
-  eventQuestList: { marginTop: 20 },
-  eventQuest: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, marginTop: 8, padding: 13 },
-  eventQuestKind: { color: '#d65849', fontSize: 10, fontWeight: '800', letterSpacing: 0.7 },
-  eventQuestTitle: { color: '#0a1020', fontSize: 17, fontWeight: '800', marginTop: 6 },
-  eventQuestCopy: { color: '#686979', fontSize: 14, lineHeight: 20, marginTop: 5 },
-  questProofButton: { alignSelf: 'flex-start', backgroundColor: '#0a1020', borderRadius: 16, marginTop: 11, paddingHorizontal: 11, paddingVertical: 8 },
-  questProofButtonText: { color: '#fff', fontSize: 12, fontWeight: '800' },
-  questProofState: { alignSelf: 'flex-start', backgroundColor: '#eff7d7', borderRadius: 12, color: '#506319', fontSize: 11, fontWeight: '800', marginTop: 11, paddingHorizontal: 9, paddingVertical: 6, textTransform: 'capitalize' },
-  eventMoments: { gap: 9, marginTop: 22 },
-  ratingPanel: { backgroundColor: '#fff', borderColor: '#dedbd2', borderRadius: 10, borderWidth: 1, marginTop: 18, padding: 14 },
-  ratingTitle: { color: '#0a1020', fontSize: 12, fontWeight: '800', letterSpacing: 0.8 },
-  ratingCopy: { color: '#686979', fontSize: 14, lineHeight: 20, marginTop: 6 },
-  ratingPerson: { alignItems: 'center', borderTopColor: '#e6e3db', borderTopWidth: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginTop: 13, paddingTop: 12 },
-  ratingProfile: { alignItems: 'center', flex: 1, flexDirection: 'row', gap: 9, minWidth: 100 },
-  ratingPersonCopy: { flex: 1, minWidth: 100 },
-  ratingActions: { flexDirection: 'row', gap: 5, paddingLeft: 45, width: '100%' },
-  ratingChoice: { backgroundColor: '#f1efe9', borderColor: '#dedbd2', borderRadius: 14, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 7 },
-  ratingChoiceSelected: { backgroundColor: '#d8ff59', borderColor: '#d8ff59' },
-  ratingChoiceText: { color: '#3c3c48', fontSize: 12, fontWeight: '800' },
-  ratingChoiceSelectedText: { color: '#0a1020' },
-  ratingEmpty: { color: '#686979', fontSize: 14, lineHeight: 20, marginTop: 12 },
-  eventActionRow: { flexDirection: 'row', marginTop: 20 },
-  eventShare: { alignItems: 'center', borderColor: '#0a1020', borderRadius: 9, borderWidth: 1, flex: 1, justifyContent: 'center', marginRight: 8, padding: 14 },
-  eventShareText: { color: '#0a1020', fontSize: 14, fontWeight: '800' },
-  eventJoin: { marginTop: 0 },
-  hostPill: { alignItems: 'center', backgroundColor: '#d8ff59', borderRadius: 9, flex: 1, padding: 14 },
-  hostPillText: { color: '#0a1020', fontSize: 14, fontWeight: '800', textTransform: 'capitalize' },
-  homeGreeting: { color: '#55576a', fontSize: 17, fontWeight: '600', marginTop: 7 },
-  homeSpark: { color: '#a16cff', fontSize: 22 },
-  questFilters: { flexDirection: 'row', gap: 8, marginTop: 18 },
-  questFilter: { backgroundColor: '#efedf5', borderColor: '#dfdce8', borderRadius: 17, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 8 },
-  questFilterActive: { backgroundColor: '#7d59ec', borderColor: '#7d59ec' },
-  questFilterText: { color: '#5e6072', fontSize: 11, fontWeight: '800' },
-  questFilterTextActive: { color: '#fff' },
-  questSectionHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between', marginTop: 24 },
-  questSectionTitle: { color: '#0a1020', fontSize: 17, fontWeight: '800', letterSpacing: -0.4 },
-  questSeeAll: { color: '#8b5cf6', fontSize: 11, fontWeight: '800' },
-  mobileQuestDeck: { gap: 11, marginTop: 12 },
-  mobileQuestCard: { backgroundColor: '#fff', borderColor: '#e1dfe8', borderRadius: 15, borderWidth: 1, overflow: 'hidden' },
-  mobileQuestArt: { alignItems: 'center', backgroundColor: '#6650bd', height: 134, justifyContent: 'center' },
-  mobileQuestArtAlt: { backgroundColor: '#9a4f87' },
-  mobileQuestDate: { backgroundColor: '#ffffffeb', borderRadius: 5, color: '#1a1725', fontSize: 10, fontWeight: '800', left: 11, paddingHorizontal: 7, paddingVertical: 5, position: 'absolute', top: 11 },
-  mobileQuestIcon: { color: '#fff', fontSize: 42 },
-  mobileQuestStatus: { backgroundColor: '#a3ff64', borderRadius: 5, bottom: 11, color: '#172016', fontSize: 9, fontWeight: '900', left: 11, paddingHorizontal: 7, paddingVertical: 5, position: 'absolute' },
-  mobileQuestCopy: { padding: 13 },
-  mobileQuestName: { color: '#0a1020', fontSize: 18, fontWeight: '800', letterSpacing: -0.5 },
-  mobileQuestMeta: { color: '#6f7181', fontSize: 12, marginTop: 4 },
-  mobileQuestXp: { color: '#00a87b', fontSize: 11, fontWeight: '900', marginTop: 9 },
-});
-
-const darkStyles: any = {
-  ...lightStyles,
-  app: [lightStyles.app, { backgroundColor: '#21140f' }],
-  auth: [lightStyles.auth, { backgroundColor: '#21140f' }],
-  authHero: [lightStyles.authHero, { backgroundColor: '#1a0f0b' }],
-  bigMark: [lightStyles.bigMark, { backgroundColor: '#e6b56b' }],
-  markText: [lightStyles.markText, { color: '#2a180f' }],
-  authBrand: [lightStyles.authBrand, { color: '#f8ede0' }],
-  tagline: [lightStyles.tagline, { color: '#c8b3a1' }],
-  authTitle: [lightStyles.authTitle, { color: '#f8ede0' }],
-  authDescription: [lightStyles.authDescription, { color: '#c8b3a1' }],
-  input: [lightStyles.input, { backgroundColor: '#362218', borderColor: '#624536', color: '#f8ede0' }],
-  primary: [lightStyles.primary, { backgroundColor: '#e6b56b' }],
-  primaryText: [lightStyles.primaryText, { color: '#2a180f' }],
-  switchText: [lightStyles.switchText, { color: '#e58a6d' }],
-  appHeader: [lightStyles.appHeader, { backgroundColor: '#2b1a13', borderBottomColor: '#624536' }],
-  smallMark: [lightStyles.smallMark, { backgroundColor: '#e6b56b' }],
-  smallMarkText: [lightStyles.smallMarkText, { color: '#2a180f' }],
-  appBrand: [lightStyles.appBrand, { color: '#f8ede0' }],
-  headerTheme: [lightStyles.headerTheme, { backgroundColor: '#362218', borderColor: '#624536' }],
-  headerThemeText: [lightStyles.headerThemeText, { color: '#f8ede0' }],
-  headerChat: [lightStyles.headerChat, { backgroundColor: '#362218', borderColor: '#624536' }],
-  headerProfile: [lightStyles.headerProfile, { backgroundColor: '#e6b56b' }],
-  headerProfileText: [lightStyles.headerProfileText, { color: '#2a180f' }],
-  content: [lightStyles.content, { backgroundColor: '#21140f' }],
-  title: [lightStyles.title, { color: '#f8ede0' }],
-  copy: [lightStyles.copy, { color: '#c8b3a1' }],
-  outline: [lightStyles.outline, { borderColor: '#ead6c2' }],
-  outlineText: [lightStyles.outlineText, { color: '#f8ede0' }],
-  secondary: [lightStyles.secondary, { borderColor: '#ead6c2' }],
-  secondaryText: [lightStyles.secondaryText, { color: '#f8ede0' }],
-  avatar: [lightStyles.avatar, { backgroundColor: '#a76f55' }],
-  post: [lightStyles.post, { backgroundColor: '#362218', borderColor: '#624536' }],
-  personName: [lightStyles.personName, { color: '#f8ede0' }],
-  personMeta: [lightStyles.personMeta, { color: '#c8b3a1' }],
-  recommendationTag: [lightStyles.recommendationTag, { backgroundColor: '#413122', color: '#e6b56b' }],
-  questPostTag: [lightStyles.questPostTag, { backgroundColor: '#4b3720', color: '#f1cf91' }],
-  postBody: [lightStyles.postBody, { color: '#ead6c2' }],
-  postFooter: [lightStyles.postFooter, { borderTopColor: '#624536' }],
-  postManage: [lightStyles.postManage, { borderLeftColor: '#624536' }],
-  postManageText: [lightStyles.postManageText, { color: '#f8ede0' }],
-  searchInput: [lightStyles.searchInput, { backgroundColor: '#362218', borderColor: '#624536', color: '#f8ede0' }],
-  searchButton: [lightStyles.searchButton, { backgroundColor: '#e6b56b' }],
-  searchText: [lightStyles.searchText, { color: '#2a180f' }],
-  section: [lightStyles.section, { color: '#c8b3a1' }],
-  personCard: [lightStyles.personCard, { backgroundColor: '#362218', borderColor: '#624536' }],
-  muted: [lightStyles.muted, { color: '#c8b3a1' }],
-  eventCard: [lightStyles.eventCard, { backgroundColor: '#362218', borderColor: '#624536' }],
-  eventArt: [lightStyles.eventArt, { backgroundColor: '#5a3827' }],
-  eventDate: [lightStyles.eventDate, { backgroundColor: '#f8ede0', color: '#2a180f' }],
-  eventBadge: [lightStyles.eventBadge, { backgroundColor: '#e6b56b', color: '#2a180f' }],
-  eventName: [lightStyles.eventName, { color: '#f8ede0' }],
-  eventMeta: [lightStyles.eventMeta, { color: '#c8b3a1' }],
-  hostMeta: [lightStyles.hostMeta, { color: '#ead6c2' }],
-  eventHostLink: [lightStyles.eventHostLink, { borderTopColor: '#624536' }],
-  eventHostLinkText: lightStyles.eventHostLinkText,
-  eventRecommendation: [lightStyles.eventRecommendation, { color: '#e6b56b' }],
-  nearbyButton: [lightStyles.nearbyButton, { borderColor: '#ead6c2' }],
-  nearbyButtonActive: [lightStyles.nearbyButtonActive, { backgroundColor: '#e6b56b', borderColor: '#e6b56b' }],
-  nearbyButtonText: [lightStyles.nearbyButtonText, { color: '#f8ede0' }],
-  nearbyButtonTextActive: [lightStyles.nearbyButtonTextActive, { color: '#2a180f' }],
-  reelPurple: [lightStyles.reelPurple, { backgroundColor: '#623d2c' }],
-  reelBlue: [lightStyles.reelBlue, { backgroundColor: '#5b4333' }],
-  reelIcon: [lightStyles.reelIcon, { color: '#e6b56b' }],
-  reelBody: [lightStyles.reelBody, { color: '#f8ede0' }],
-  contactName: [lightStyles.contactName, { color: '#ead6c2' }],
-  chatFollowHint: [lightStyles.chatFollowHint, { color: '#c8b3a1' }],
-  chatIntroTitle: lightStyles.chatIntroTitle,
-  chatCount: [lightStyles.chatCount, { backgroundColor: '#e6b56b' }],
-  chatCountText: [lightStyles.chatCountText, { color: '#2a180f' }],
-  conversation: [lightStyles.conversation, { backgroundColor: '#362218', borderColor: '#624536' }],
-  conversationCopy: lightStyles.conversationCopy,
-  conversationTop: lightStyles.conversationTop,
-  conversationTime: [lightStyles.conversationTime, { color: '#c8b3a1' }],
-  notificationCard: [lightStyles.notificationCard, { backgroundColor: '#362218', borderColor: '#624536' }],
-  notificationUnread: [lightStyles.notificationUnread, { backgroundColor: '#4d2d23', borderColor: '#e58a6d' }],
-  notificationIcon: [lightStyles.notificationIcon, { backgroundColor: '#e6b56b' }],
-  notificationText: [lightStyles.notificationText, { color: '#f8ede0' }],
-  chatHeader: [lightStyles.chatHeader, { backgroundColor: '#362218', borderBottomColor: '#624536' }],
-  chatBackButton: [lightStyles.chatBackButton, { backgroundColor: '#493126' }],
-  back: [lightStyles.back, { color: '#e6b56b' }],
-  chatPerson: lightStyles.chatPerson,
-  chatIdentity: lightStyles.chatIdentity,
-  chatTitle: [lightStyles.chatTitle, { color: '#f8ede0' }],
-  chatSubtitle: [lightStyles.chatSubtitle, { color: '#c8b3a1' }],
-  chatPresence: [lightStyles.chatPresence, { color: '#9ac77e' }],
-  chatMenu: [lightStyles.chatMenu, { backgroundColor: '#493126' }],
-  chatMenuText: [lightStyles.chatMenuText, { color: '#f8ede0' }],
-  messageList: [lightStyles.messageList, { backgroundColor: '#21140f' }],
-  bubble: [lightStyles.bubble, { backgroundColor: '#362218', borderColor: '#624536' }],
-  bubbleMine: [lightStyles.bubbleMine, { backgroundColor: '#e6b56b', borderColor: '#e6b56b' }],
-  bubbleText: [lightStyles.bubbleText, { color: '#f8ede0' }],
-  bubbleMineText: [lightStyles.bubbleText, { color: '#2a180f' }],
-  bubbleDeletedText: [lightStyles.bubbleDeletedText, { color: '#c8b3a1' }],
-  bubbleTime: [lightStyles.bubbleTime, { color: '#c8b3a1' }],
-  bubbleMineTime: [lightStyles.bubbleMineTime, { color: '#765031' }],
-  composer: [lightStyles.composer, { backgroundColor: '#2b1a13', borderTopColor: '#624536' }],
-  composerMark: [lightStyles.composerMark, { backgroundColor: '#493126' }],
-  composerMarkText: [lightStyles.composerMarkText, { color: '#e6b56b' }],
-  emojiTrigger: lightStyles.emojiTrigger,
-  emojiTriggerText: [lightStyles.emojiTriggerText, { color: '#e6b56b' }],
-  emojiPicker: [lightStyles.emojiPicker, { backgroundColor: '#2b1a13', borderTopColor: '#624536' }],
-  emojiChoice: [lightStyles.emojiChoice, { backgroundColor: '#493126' }],
-  emojiChoiceText: lightStyles.emojiChoiceText,
-  messageInput: [lightStyles.messageInput, { backgroundColor: '#362218', borderColor: '#624536', color: '#f8ede0' }],
-  send: [lightStyles.send, { backgroundColor: '#e6b56b' }],
-  sendText: [lightStyles.sendText, { color: '#2a180f' }],
-  profileName: [lightStyles.profileName, { color: '#f8ede0' }],
-  profileBio: [lightStyles.profileBio, { color: '#ead6c2' }],
-  score: [lightStyles.score, { backgroundColor: '#362218', borderColor: '#624536' }],
-  scoreValue: [lightStyles.scoreValue, { color: '#f8ede0' }],
-  scoreLabel: [lightStyles.scoreLabel, { color: '#c8b3a1' }],
-  profileHelp: [lightStyles.profileHelp, { color: '#c8b3a1' }],
-  logout: [lightStyles.logout, { borderColor: '#e58a6d' }],
-  logoutText: [lightStyles.logoutText, { color: '#e58a6d' }],
-  nav: [lightStyles.nav, { backgroundColor: '#2b1a13', borderTopColor: '#624536' }],
-  navActive: [lightStyles.navActive, { color: '#f8ede0' }],
-  empty: [lightStyles.empty, { borderColor: '#765543' }],
-  emptyTitle: [lightStyles.emptyTitle, { color: '#f8ede0' }],
-  emptyBody: [lightStyles.emptyBody, { color: '#c8b3a1' }],
-  overlay: [lightStyles.overlay, { backgroundColor: '#160c08aa' }],
-  sheet: [lightStyles.sheet, { backgroundColor: '#2b1a13' }],
-  handle: [lightStyles.handle, { backgroundColor: '#8a6650' }],
-  sheetTitle: [lightStyles.sheetTitle, { color: '#f8ede0' }],
-  sheetCopy: [lightStyles.sheetCopy, { color: '#c8b3a1' }],
-  momentInput: [lightStyles.momentInput, { backgroundColor: '#362218', borderColor: '#624536', color: '#f8ede0' }],
-  commentList: lightStyles.commentList,
-  commentListContent: lightStyles.commentListContent,
-  commentCard: [lightStyles.commentCard, { backgroundColor: '#362218', borderColor: '#624536' }],
-  commentCopy: lightStyles.commentCopy,
-  commentBody: [lightStyles.commentBody, { color: '#ead6c2' }],
-  commentInput: [lightStyles.commentInput, { backgroundColor: '#362218', borderColor: '#624536', color: '#f8ede0' }],
-  editLocation: [lightStyles.editLocation, { backgroundColor: '#362218', borderColor: '#624536', color: '#f8ede0' }],
-  cancelEdit: [lightStyles.cancelEdit, { borderColor: '#ead6c2' }],
-  cancelEditText: [lightStyles.cancelEditText, { color: '#f8ede0' }],
-  mediaAction: [lightStyles.mediaAction, { backgroundColor: '#493126' }],
-  mediaActionText: [lightStyles.mediaActionText, { color: '#f8ede0' }],
-  attachment: [lightStyles.attachment, { backgroundColor: '#493126' }],
-  attachmentTitle: [lightStyles.attachmentTitle, { color: '#f8ede0' }],
-  locationTag: [lightStyles.locationTag, { backgroundColor: '#5a3c21' }],
-  locationTagText: [lightStyles.locationTagText, { color: '#ffe3b3' }],
-  questNotice: [lightStyles.questNotice, { backgroundColor: '#e6b56b' }],
-  questNoticeText: [lightStyles.questNoticeText, { color: '#2a180f' }],
-  eventQuest: [lightStyles.eventQuest, { backgroundColor: '#362218', borderColor: '#624536' }],
-  eventQuestKind: [lightStyles.eventQuestKind, { color: '#e58a6d' }],
-  eventQuestTitle: [lightStyles.eventQuestTitle, { color: '#f8ede0' }],
-  eventQuestCopy: [lightStyles.eventQuestCopy, { color: '#c8b3a1' }],
-  questProofButton: [lightStyles.questProofButton, { backgroundColor: '#e6b56b' }],
-  questProofButtonText: [lightStyles.questProofButtonText, { color: '#2a180f' }],
-  questProofState: [lightStyles.questProofState, { backgroundColor: '#4b3720', color: '#f1cf91' }],
-  ratingPanel: [lightStyles.ratingPanel, { backgroundColor: '#362218', borderColor: '#624536' }],
-  ratingTitle: [lightStyles.ratingTitle, { color: '#f8ede0' }],
-  ratingCopy: [lightStyles.ratingCopy, { color: '#c8b3a1' }],
-  ratingPerson: [lightStyles.ratingPerson, { borderTopColor: '#624536' }],
-  ratingProfile: lightStyles.ratingProfile,
-  ratingChoice: [lightStyles.ratingChoice, { backgroundColor: '#493126', borderColor: '#765543' }],
-  ratingChoiceText: [lightStyles.ratingChoiceText, { color: '#ead6c2' }],
-  ratingChoiceSelected: [lightStyles.ratingChoiceSelected, { backgroundColor: '#e6b56b', borderColor: '#e6b56b' }],
-  ratingChoiceSelectedText: [lightStyles.ratingChoiceSelectedText, { color: '#2a180f' }],
-  ratingEmpty: [lightStyles.ratingEmpty, { color: '#c8b3a1' }],
-  eventShare: [lightStyles.eventShare, { borderColor: '#ead6c2' }],
-  eventShareText: [lightStyles.eventShareText, { color: '#f8ede0' }],
-  hostPill: [lightStyles.hostPill, { backgroundColor: '#e6b56b' }],
-  hostPillText: [lightStyles.hostPillText, { color: '#2a180f' }],
-};
-
-// The app defaults to this high-contrast game/social palette.  It deliberately
-// keeps the same component map as light mode, so all existing screens inherit
-// the new visual language without changing their behavior.
-Object.assign(darkStyles, {
-  app: { flex: 1, backgroundColor: '#0a0b12' },
-  auth: { flex: 1, backgroundColor: '#0a0b12' },
-  authHero: { backgroundColor: '#10111b', minHeight: 235, padding: 28, paddingTop: 38, position: 'relative' },
-  bigMark: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 14, height: 46, justifyContent: 'center', width: 46 },
-  markText: { color: '#fff', fontFamily: 'Georgia', fontSize: 29, fontStyle: 'italic', fontWeight: '700' },
-  authBrand: { color: '#f8f6ff', fontSize: 35, fontWeight: '800', letterSpacing: -1.8, marginTop: 13 },
-  tagline: { color: '#9da1b4', fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginTop: 6 },
-  authTitle: { color: '#f8f6ff', fontSize: 37, fontWeight: '800', letterSpacing: -1.8, lineHeight: 42, marginTop: 13 },
-  authDescription: { color: '#a5a8b9', fontSize: 17, lineHeight: 25, marginBottom: 15, marginTop: 11 },
-  input: { backgroundColor: '#181a26', borderColor: '#303346', borderRadius: 11, borderWidth: 1, color: '#f8f6ff', fontSize: 17, marginTop: 10, paddingHorizontal: 14, paddingVertical: 13 },
-  primary: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 11, flex: 1, justifyContent: 'center', marginTop: 16, padding: 15 },
-  primaryText: { color: '#fff', fontSize: 15, fontWeight: '800' },
-  switchText: { color: '#d991ff', fontSize: 14, fontWeight: '700', marginTop: 20, textAlign: 'center' },
-  appHeader: { alignItems: 'center', backgroundColor: '#10111a', borderBottomColor: '#292c3c', borderBottomWidth: 1, flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 18, paddingVertical: 13 },
-  smallMark: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 9, height: 29, justifyContent: 'center', width: 29 },
-  smallMarkText: { color: '#fff', fontFamily: 'Georgia', fontSize: 19, fontStyle: 'italic', fontWeight: '700' },
-  appBrand: { flexShrink: 1, color: '#f8f6ff', fontSize: 21, fontWeight: '800', letterSpacing: -1.1 },
-  headerTheme: { alignItems: 'center', backgroundColor: '#1a1c28', borderColor: '#323546', borderRadius: 17, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerThemeText: { color: '#c99aff', fontSize: 17 },
-  headerChat: { alignItems: 'center', backgroundColor: '#1a1c28', borderColor: '#323546', borderRadius: 17, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerProfile: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 17, height: 34, justifyContent: 'center', width: 34 },
-  headerProfileText: { color: '#fff', fontSize: 13, fontWeight: '800' },
-  content: { flex: 1, backgroundColor: '#0d0e16' },
-  list: { gap: 13, padding: 19, paddingBottom: 25 },
-  eyebrow: { color: '#b986ff', fontSize: 11, fontWeight: '800', letterSpacing: 1.1 },
-  title: { color: '#f8f6ff', fontSize: 37, fontWeight: '800', letterSpacing: -1.8, lineHeight: 41, marginTop: 3 },
-  homeGreeting: { color: '#a5a8b9', fontSize: 17, fontWeight: '600', marginTop: 7 },
-  homeSpark: { color: '#ff5ca8', fontSize: 22 },
-  copy: { color: '#a5a8b9', fontSize: 16, lineHeight: 24, marginTop: 10 },
-  outline: { alignSelf: 'flex-start', backgroundColor: '#191b27', borderColor: '#373a4b', borderRadius: 20, borderWidth: 1, marginTop: 17, paddingHorizontal: 14, paddingVertical: 10 },
-  outlineText: { color: '#eceaff', fontSize: 14, fontWeight: '800' },
-  secondary: { alignItems: 'center', backgroundColor: '#171925', borderColor: '#393c4d', borderRadius: 11, borderWidth: 1, justifyContent: 'center', marginTop: 12, padding: 14 },
-  secondaryText: { color: '#eceaff', fontSize: 15, fontWeight: '800' },
-  questFilters: { flexDirection: 'row', gap: 8, marginTop: 18 },
-  questFilter: { backgroundColor: '#191b27', borderColor: '#333647', borderRadius: 17, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 8 },
-  questFilterActive: { backgroundColor: '#8b5cf6', borderColor: '#9b70ff' },
-  questFilterText: { color: '#a4a7b8', fontSize: 11, fontWeight: '800' },
-  questFilterTextActive: { color: '#fff' },
-  questSectionHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between', marginTop: 24 },
-  questSectionTitle: { color: '#f8f6ff', fontSize: 17, fontWeight: '800', letterSpacing: -0.4 },
-  questSeeAll: { color: '#c28fff', fontSize: 11, fontWeight: '800' },
-  mobileQuestDeck: { gap: 11, marginTop: 12 },
-  mobileQuestCard: { backgroundColor: '#171925', borderColor: '#2f3243', borderRadius: 15, borderWidth: 1, overflow: 'hidden' },
-  mobileQuestArt: { alignItems: 'center', backgroundColor: '#4e3a87', height: 134, justifyContent: 'center' },
-  mobileQuestArtAlt: { backgroundColor: '#833f70' },
-  mobileQuestDate: { backgroundColor: '#f7f5ff', borderRadius: 5, color: '#15131d', fontSize: 10, fontWeight: '800', left: 11, paddingHorizontal: 7, paddingVertical: 5, position: 'absolute', top: 11 },
-  mobileQuestIcon: { color: '#fff', fontSize: 42 },
-  mobileQuestStatus: { backgroundColor: '#a3ff64', borderRadius: 5, bottom: 11, color: '#172016', fontSize: 9, fontWeight: '900', left: 11, paddingHorizontal: 7, paddingVertical: 5, position: 'absolute' },
-  mobileQuestCopy: { padding: 13 },
-  mobileQuestName: { color: '#f8f6ff', fontSize: 18, fontWeight: '800', letterSpacing: -0.5 },
-  mobileQuestMeta: { color: '#a4a7b8', fontSize: 12, marginTop: 4 },
-  mobileQuestXp: { color: '#5be2bc', fontSize: 11, fontWeight: '900', marginTop: 9 },
-  avatar: { alignItems: 'center', backgroundColor: '#8b5cf6', borderColor: '#bd92ff66', borderRadius: 18, borderWidth: 1, height: 36, justifyContent: 'center', overflow: 'hidden', width: 36 },
-  post: { backgroundColor: '#171925', borderColor: '#2c2f40', borderRadius: 15, borderWidth: 1, padding: 14 },
-  personName: { flexShrink: 1, color: '#f8f6ff', fontSize: 15, fontWeight: '800' }, personMeta: { flexShrink: 1, color: '#a2a5b6', fontSize: 13, marginTop: 2 },
-  recommendationTag: { alignSelf: 'flex-start', backgroundColor: '#20243b', borderRadius: 12, color: '#7de5c3', fontSize: 11, fontWeight: '800', marginTop: 11, paddingHorizontal: 8, paddingVertical: 5 }, questPostTag: { alignSelf: 'flex-start', backgroundColor: '#302647', borderRadius: 12, color: '#caa5ff', fontSize: 11, fontWeight: '800', marginTop: 11, paddingHorizontal: 8, paddingVertical: 5 }, postBody: { color: '#e9e8f1', fontSize: 17, lineHeight: 25, marginTop: 13 }, postFooter: { flexWrap: 'wrap', borderTopColor: '#2d3040', borderTopWidth: 1, flexDirection: 'row', gap: 20, marginTop: 14, paddingTop: 11 }, postManage: { borderLeftColor: '#343746', borderLeftWidth: 1, flexDirection: 'row', gap: 10, marginLeft: 'auto', paddingLeft: 10 }, postManageText: { color: '#cfcbdf', fontSize: 13, fontWeight: '800' }, postDeleteText: { color: '#ff74aa', fontSize: 13, fontWeight: '800' },
-  searchInput: { backgroundColor: '#171925', borderColor: '#303344', borderRadius: 11, borderWidth: 1, color: '#f8f6ff', flex: 1, fontSize: 16, paddingHorizontal: 12, paddingVertical: 11 }, searchButton: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 11, justifyContent: 'center', paddingHorizontal: 13 }, searchText: { color: '#fff', fontSize: 14, fontWeight: '800' }, section: { color: '#a5a8b9', fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 8 }, muted: { color: '#9ca0b1', fontSize: 14 },
-  eventCard: { backgroundColor: '#171925', borderColor: '#2c2f40', borderRadius: 15, borderWidth: 1, overflow: 'hidden' }, eventArt: { alignItems: 'center', backgroundColor: '#4d3989', height: 148, justifyContent: 'center' }, eventDate: { backgroundColor: '#f8f6ff', color: '#17151f', fontSize: 11, fontWeight: '800', left: 10, padding: 7, position: 'absolute', top: 10 }, eventBadge: { backgroundColor: '#a3ff64', bottom: 10, color: '#182018', fontSize: 9, fontWeight: '800', left: 10, padding: 7, position: 'absolute' }, eventName: { color: '#f8f6ff', fontSize: 23, fontWeight: '800', letterSpacing: -0.8 }, eventMeta: { color: '#a4a7b8', fontSize: 14, marginTop: 5 }, hostMeta: { color: '#c8c5d5', fontSize: 14, fontWeight: '600', marginTop: 12 }, eventHostLink: { borderTopColor: '#2d3040', borderTopWidth: 1, paddingHorizontal: 14, paddingVertical: 12 }, eventRecommendation: { color: '#78e0c0', fontSize: 12, fontWeight: '800', marginTop: 8 }, nearbyButton: { alignSelf: 'flex-start', backgroundColor: '#191b27', borderColor: '#383b4d', borderRadius: 17, borderWidth: 1, marginTop: 16, paddingHorizontal: 12, paddingVertical: 8 }, nearbyButtonActive: { backgroundColor: '#8b5cf6', borderColor: '#9f76ff' }, nearbyButtonText: { color: '#e9e6f6', fontSize: 12, fontWeight: '800' }, nearbyButtonTextActive: { color: '#fff' },
-  conversation: { alignItems: 'center', backgroundColor: '#171925', borderColor: '#2b2e3f', borderRadius: 14, borderWidth: 1, flexDirection: 'row', gap: 11, marginBottom: 8, padding: 12 }, notificationCard: { alignItems: 'center', backgroundColor: '#171925', borderColor: '#2b2e3f', borderRadius: 11, borderWidth: 1, flexDirection: 'row', gap: 10, padding: 12 }, notificationUnread: { backgroundColor: '#241d38', borderColor: '#9b70ff' }, notificationIcon: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 17, height: 34, justifyContent: 'center', width: 34 }, notificationText: { color: '#f8f6ff', fontSize: 15, fontWeight: '700', lineHeight: 21 }, contactName: { color: '#d7d4e2', fontSize: 11, fontWeight: '700', marginTop: 5, textAlign: 'center', width: 60 }, chatFollowHint: { color: '#a4a7b8', fontSize: 14, lineHeight: 20, paddingBottom: 22 },
-  chatHeader: { alignItems: 'center', backgroundColor: '#171925', borderBottomColor: '#2b2e3f', borderBottomWidth: 1, flexDirection: 'row', gap: 10, paddingHorizontal: 15, paddingVertical: 13 }, chatBackButton: { alignItems: 'center', backgroundColor: '#292438', borderRadius: 18, height: 36, justifyContent: 'center', width: 36 }, back: { color: '#c698ff', fontSize: 27, fontWeight: '500', lineHeight: 29, marginTop: -3 }, chatTitle: { color: '#f8f6ff', flex: 1, fontSize: 18, fontWeight: '800' }, chatSubtitle: { color: '#a4a7b8', fontSize: 11, fontWeight: '700', marginTop: 2 }, chatMenu: { alignItems: 'center', backgroundColor: '#292438', borderRadius: 18, height: 36, justifyContent: 'center', width: 36 }, chatMenuText: { color: '#f8f6ff', fontSize: 15, fontWeight: '900', letterSpacing: 1, marginTop: -6 }, messageList: { backgroundColor: '#0d0e16', flexGrow: 1, gap: 10, padding: 16, paddingTop: 20 }, bubble: { alignSelf: 'flex-start', backgroundColor: '#25223a', borderColor: '#363348', borderRadius: 15, borderBottomLeftRadius: 4, borderWidth: 1, maxWidth: '82%', paddingHorizontal: 12, paddingVertical: 10 }, bubbleMine: { alignSelf: 'flex-end', backgroundColor: '#8b5cf6', borderColor: '#8b5cf6', borderBottomLeftRadius: 15, borderBottomRightRadius: 4 }, bubbleText: { color: '#f8f6ff', fontSize: 16, lineHeight: 23 }, bubbleMineText: { color: '#fff' }, bubbleTime: { color: '#a8aabc', fontSize: 11, marginTop: 5 }, bubbleMineTime: { color: '#e3d8ff' }, composer: { alignItems: 'center', backgroundColor: '#171925', borderTopColor: '#2b2e3f', borderTopWidth: 1, flexDirection: 'row', gap: 8, paddingHorizontal: 12, paddingVertical: 11 }, composerMark: { alignItems: 'center', backgroundColor: '#292438', borderRadius: 17, height: 34, justifyContent: 'center', width: 34 }, composerMarkText: { color: '#c698ff', fontSize: 16 }, emojiTriggerText: { color: '#c698ff', fontSize: 20 }, emojiPicker: { alignItems: 'center', backgroundColor: '#171925', borderTopColor: '#2b2e3f', borderTopWidth: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 5, justifyContent: 'center', paddingHorizontal: 14, paddingVertical: 9 }, emojiChoice: { alignItems: 'center', backgroundColor: '#292438', borderRadius: 16, height: 32, justifyContent: 'center', width: 32 }, messageInput: { backgroundColor: '#10111a', borderColor: '#36394a', borderRadius: 21, borderWidth: 1, color: '#f8f6ff', flex: 1, fontSize: 16, maxHeight: 80, paddingHorizontal: 14, paddingVertical: 10 }, send: { alignItems: 'center', backgroundColor: '#8b5cf6', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 }, sendText: { color: '#fff', fontSize: 21, fontWeight: '700' },
-  profile: { backgroundColor: '#0d0e16', padding: 21, paddingTop: 30 }, profileName: { color: '#f8f6ff', fontSize: 28, fontWeight: '800', letterSpacing: -1.2, marginTop: 6 }, profileBio: { color: '#d9d6e5', fontSize: 17, lineHeight: 25, marginTop: 23 }, score: { backgroundColor: '#191b27', borderColor: '#343748', borderRadius: 12, borderWidth: 1, flex: 1, padding: 12 }, scoreValue: { color: '#f8f6ff', fontSize: 25, fontWeight: '800' }, scoreLabel: { color: '#a8abbc', fontSize: 8, fontWeight: '800', letterSpacing: 0.8, marginTop: 5 }, profileHelp: { color: '#a5a8b9', fontSize: 15, lineHeight: 22, marginTop: 25 }, logout: { alignItems: 'center', borderColor: '#ff6da9', borderRadius: 10, borderWidth: 1, marginTop: 25, padding: 14 }, logoutText: { color: '#ff80b3', fontSize: 15, fontWeight: '800' },
-  nav: { backgroundColor: '#12131d', borderTopColor: '#2a2d3c', borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', paddingBottom: 8, paddingTop: 9 }, navIcon: { color: '#858899', fontSize: 18, lineHeight: 20 }, navLabel: { color: '#858899', fontSize: 10, fontWeight: '700', marginTop: 3 }, navActive: { color: '#bd8cff', fontWeight: '800' }, navBadge: { backgroundColor: '#ff5ca8', borderRadius: 8, color: '#fff', fontSize: 8, fontWeight: '800', minWidth: 15, overflow: 'hidden', paddingHorizontal: 3, position: 'absolute', right: -9, textAlign: 'center', top: -5 },
-  empty: { alignItems: 'center', backgroundColor: '#151721', borderColor: '#383b4b', borderRadius: 13, borderStyle: 'dashed', borderWidth: 1, marginTop: 15, padding: 27 }, emptyIcon: { color: '#ae80ff', fontSize: 30 }, emptyTitle: { color: '#f8f6ff', fontSize: 17, fontWeight: '800', marginTop: 7 }, emptyBody: { color: '#a4a7b8', fontSize: 15, lineHeight: 22, marginTop: 5, textAlign: 'center' }, overlay: { backgroundColor: '#04050bdd', flex: 1, justifyContent: 'flex-end' }, sheet: { backgroundColor: '#171925', borderColor: '#333647', borderTopLeftRadius: 24, borderTopRightRadius: 24, borderWidth: 1, maxHeight: '90%', padding: 22, paddingBottom: 34 }, handle: { alignSelf: 'center', backgroundColor: '#686b7c', borderRadius: 3, height: 4, marginBottom: 20, width: 36 }, sheetTitle: { color: '#f8f6ff', fontSize: 30, fontWeight: '800', letterSpacing: -1.4, marginTop: 9 }, sheetCopy: { color: '#a5a8b9', fontSize: 16, lineHeight: 24, marginTop: 9 }, momentInput: { backgroundColor: '#10111a', borderColor: '#36394a', borderRadius: 11, borderWidth: 1, color: '#f8f6ff', fontSize: 17, height: 120, marginTop: 18, padding: 13, textAlignVertical: 'top' }, commentCard: { alignItems: 'flex-start', backgroundColor: '#20222f', borderColor: '#343747', borderRadius: 10, borderWidth: 1, flexDirection: 'row', gap: 10, padding: 11 }, commentBody: { color: '#e8e6f0', fontSize: 15, lineHeight: 21, marginTop: 4 }, commentInput: { backgroundColor: '#10111a', borderColor: '#36394a', borderRadius: 10, borderWidth: 1, color: '#f8f6ff', fontSize: 16, marginTop: 10, maxHeight: 180, minHeight: 96, paddingHorizontal: 13, paddingVertical: 10, textAlignVertical: 'top' }, mediaAction: { backgroundColor: '#28233c', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 9 }, mediaActionText: { color: '#eae7f8', fontSize: 13, fontWeight: '800' }, attachment: { alignItems: 'center', backgroundColor: '#28233c', borderRadius: 10, flexDirection: 'row', gap: 10, marginTop: 12, padding: 9 }, attachmentTitle: { color: '#f8f6ff', fontSize: 13, fontWeight: '800' }, locationTag: { alignItems: 'center', backgroundColor: '#1d3540', borderRadius: 8, flexDirection: 'row', justifyContent: 'space-between', marginTop: 10, padding: 10 }, locationTagText: { color: '#8ff4d0', flex: 1, fontSize: 13, fontWeight: '700' }, editLocation: { backgroundColor: '#10111a', borderColor: '#36394a', borderRadius: 10, borderWidth: 1, color: '#f8f6ff', fontSize: 16, marginTop: 10, paddingHorizontal: 13, paddingVertical: 12 }, cancelEdit: { alignItems: 'center', borderColor: '#bab6ca', borderRadius: 10, borderWidth: 1, flex: 1, justifyContent: 'center', marginTop: 16, padding: 15 }, cancelEditText: { color: '#f8f6ff', fontSize: 15, fontWeight: '800' },
-  eventQuest: { backgroundColor: '#20222f', borderColor: '#343747', borderRadius: 11, borderWidth: 1, marginTop: 8, padding: 13 }, eventQuestKind: { color: '#c18cff', fontSize: 10, fontWeight: '800', letterSpacing: 0.7 }, eventQuestTitle: { color: '#f8f6ff', fontSize: 17, fontWeight: '800', marginTop: 6 }, eventQuestCopy: { color: '#a6a9b9', fontSize: 14, lineHeight: 20, marginTop: 5 }, questNotice: { backgroundColor: '#302653', borderRadius: 12, marginTop: 19, padding: 15 }, questNoticeText: { color: '#e9e2ff', fontSize: 15, lineHeight: 22 }, questProofButton: { alignSelf: 'flex-start', backgroundColor: '#8b5cf6', borderRadius: 16, marginTop: 11, paddingHorizontal: 11, paddingVertical: 8 }, questProofButtonText: { color: '#fff', fontSize: 12, fontWeight: '800' }, questProofState: { alignSelf: 'flex-start', backgroundColor: '#25352a', borderRadius: 12, color: '#a6ff80', fontSize: 11, fontWeight: '800', marginTop: 11, paddingHorizontal: 9, paddingVertical: 6, textTransform: 'capitalize' }, ratingPanel: { backgroundColor: '#20222f', borderColor: '#343747', borderRadius: 11, borderWidth: 1, marginTop: 18, padding: 14 }, ratingTitle: { color: '#f8f6ff', fontSize: 12, fontWeight: '800', letterSpacing: 0.8 }, ratingCopy: { color: '#a6a9b9', fontSize: 14, lineHeight: 20, marginTop: 6 }, ratingChoice: { backgroundColor: '#292c3b', borderColor: '#3b3e4d', borderRadius: 14, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 7 }, ratingChoiceText: { color: '#dedbe9', fontSize: 12, fontWeight: '800' }, ratingChoiceSelected: { backgroundColor: '#8b5cf6', borderColor: '#8b5cf6' }, ratingChoiceSelectedText: { color: '#fff' }, eventShare: { alignItems: 'center', backgroundColor: '#191b27', borderColor: '#3c3f50', borderRadius: 10, borderWidth: 1, flex: 1, justifyContent: 'center', marginRight: 8, padding: 14 }, eventShareText: { color: '#f3f0ff', fontSize: 14, fontWeight: '800' }, hostPill: { alignItems: 'center', backgroundColor: '#302653', borderRadius: 10, flex: 1, padding: 14 }, hostPillText: { color: '#dccbff', fontSize: 14, fontWeight: '800', textTransform: 'capitalize' },
-});
-
-/* Pixel-quest mobile skin.  `monospace` maps to the platform's bitmap-style
-   system face, keeping the app offline and consistent with the web UI. */
-Object.assign(darkStyles, {
-  app: { flex: 1, backgroundColor: '#050916' },
-  auth: { flex: 1, backgroundColor: '#050916' },
-  authHero: { backgroundColor: '#09142a', borderBottomColor: '#38527d', borderBottomWidth: 2, minHeight: 236, padding: 28, paddingTop: 38, position: 'relative' },
-  bigMark: { alignItems: 'center', backgroundColor: '#7644d5', borderColor: '#d8b3ff', borderRadius: 2, borderWidth: 2, height: 46, justifyContent: 'center', width: 46 },
-  markText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 24, fontWeight: '900' },
-  authBrand: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 27, fontWeight: '800', letterSpacing: -1.2, marginTop: 15 },
-  tagline: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 8, lineHeight: 14, marginTop: 9 },
-  themeToggle: { backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, paddingHorizontal: 10, paddingVertical: 7, position: 'absolute', right: 20, top: 20 },
-  themeToggleText: { color: '#ffd35d', fontFamily: PIXEL_FONT, fontSize: 8 },
-  authTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 24, letterSpacing: -1.4, lineHeight: 35, marginTop: 14 },
-  authDescription: { color: '#b7c2da', fontFamily: 'monospace', fontSize: 16, lineHeight: 23, marginBottom: 15, marginTop: 11 },
-  input: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', fontFamily: 'monospace', fontSize: 16, marginTop: 10, paddingHorizontal: 13, paddingVertical: 13 },
-  primary: { alignItems: 'center', backgroundColor: '#7743d8', borderColor: '#dfc0ff', borderRadius: 1, borderWidth: 2, flex: 1, justifyContent: 'center', marginTop: 16, padding: 14 },
-  primaryText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 10, lineHeight: 17 },
-  switchText: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 8, lineHeight: 16, marginTop: 20, textAlign: 'center' },
-  appHeader: { alignItems: 'center', backgroundColor: '#081125', borderBottomColor: '#38527d', borderBottomWidth: 2, flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 15, paddingVertical: 12 },
-  smallMark: { alignItems: 'center', backgroundColor: '#7644d5', borderColor: '#d8b3ff', borderRadius: 1, borderWidth: 1, height: 29, justifyContent: 'center', width: 29 },
-  smallMarkText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 14, fontWeight: '800' },
-  appBrand: { flexShrink: 1, color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 13, letterSpacing: -1 },
-  headerTheme: { alignItems: 'center', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerThemeText: { color: '#ffd35d', fontSize: 17 },
-  headerChat: { alignItems: 'center', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerProfile: { alignItems: 'center', backgroundColor: '#7644d5', borderColor: '#d8b3ff', borderRadius: 1, borderWidth: 1, height: 34, justifyContent: 'center', width: 34 },
-  headerProfileText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 10 },
-  content: { flex: 1, backgroundColor: '#050916' },
-  list: { gap: 12, padding: 15, paddingBottom: 22 },
-  eyebrow: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 15, marginBottom: 7 },
-  title: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 22, letterSpacing: -1.3, lineHeight: 34, marginTop: 5 },
-  serif: { color: '#ffd35d', fontFamily: PIXEL_FONT, fontStyle: 'normal' },
-  homeGreeting: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 15, marginTop: 8 },
-  homeSpark: { color: '#ff68b4', fontSize: 20 },
-  copy: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 15, lineHeight: 22, marginTop: 9 },
-  outline: { alignSelf: 'flex-start', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, marginTop: 15, paddingHorizontal: 12, paddingVertical: 9 },
-  outlineText: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 8 },
-  secondary: { alignItems: 'center', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, justifyContent: 'center', marginTop: 12, padding: 13 },
-  secondaryText: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 8 },
-  questFilters: { flexDirection: 'row', gap: 7, marginTop: 17 },
-  questFilter: { backgroundColor: '#101d38', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, paddingHorizontal: 10, paddingVertical: 8 },
-  questFilterActive: { backgroundColor: '#6741c7', borderColor: '#d1b0ff' },
-  questFilterText: { color: '#b7c2da', fontFamily: PIXEL_FONT, fontSize: 7 },
-  questFilterTextActive: { color: '#fff' },
-  questSectionTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 9, lineHeight: 16 },
-  questSeeAll: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7 },
-  mobileQuestCard: { backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, overflow: 'hidden' },
-  mobileQuestArt: { alignItems: 'center', backgroundColor: '#263a74', height: 134, justifyContent: 'center' },
-  mobileQuestArtAlt: { backgroundColor: '#572c7d' },
-  mobileQuestDate: { backgroundColor: '#f8f5e8', borderRadius: 1, color: '#17142c', fontFamily: PIXEL_FONT, fontSize: 7, left: 10, paddingHorizontal: 7, paddingVertical: 6, position: 'absolute', top: 10 },
-  mobileQuestIcon: { color: '#ffd35d', fontSize: 39 },
-  mobileQuestStatus: { backgroundColor: '#9cec4c', borderRadius: 1, bottom: 10, color: '#173122', fontFamily: PIXEL_FONT, fontSize: 6, left: 10, paddingHorizontal: 7, paddingVertical: 6, position: 'absolute' },
-  mobileQuestName: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 10, lineHeight: 17 },
-  mobileQuestMeta: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 12, marginTop: 5 },
-  mobileQuestXp: { color: '#9cec4c', fontFamily: PIXEL_FONT, fontSize: 7, marginTop: 10 },
-  avatar: { alignItems: 'center', backgroundColor: '#6741c7', borderColor: '#d1b0ff', borderRadius: 1, borderWidth: 1, height: 36, justifyContent: 'center', overflow: 'hidden', width: 36 },
-  avatarText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 10 },
-  avatarLarge: { borderRadius: 1, height: 64, width: 64 },
-  avatarLargeText: { fontSize: 18 },
-  post: { backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, padding: 13 },
-  personName: { flexShrink: 1, color: '#f8f5e8', fontFamily: 'monospace', fontSize: 15, fontWeight: '800' },
-  personMeta: { flexShrink: 1, color: '#aeb9d1', fontFamily: 'monospace', fontSize: 12, marginTop: 3 },
-  recommendationTag: { alignSelf: 'flex-start', backgroundColor: '#162a4b', borderColor: '#31547b', borderRadius: 1, borderWidth: 1, color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 6, marginTop: 10, paddingHorizontal: 7, paddingVertical: 6 },
-  questPostTag: { alignSelf: 'flex-start', backgroundColor: '#291f4b', borderColor: '#7651ad', borderRadius: 1, borderWidth: 1, color: '#e0c2ff', fontFamily: PIXEL_FONT, fontSize: 6, marginTop: 10, paddingHorizontal: 7, paddingVertical: 6 },
-  postBody: { color: '#e7ecf9', fontFamily: 'monospace', fontSize: 16, lineHeight: 24, marginTop: 12 },
-  postFooter: { flexWrap: 'wrap', borderTopColor: '#263b62', borderTopWidth: 1, flexDirection: 'row', gap: 15, marginTop: 13, paddingTop: 10 },
-  postManage: { borderLeftColor: '#38527d', borderLeftWidth: 1, flexDirection: 'row', gap: 8, marginLeft: 'auto', paddingLeft: 9 },
-  postManageText: { color: '#d6dced', fontFamily: 'monospace', fontSize: 12, fontWeight: '800' },
-  postDeleteText: { color: '#ff938c', fontFamily: 'monospace', fontSize: 12, fontWeight: '800' },
-  searchInput: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', flex: 1, fontFamily: 'monospace', fontSize: 16, paddingHorizontal: 12, paddingVertical: 11 },
-  searchButton: { alignItems: 'center', backgroundColor: '#6741c7', borderColor: '#d1b0ff', borderRadius: 1, borderWidth: 1, justifyContent: 'center', paddingHorizontal: 12 },
-  searchText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 7 },
-  section: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 16, marginBottom: 8 },
-  muted: { color: '#aeb9d1', fontFamily: 'monospace', fontSize: 14 },
-  eventCard: { backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, overflow: 'hidden' },
-  eventArt: { alignItems: 'center', backgroundColor: '#263a74', height: 148, justifyContent: 'center' },
-  eventDate: { backgroundColor: '#f8f5e8', borderRadius: 1, color: '#15142b', fontFamily: PIXEL_FONT, fontSize: 7, left: 10, padding: 7, position: 'absolute', top: 10 },
-  eventBadge: { backgroundColor: '#9cec4c', borderRadius: 1, bottom: 10, color: '#173122', fontFamily: PIXEL_FONT, fontSize: 6, left: 10, padding: 7, position: 'absolute' },
-  eventName: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 12, lineHeight: 18 },
-  eventMeta: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 13, marginTop: 5 },
-  hostMeta: { color: '#d6dced', fontFamily: 'monospace', fontSize: 13, marginTop: 11 },
-  eventHostLink: { borderTopColor: '#263b62', borderTopWidth: 1, paddingHorizontal: 13, paddingVertical: 11 },
-  eventRecommendation: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7, marginTop: 8 },
-  nearbyButton: { alignSelf: 'flex-start', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, marginTop: 15, paddingHorizontal: 11, paddingVertical: 8 },
-  nearbyButtonActive: { backgroundColor: '#6741c7', borderColor: '#d1b0ff' },
-  nearbyButtonText: { color: '#e9efff', fontFamily: PIXEL_FONT, fontSize: 7 },
-  nearbyButtonTextActive: { color: '#fff' },
-  conversation: { alignItems: 'center', backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, flexDirection: 'row', gap: 11, marginBottom: 8, padding: 11 },
-  notificationCard: { alignItems: 'center', backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, flexDirection: 'row', gap: 10, padding: 11 },
-  notificationUnread: { backgroundColor: '#211845', borderColor: '#b780ff' },
-  notificationIcon: { alignItems: 'center', backgroundColor: '#6741c7', borderRadius: 1, height: 34, justifyContent: 'center', width: 34 },
-  notificationText: { color: '#f8f5e8', fontFamily: 'monospace', fontSize: 15, fontWeight: '700', lineHeight: 21 },
-  chatHeader: { alignItems: 'center', backgroundColor: '#101d38', borderBottomColor: '#38527d', borderBottomWidth: 1, flexDirection: 'row', gap: 10, paddingHorizontal: 14, paddingVertical: 12 },
-  chatBackButton: { alignItems: 'center', backgroundColor: '#162a4b', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, height: 36, justifyContent: 'center', width: 36 },
-  back: { color: '#55e7ed', fontSize: 25, lineHeight: 29, marginTop: -3 },
-  chatTitle: { color: '#f8f5e8', flex: 1, fontFamily: 'monospace', fontSize: 17, fontWeight: '800' },
-  chatSubtitle: { color: '#aeb9d1', fontFamily: 'monospace', fontSize: 11, marginTop: 2 },
-  chatMenu: { alignItems: 'center', backgroundColor: '#162a4b', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, height: 36, justifyContent: 'center', width: 36 },
-  chatMenuText: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 9 },
-  messageList: { backgroundColor: '#050916', flexGrow: 1, gap: 9, padding: 14, paddingTop: 18 },
-  bubble: { alignSelf: 'flex-start', backgroundColor: '#15284b', borderColor: '#3c5786', borderRadius: 1, borderWidth: 1, maxWidth: '82%', paddingHorizontal: 11, paddingVertical: 9 },
-  bubbleMine: { alignSelf: 'flex-end', backgroundColor: '#6741c7', borderColor: '#d1b0ff', borderBottomLeftRadius: 1, borderBottomRightRadius: 1 },
-  bubbleText: { color: '#f8f5e8', fontFamily: 'monospace', fontSize: 15, lineHeight: 22 },
-  bubbleMineText: { color: '#fff' },
-  bubbleTime: { color: '#b9c5e0', fontFamily: PIXEL_FONT, fontSize: 6, marginTop: 5 },
-  bubbleMineTime: { color: '#e6d9ff' },
-  composer: { alignItems: 'center', backgroundColor: '#101d38', borderTopColor: '#38527d', borderTopWidth: 1, flexDirection: 'row', gap: 7, paddingHorizontal: 11, paddingVertical: 10 },
-  composerMark: { alignItems: 'center', backgroundColor: '#1b3160', borderRadius: 1, height: 34, justifyContent: 'center', width: 34 },
-  composerMarkText: { color: '#ffd35d', fontSize: 16 },
-  emojiTriggerText: { color: '#ffd35d', fontSize: 20 },
-  emojiPicker: { alignItems: 'center', backgroundColor: '#101d38', borderTopColor: '#38527d', borderTopWidth: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 5, justifyContent: 'center', paddingHorizontal: 14, paddingVertical: 9 },
-  emojiChoice: { alignItems: 'center', backgroundColor: '#1b3160', borderRadius: 1, height: 32, justifyContent: 'center', width: 32 },
-  messageInput: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', flex: 1, fontFamily: 'monospace', fontSize: 15, maxHeight: 80, paddingHorizontal: 12, paddingVertical: 10 },
-  send: { alignItems: 'center', backgroundColor: '#9cec4c', borderColor: '#e0ffba', borderRadius: 1, borderWidth: 1, height: 40, justifyContent: 'center', width: 40 },
-  sendText: { color: '#173122', fontSize: 21, fontWeight: '700' },
-  profile: { backgroundColor: '#050916', padding: 18, paddingTop: 25 },
-  profileName: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 17, lineHeight: 27, marginTop: 6 },
-  profileBio: { color: '#d7dfef', fontFamily: 'monospace', fontSize: 16, lineHeight: 24, marginTop: 21 },
-  score: { backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, flex: 1, padding: 10 },
-  scoreValue: { color: '#ffd35d', fontFamily: PIXEL_FONT, fontSize: 12 },
-  scoreLabel: { color: '#aeb9d1', fontFamily: PIXEL_FONT, fontSize: 5, lineHeight: 12, marginTop: 7 },
-  profileHelp: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 14, lineHeight: 22, marginTop: 22 },
-  logout: { alignItems: 'center', backgroundColor: '#1a1831', borderColor: '#ff938c', borderRadius: 1, borderWidth: 1, marginTop: 22, padding: 13 },
-  logoutText: { color: '#ffaaa1', fontFamily: PIXEL_FONT, fontSize: 8 },
-  nav: { backgroundColor: '#081125', borderTopColor: '#38527d', borderTopWidth: 2, flexDirection: 'row', justifyContent: 'space-around', paddingBottom: 8, paddingTop: 8 },
-  navIcon: { color: '#8f9bb3', fontSize: 18, lineHeight: 20 },
-  navLabel: { color: '#8f9bb3', fontFamily: PIXEL_FONT, fontSize: 6, marginTop: 3 },
-  navActive: { color: '#55e7ed' },
-  navBadge: { backgroundColor: '#ff68b4', borderRadius: 1, color: '#fff', fontFamily: PIXEL_FONT, fontSize: 6, minWidth: 15, paddingHorizontal: 3, position: 'absolute', right: -9, textAlign: 'center', top: -5 },
-  empty: { alignItems: 'center', backgroundColor: '#0d1930', borderColor: '#536c9d', borderRadius: 1, borderStyle: 'dashed', borderWidth: 1, marginTop: 15, padding: 23 },
-  emptyIcon: { color: '#ffd35d', fontSize: 28 },
-  emptyTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 9, lineHeight: 17, marginTop: 8 },
-  emptyBody: { color: '#aeb9d1', fontFamily: 'monospace', fontSize: 14, lineHeight: 21, marginTop: 6, textAlign: 'center' },
-  overlay: { backgroundColor: '#01030be8', flex: 1, justifyContent: 'flex-end' },
-  sheet: { backgroundColor: '#0d1930', borderColor: '#536c9d', borderTopLeftRadius: 2, borderTopRightRadius: 2, borderWidth: 2, maxHeight: '90%', padding: 20, paddingBottom: 32 },
-  handle: { alignSelf: 'center', backgroundColor: '#536c9d', borderRadius: 0, height: 4, marginBottom: 17, width: 40 },
-  sheetTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 16, lineHeight: 26, marginTop: 9 },
-  sheetCopy: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 15, lineHeight: 22, marginTop: 9 },
-  momentInput: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', fontFamily: 'monospace', fontSize: 16, height: 120, marginTop: 17, padding: 12, textAlignVertical: 'top' },
-  commentCard: { alignItems: 'flex-start', backgroundColor: '#111f3b', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, flexDirection: 'row', gap: 10, padding: 10 },
-  commentBody: { color: '#e7ecf9', fontFamily: 'monospace', fontSize: 14, lineHeight: 21, marginTop: 4 },
-  commentInput: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', fontFamily: 'monospace', fontSize: 16, marginTop: 10, maxHeight: 180, minHeight: 96, paddingHorizontal: 12, paddingVertical: 10, textAlignVertical: 'top' },
-  mediaAction: { backgroundColor: '#1b3160', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, paddingHorizontal: 10, paddingVertical: 9 },
-  mediaActionText: { color: '#eef2ff', fontFamily: PIXEL_FONT, fontSize: 7 },
-  attachment: { alignItems: 'center', backgroundColor: '#1b3160', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, flexDirection: 'row', gap: 10, marginTop: 12, padding: 9 },
-  attachmentTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 8 },
-  locationTag: { alignItems: 'center', backgroundColor: '#17354c', borderColor: '#3d8c9b', borderRadius: 1, borderWidth: 1, flexDirection: 'row', justifyContent: 'space-between', marginTop: 10, padding: 10 },
-  locationTagText: { color: '#9cf3f3', flex: 1, fontFamily: 'monospace', fontSize: 13 },
-  editLocation: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', fontFamily: 'monospace', fontSize: 16, marginTop: 10, paddingHorizontal: 12, paddingVertical: 12 },
-  cancelEdit: { alignItems: 'center', borderColor: '#b6c1d8', borderRadius: 1, borderWidth: 1, flex: 1, justifyContent: 'center', marginTop: 16, padding: 14 },
-  cancelEditText: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 8 },
-  questNotice: { backgroundColor: '#20194b', borderColor: '#7651ad', borderRadius: 1, borderWidth: 1, marginTop: 18, padding: 14 },
-  questNoticeText: { color: '#e8ddff', fontFamily: 'monospace', fontSize: 14, lineHeight: 21 },
-  eventQuest: { backgroundColor: '#111f3b', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, marginTop: 8, padding: 12 },
-  eventQuestKind: { color: '#d9b5ff', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 15 },
-  eventQuestTitle: { color: '#f8f5e8', fontFamily: 'monospace', fontSize: 16, fontWeight: '800', marginTop: 6 },
-  eventQuestCopy: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 13, lineHeight: 20, marginTop: 5 },
-  questProofButton: { alignSelf: 'flex-start', backgroundColor: '#9cec4c', borderColor: '#e0ffba', borderRadius: 1, borderWidth: 1, marginTop: 11, paddingHorizontal: 10, paddingVertical: 8 },
-  questProofButtonText: { color: '#173122', fontFamily: PIXEL_FONT, fontSize: 7 },
-  questProofState: { alignSelf: 'flex-start', backgroundColor: '#1f3e32', borderColor: '#65a66d', borderRadius: 1, borderWidth: 1, color: '#b8f99b', fontFamily: PIXEL_FONT, fontSize: 7, marginTop: 11, paddingHorizontal: 8, paddingVertical: 6, textTransform: 'capitalize' },
-  ratingPanel: { backgroundColor: '#111f3b', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, marginTop: 17, padding: 13 },
-  ratingTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 8, lineHeight: 16 },
-  ratingCopy: { color: '#b6c1d8', fontFamily: 'monospace', fontSize: 13, lineHeight: 20, marginTop: 6 },
-  ratingChoice: { backgroundColor: '#1b3160', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 7 },
-  ratingChoiceText: { color: '#e4ebfb', fontFamily: PIXEL_FONT, fontSize: 7 },
-  ratingChoiceSelected: { backgroundColor: '#ffd35d', borderColor: '#fff0b5' },
-  ratingChoiceSelectedText: { color: '#231c34' },
-  eventShare: { alignItems: 'center', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, flex: 1, justifyContent: 'center', marginRight: 8, padding: 13 },
-  eventShareText: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 8 },
-  hostPill: { alignItems: 'center', backgroundColor: '#20194b', borderColor: '#7651ad', borderRadius: 1, borderWidth: 1, flex: 1, padding: 13 },
-  hostPillText: { color: '#e0c2ff', fontFamily: PIXEL_FONT, fontSize: 7, textTransform: 'capitalize' },
-});
-
-// A slightly roomier pixel scale keeps the 8-bit UI legible on real phones.
-Object.assign(darkStyles, {
-  auth: { flex: 1, backgroundColor: '#0b1326' },
-  authArt: { backgroundColor: '#071022', minHeight: 255, overflow: 'hidden', paddingHorizontal: 24, position: 'relative' },
-  authGrid: { bottom: 0, left: 0, opacity: 0.42, position: 'absolute', right: 0, top: 0 },
-  authGridRow: { backgroundColor: '#ffffff14', height: 1, left: 0, position: 'absolute', right: 0 },
-  authGridColumn: { backgroundColor: '#ffffff14', bottom: 0, position: 'absolute', top: 0, width: 1 },
-  authGlow: { backgroundColor: '#3c2578', borderRadius: 150, height: 300, opacity: 0.72, position: 'absolute', right: -115, top: 72, width: 300 },
-  authOrbitLarge: { borderColor: '#9c72e5a0', borderRadius: 220, borderStyle: 'dashed', borderWidth: 2, height: 420, position: 'absolute', right: -180, top: 160, width: 420 },
-  authOrbitSmall: { borderColor: '#9c72e5a0', borderRadius: 140, borderStyle: 'dashed', borderWidth: 2, height: 260, position: 'absolute', right: -55, top: 248, width: 260 },
-  authArtContent: { zIndex: 1 },
-  authWordmark: { alignItems: 'center', flexDirection: 'row', gap: 9 },
-  authWordBrand: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 13, letterSpacing: -1 },
-  authKicker: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 15, marginTop: 72 },
-  authDisplayTitle: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 31, letterSpacing: -2.5, lineHeight: 40, marginTop: 12, textShadowColor: '#40216f', textShadowOffset: { width: 3, height: 3 }, textShadowRadius: 0 },
-  authDisplayTitleAccent: { color: '#ffd35d' },
-  authSword: { color: '#ff68b4', fontSize: 24, marginTop: 8 },
-  authForm: { flex: 1 },
-  authContent: { backgroundColor: '#0b1326', padding: 28 },
-  authLabel: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 16, marginTop: 16 },
-  authTitle: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 22, letterSpacing: -1.3, lineHeight: 34, marginTop: 5 },
-  authDescription: { color: '#b6c1d8', fontFamily: COPY_FONT, fontSize: 15, lineHeight: 22, marginBottom: 0, marginTop: 9 },
-  input: { backgroundColor: '#071022', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, color: '#f8f5e8', fontFamily: COPY_FONT, fontSize: 17, marginTop: 7, paddingHorizontal: 13, paddingVertical: 13 },
-  primary: { alignItems: 'center', backgroundColor: '#7743d8', borderColor: '#dfc0ff', borderRadius: 1, borderWidth: 2, flex: 1, justifyContent: 'center', marginTop: 18, padding: 14 },
-  primaryText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 9, lineHeight: 17 },
-  switchText: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 16, marginTop: 20, textAlign: 'center' },
-  authNote: { color: '#b6c1d8', fontFamily: COPY_FONT, fontSize: 13, lineHeight: 19, marginTop: 22, textAlign: 'center' },
-  headerRight: { flexDirection: 'row', gap: 6 },
-  headerAction: { alignItems: 'center', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, height: 32, justifyContent: 'center', position: 'relative', width: 32 },
-  headerActionText: { color: '#f8f5e8', fontFamily: PIXEL_FONT, fontSize: 13 },
-  headerNotificationBadge: { alignItems: 'center', backgroundColor: '#ff68b4', borderRadius: 1, color: '#fff', fontFamily: PIXEL_FONT, fontSize: 5, justifyContent: 'center', minWidth: 14, paddingHorizontal: 2, position: 'absolute', right: -5, textAlign: 'center', top: -5 },
-  headerCompose: { alignItems: 'center', backgroundColor: '#6741c7', borderColor: '#d1b0ff', borderRadius: 1, borderWidth: 1, height: 32, justifyContent: 'center', width: 32 },
-  headerComposeText: { color: '#fff', fontFamily: PIXEL_FONT, fontSize: 17, lineHeight: 19 },
-  navItem: { alignItems: 'center', flex: 1, minWidth: 0, minHeight: 44 },
-  mobileQuestCover: { height: '100%', left: 0, position: 'absolute', top: 0, width: '100%' },
-  homeComposer: { alignItems: 'flex-start', backgroundColor: '#0d1930', borderColor: '#38527d', borderRadius: 1, borderWidth: 1, flexDirection: 'row', gap: 10, marginTop: 18, padding: 12 },
-  homeComposerCopy: { flex: 1, minWidth: 0 },
-  homeComposerPrompt: { color: '#f8f5e8', fontFamily: COPY_FONT_BOLD, fontSize: 15, lineHeight: 21 },
-  homeComposerAction: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 7, lineHeight: 15, marginTop: 11 },
-  title: { ...darkStyles.title, fontSize: 25, lineHeight: 36 },
-  appBrand: { flexShrink: 1, ...darkStyles.appBrand, fontSize: 14 },
-  eyebrow: { ...darkStyles.eyebrow, fontSize: 9, lineHeight: 15 },
-  outlineText: { ...darkStyles.outlineText, fontSize: 9 },
-  questFilterText: { ...darkStyles.questFilterText, fontSize: 9 },
-  questSectionTitle: { ...darkStyles.questSectionTitle, fontSize: 10 },
-  section: { ...darkStyles.section, fontSize: 9 },
-  navLabel: { ...darkStyles.navLabel, fontFamily: COPY_FONT, fontSize: 12 },
-  eventName: { ...darkStyles.eventName, fontSize: 17 },
-  personName: { flexShrink: 1, ...darkStyles.personName, fontSize: 16 },
-  modalKeyboardAvoider: { flex: 1 },
-  messageScroller: { flex: 1 },
-  keyboardDismiss: { alignItems: 'center', backgroundColor: '#162a4b', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, height: 40, justifyContent: 'center', width: 30 },
-  keyboardDismissText: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 12, lineHeight: 15 },
-  sheetKeyboardDismiss: { alignItems: 'center', alignSelf: 'flex-end', backgroundColor: '#101d38', borderColor: '#536c9d', borderRadius: 1, borderWidth: 1, justifyContent: 'center', marginBottom: 4, paddingHorizontal: 9, paddingVertical: 7 },
-  sheetKeyboardDismissText: { color: '#55e7ed', fontFamily: PIXEL_FONT, fontSize: 6, lineHeight: 13 },
-});

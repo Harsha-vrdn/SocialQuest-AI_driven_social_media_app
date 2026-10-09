@@ -54,11 +54,14 @@ STATICFILES_DIRS = [BASE_DIR / "web" / "static"]
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+WEBPUSH_PRIVATE_KEY = os.getenv("WEBPUSH_PRIVATE_KEY", str(BASE_DIR / ".notifications" / "vapid.pem"))
+WEBPUSH_SUBJECT = os.getenv("WEBPUSH_SUBJECT", "mailto:notifications@example.com")
+EXPO_PUSH_ACCESS_TOKEN = os.getenv("EXPO_PUSH_ACCESS_TOKEN", "")
 CORS_ALLOW_ALL_ORIGINS = DEBUG
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
+        "core.authentication.SessionTokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticatedOrReadOnly"],

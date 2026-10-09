@@ -6,13 +6,14 @@ const view = document.querySelector('#view');
 const modal = document.querySelector('#modal');
 const modalContent = document.querySelector('#modal-content');
 const formHandlers = [];
-const state = { viewVersion: 0, feedFilter: 'for-you', user: null, currentView: 'home', activeConversation: null, chatOpen: false, conversations: [], profileId: null, profileTab: 'moments', eventId: null, postId: null, openPostId: null, eventQuests: [], messagePoll: null, notificationPoll: null, notificationUnread: 0, exploreQuery: '', nearby: null, nearbyStatus: '', share: null };
+const state = { viewVersion: 0, feedFilter: 'for-you', user: null, currentView: 'home', activeConversation: null, chatOpen: false, conversations: [], profileId: null, profileTab: 'moments', eventId: null, eventDetail: null, postId: null, openPostId: null, eventQuests: [], messagePoll: null, notificationPoll: null, notificationUnread: 0, exploreQuery: '', nearby: null, nearbyStatus: '', share: null };
 
 document.documentElement.classList.add('dark');
 document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#050916');
 async function logout() {
+  await window.SocialQuestNotifications.logout();
   presenceStopped = true;
-  updatePresence(false);
+  await updatePresence(false);
   try { await api('/auth/logout/', {method:'POST'}); } catch (_) { /* Clearing the local credential still safely ends this session. */ }
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem('socialquest_user');
@@ -107,6 +108,16 @@ function addPostControls() {
 }
 const postControlObserver = new MutationObserver(addPostControls);
 postControlObserver.observe(view, {childList:true, subtree:true});
+async function openSystemNotification(data) {
+  if (data.recipient_id !== state.user?.id) return;
+  if (modal.open) closeModal();
+  if (data.kind === 'MESSAGE' && Number.isInteger(data.conversation_id)) {
+    state.activeConversation = data.conversation_id; state.chatOpen = true;
+    await loadView('chats');
+  } else if (Number.isInteger(data.post_id)) await loadView('post', {postId:data.post_id});
+  else if (Number.isInteger(data.event_id)) await loadView('event', {eventId:data.event_id});
+  else await loadView('notifications');
+}
 function syncNotificationBadges(count) {
   state.notificationUnread = count;
   document.querySelectorAll('[data-notification-count]').forEach(badge => {
@@ -125,17 +136,17 @@ function startNotificationPolling() {
   state.notificationPoll = window.setInterval(loadNotificationBadge, 15000);
 }
 function notificationMarkup(notification) {
-  const detail = notification.event ? notification.event.name : notification.kind === 'MESSAGE' ? 'Open chat' : 'SocialQuest';
-  const action = notification.event ? 'notification-event' : notification.conversation_id ? 'notification-chat' : '';
-  const target = notification.event ? ' data-event-id="' + notification.event.id + '"' : notification.conversation_id ? ' data-conversation-id="' + notification.conversation_id + '"' : '';
-  return '<button class="notification-row ' + (!notification.is_read ? 'unread' : '') + '" data-action="' + action + '"' + target + '><span class="notification-symbol">' + (notification.kind === 'MESSAGE' ? '✉' : '✦') + '</span><span><strong>' + escapeHtml(notification.text) + '</strong><small>' + escapeHtml(detail) + ' · ' + when(notification.created_at) + '</small></span></button>';
+  const detail = notification.event ? notification.event.name : notification.kind === 'MESSAGE' ? 'Open chat' : notification.comment_post_id ? 'Open moment' : 'SocialQuest';
+  const action = notification.event ? 'notification-event' : notification.conversation_id ? 'notification-chat' : notification.comment_post_id ? 'notification-post' : '';
+  const target = notification.event ? ' data-event-id="' + notification.event.id + '"' : notification.conversation_id ? ' data-conversation-id="' + notification.conversation_id + '"' : notification.comment_post_id ? ' data-post-id="' + notification.comment_post_id + '"' : '';
+  return '<button class="notification-row ' + (!notification.is_read ? 'unread' : '') + '" data-action="' + action + '"' + target + '><span class="notification-symbol">' + (notification.kind === 'MESSAGE' ? '✉' : notification.kind === 'COMMENT_REPLY' ? '💬' : '✦') + '</span><span><strong>' + escapeHtml(notification.text) + '</strong><small>' + escapeHtml(detail) + ' · ' + when(notification.created_at) + '</small></span></button>';
 }
 async function renderNotifications() {
-  view.innerHTML = header('STAY IN THE LOOP', 'Your <em>notifications.</em>', '<button class="header-action" data-action="mark-notifications-read">Mark all read</button>') + '<section class="notifications-list"><p class="empty">Loading notifications…</p></section>';
+  view.innerHTML = header('STAY IN THE LOOP', 'Your <em>notifications.</em>', '<button class="header-action" data-action="mark-notifications-read">Mark all read</button>') + '<aside class="notification-permission" data-notification-settings></aside><section class="notifications-list"><p class="empty">Loading notifications…</p></section>';
   try {
     const notifications = rows(await api('/notifications/'));
     const holder = document.querySelector('.notifications-list');
-    holder.innerHTML = notifications.length ? notifications.map(notificationMarkup).join('') : '<div class="empty">Nothing new yet. RSVP activity and messages will appear here.</div>';
+    holder.innerHTML = notifications.length ? notifications.map(notificationMarkup).join('') : '<div class="empty">Nothing new yet. Replies and RSVP activity will appear here.</div>';
     const unreadIds = notifications.filter(notification => !notification.is_read).map(notification => notification.id);
     if (unreadIds.length) await api('/notifications/mark-read/', {method:'POST', body:JSON.stringify({ids:unreadIds})});
     syncNotificationBadges(0);
@@ -152,7 +163,7 @@ let presenceStopped = false;
 let presenceReadPending = false;
 function updatePresence(online) {
   const credential = localStorage.getItem(TOKEN_KEY);
-  if (!credential || (online && presenceStopped)) return;
+  if (!credential || (online && presenceStopped)) return Promise.resolve();
   presenceQueue = presenceQueue.catch(() => {}).then(async () => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -160,10 +171,11 @@ function updatePresence(online) {
       await fetch('/api/people/presence/', {
         method: online ? 'PUT' : 'DELETE', keepalive: true, signal: controller.signal,
         headers: {Authorization: `Token ${credential}`, 'Content-Type': 'application/json'},
-        body: JSON.stringify({session_id: presenceSession}),
+        body: JSON.stringify({session_id: presenceSession, chats_open: online && state.currentView === 'chats'}),
       });
     } finally { clearTimeout(timeout); }
   }).catch(() => {});
+  return presenceQueue;
 }
 function clearChatPresence() {
   document.querySelectorAll('[data-online-person]').forEach(marker => { marker.hidden = true; });
@@ -209,6 +221,11 @@ function postMarkup(post) {
   const recommendation = post.recommendation_reason ? `<p class="recommendation-tag">For you · ${escapeHtml(post.recommendation_reason)}</p>` : '';
   return `<article class="post" data-post-id="${post.id}"><div class="post-head"><button class="post-person" data-action="open-profile" data-id="${post.author.id}">${avatar(post.author)}<span class="person-line"><strong>${escapeHtml(post.author.display_name || post.author.username)}</strong><span>@${escapeHtml(post.author.username)}</span><small>${when(post.created_at)} ${post.location_name ? `· ⌖ ${escapeHtml(post.location_name)}` : ''}</small></span></button></div>${recommendation}${questTag}${post.body ? `<p class="post-body">${escapeHtml(post.body)}</p>` : ''}${media}<p class="post-meta">${post.kind === 'REEL' ? '◉ Reel' : '✦ Community moment'}</p><div class="post-actions"><button class="${post.liked_by_me ? 'liked' : ''}" data-action="like" data-id="${post.id}" data-liked="${post.liked_by_me}" aria-pressed="${post.liked_by_me}" aria-label="${post.liked_by_me ? 'Unlike' : 'Like'} this post">♥ ${post.like_count}</button><button data-action="focus-comment" data-id="${post.id}">◌ ${post.comment_count} replies</button><button data-action="share-post" data-id="${post.id}">↗ Share</button></div><div class="comments">${comments}<form class="comment-form" data-post="${post.id}"><textarea name="body" aria-label="Reply to post" placeholder="Add a kind reply..." maxlength="500" rows="3" required></textarea><button>Reply</button></form></div></article>`;
 }
+function postDetailCommentsMarkup(comments) {
+  return comments.length
+    ? comments.map(comment => `<article class="post-detail-comment" data-comment-id="${comment.id}"><button class="post-person" data-action="open-profile" data-id="${comment.author.id}">${avatar(comment.author)}<span class="person-line"><strong>${escapeHtml(comment.author.display_name || comment.author.username)}</strong><small>${when(comment.created_at)}</small></span></button><p>${escapeHtml(comment.body)}</p>${commentControls(comment)}</article>`).join('')
+    : '<p class="post-detail-empty">Start the conversation with a kind reply.</p>';
+}
 function postDetailMarkup(post, comments) {
   const authorName = post.author.display_name || post.author.username;
   const media = post.media
@@ -216,9 +233,7 @@ function postDetailMarkup(post, comments) {
       ? `<video src="${escapeHtml(post.media)}" controls playsinline></video>`
       : `<img src="${escapeHtml(post.media)}" alt="Post by ${escapeHtml(authorName)}">`
     : '<div class="post-detail-media-fallback">✦</div>';
-  const commentList = comments.length
-    ? comments.map(comment => `<article class="post-detail-comment" data-comment-id="${comment.id}"><button class="post-person" data-action="open-profile" data-id="${comment.author.id}">${avatar(comment.author)}<span class="person-line"><strong>${escapeHtml(comment.author.display_name || comment.author.username)}</strong><small>${when(comment.created_at)}</small></span></button><p>${escapeHtml(comment.body)}</p>${commentControls(comment)}</article>`).join('')
-    : '<p class="post-detail-empty">Start the conversation with a kind reply.</p>';
+  const commentList = postDetailCommentsMarkup(comments);
   return `<article class="post-detail-dialog" data-post-id="${post.id}"><section class="post-detail-media">${media}</section><section class="post-detail-content"><button class="post-person" data-action="open-profile" data-id="${post.author.id}">${avatar(post.author)}<span class="person-line"><strong>${escapeHtml(authorName)}</strong><span>@${escapeHtml(post.author.username)}</span><small>${when(post.created_at)} ${post.location_name ? `· ⌖ ${escapeHtml(post.location_name)}` : ''}</small></span></button>${post.body ? `<p class="post-detail-body">${escapeHtml(post.body)}</p>` : ''}<div class="post-detail-actions"><button class="${post.liked_by_me ? 'liked' : ''}" data-action="like" data-id="${post.id}" data-liked="${post.liked_by_me}" aria-pressed="${post.liked_by_me}" aria-label="${post.liked_by_me ? 'Unlike' : 'Like'} this post">♥ ${post.like_count}</button><button data-action="focus-detail-comment" data-id="${post.id}">◌ ${post.comment_count} replies</button><button data-action="share-post" data-id="${post.id}">↗ Share</button></div><section class="post-detail-replies"><h3>Replies</h3>${commentList}</section><form class="post-detail-comment-form" data-post="${post.id}"><textarea name="body" aria-label="Reply to post" placeholder="Write a kind reply…" maxlength="500" rows="3" required></textarea><button>Reply</button></form></section></article>`;
 }
 async function fetchPostDetail(postId) {
@@ -296,7 +311,9 @@ function updateMediaPreview(input) {
     : `<img src="${objectUrl}" alt="Selected photo preview">`;
   preview.innerHTML = `<div class="media-preview-file">${media}<button type="button" class="media-preview-remove" data-action="clear-media-preview" aria-label="Remove selected media">×</button><div class="media-preview-meta"><span>${escapeHtml(file.name)}</span><button type="button" data-action="change-media-preview">Change</button></div></div>`;
 }
-function composer() { return `<form class="composer" id="composer"><div class="composer-top">${avatar(state.user, 'avatar-me')}<textarea name="body" aria-label="Share a moment" maxlength="1200" placeholder="What happened on your quest today?"></textarea></div><div class="media-preview" data-media-preview hidden></div><div class="composer-actions"><label class="media-label">▧ Add photo / reel<input name="media" type="file" accept="image/*,video/*" /></label><select class="select-kind" name="kind" aria-label="Post type"><option value="POST">Post</option><option value="REEL">Reel</option></select><button class="post-button">Share moment</button></div></form>`; }
+function composer() {
+  return `<section class="composer studio-launcher"><button type="button" class="studio-launcher-main" data-action="compose">${avatar(state.user, 'avatar-me')}<span>What happened on your quest today?</span><span aria-hidden="true">＋</span></button><div class="studio-launcher-actions"><button type="button" data-action="compose">▧ Photo / post</button><button type="button" data-action="compose-reel">▷ Create a reel</button></div></section>`;
+}
 function homeQuestMarkup(event) {
   const art = event.cover_image
     ? `<img src="${escapeHtml(event.cover_image)}" alt="${escapeHtml(event.name)}">`
@@ -305,7 +322,7 @@ function homeQuestMarkup(event) {
 }
 async function renderHome() {
   const name = state.user?.display_name || state.user?.username || 'Adventurer';
-  view.innerHTML = header('YOUR NEXT ADVENTURE', `Hello, <em>${escapeHtml(name)}.</em>`, `<div class="header-actions"><button class="header-action people-search-icon" data-action="explore-people" aria-label="Search people" title="Search people">${searchIcon}</button><button class="header-action" data-action="refresh-feed">Refresh ↻</button></div>`) + '<div class="quest-filter-row"><button class="quest-filter active" data-action="refresh-feed">For you</button><button class="quest-filter" data-view="explore">Nearby</button><button class="quest-filter" data-action="following-feed">Following</button><button class="quest-filter" data-view="reels">Reels</button></div><section class="home-quest-section"><div class="home-section-heading"><h2>Recommended quests</h2><button data-view="explore">See all</button></div><div class="home-quest-list"><p class="home-quest-loading">Finding quests for you…</p></div></section>' + composer() + '<div class="feed"><p class="empty">Loading moments…</p></div>';
+  view.innerHTML = header('YOUR NEXT ADVENTURE', `Hello, <em>${escapeHtml(name)}.</em>`, `<div class="header-actions"><button class="header-action people-search-icon" data-action="explore-people" aria-label="Search people" title="Search people">${searchIcon}</button><button class="header-action" data-action="refresh-feed">Refresh ↻</button></div>`) + '<div class="quest-filter-row"><button class="quest-filter active" data-action="refresh-feed">For you</button><button class="quest-filter" data-view="explore">Nearby</button><button class="quest-filter" data-action="following-feed">Following</button><button class="quest-filter" data-view="reels">Reels</button></div><section class="home-quest-section"><div class="home-section-heading"><h2>Recommended quests</h2><button data-view="explore">See all</button></div><div class="home-quest-list"><p class="home-quest-loading">Finding quests for you…</p></div></section>' + '<aside class="notification-permission" data-notification-settings></aside>' + composer() + '<div class="feed"><p class="empty">Loading moments…</p></div>';
   try {
     const [posts, eventData] = await Promise.all([api(`/posts/${state.feedFilter}/?kind=POST`), api('/events/recommended/')]);
     document.querySelector('[data-action=following-feed]')?.classList.toggle('active', state.feedFilter === 'following');
@@ -343,33 +360,35 @@ async function renderEventDetail() {
   view.innerHTML = header('ADVENTURE DETAILS', 'Loading <em>adventure…</em>', '<button class="header-action" data-view="explore">‹ Back to events</button>') + '<div class="event-detail"><p class="empty">Gathering the details…</p></div>';
   try {
     const event = await api(`/events/${state.eventId}/`);
-    const [quests, attendees, ratingData, postData] = await Promise.all([
+    state.eventDetail = event;
+    const [questData, attendeeData, ratingData, postData] = await Promise.all([
       api(`/events/${event.id}/quests/`),
       api(`/events/${event.id}/attendees/`),
       event.is_finished && event.my_attendance_status === 'ACCEPTED' ? api(`/ratings/?event=${event.id}`) : Promise.resolve([]),
       api(`/posts/?event=${event.id}`),
     ]);
-    state.eventQuests = rows(quests);
+    const quests = rows(questData);
+    const attendees = rows(attendeeData);
+    state.eventQuests = quests;
     const eventPosts = rows(postData);
     const ratings = rows(ratingData);
     const isHost = event.host.id === state.user.id;
-    const [requests, proofs] = isHost ? await Promise.all([api(`/events/${event.id}/requests/`), api(`/events/${event.id}/submissions/`)]) : [[], []];
+    const requests = isHost ? rows(await api(`/events/${event.id}/requests/`)) : [];
     const pending = requests.filter(request => request.status === 'PENDING');
     const requestWindowClosed = event.is_finished;
-    const questEmptyMessage = event.quest_status === 'SCHEDULED' ? 'Quests unlock when the event starts.' : event.quest_status === 'EXPIRED' ? 'The quest window has ended.' : 'The host has not added quests yet.';
+    const questEmptyMessage = event.quest_status === 'SCHEDULED' ? 'Quests unlock when the event starts. 🕐' : event.quest_status === 'EXPIRED' ? 'The quest window has ended. Nicely done everyone! 🎉' : 'No quests yet — the host is cooking something up. Stay ready! ⚔️';
     const canSubmitQuest = event.quest_status === 'ACTIVE' && event.my_attendance_status === 'ACCEPTED';
-    const questList = quests.length ? quests.map(quest => `<article class="quest-row"><span class="quest-kind ${quest.kind.toLowerCase()}">${quest.kind === 'MAIN' ? '✦ MAIN QUEST' : 'SIDE QUEST'}</span><div><h3>${escapeHtml(quest.title)} <small>+${quest.xp_reward} XP</small></h3><p>${escapeHtml(quest.instructions)}</p>${canSubmitQuest ? quest.my_submission ? `<span class="quest-submission-state">Proof ${escapeHtml(quest.my_submission.status.toLowerCase())}</span>` : `<button class="quest-submit" data-action="submit-quest" data-id="${quest.id}">Upload proof</button>` : ''}</div></article>`).join('') : `<p class="empty">${questEmptyMessage}</p>`;
-    const eventMoments = `<section class="detail-section event-moments"><div class="detail-heading"><h2>Quest moments <span>${eventPosts.length}</span></h2><p>Proofs shared by people who joined this adventure.</p></div>${eventPosts.length ? eventPosts.map(postMarkup).join('') : '<p class="empty">Quest proofs shared by participants will appear here.</p>'}</section>`;
+    const questList = quests.length ? quests.map(quest => `<article class="quest-row"><span class="quest-kind ${quest.kind.toLowerCase()}">${quest.kind === 'MAIN' ? '✦ MAIN QUEST' : 'SIDE QUEST'}</span><div><h3>${escapeHtml(quest.title)} <small>+${quest.xp_reward} XP</small></h3><p>${escapeHtml(quest.instructions)}</p>${canSubmitQuest ? quest.my_submission ? `<span class="quest-submission-state quest-approved">✦ Quest done! +${quest.xp_reward} XP</span>` : `<button class="quest-submit" data-action="submit-quest" data-id="${quest.id}">📸 Snap & share proof</button>` : ''}</div></article>`).join('') : `<p class="empty">${questEmptyMessage}</p>`;
+    const eventMoments = `<section class="detail-section event-moments"><div class="detail-heading"><h2>Quest moments <span>${eventPosts.length}</span></h2><p>Snaps from people who actually showed up and did the thing. 🏆</p></div>${eventPosts.length ? eventPosts.map(postMarkup).join('') : '<p class="empty">No snaps yet — be the first to complete a quest and share your proof! 📸</p>'}</section>`;
     const attendeeList = attendees.length ? attendees.map(attendance => `<button class="event-person" data-action="open-profile" data-id="${attendance.user.id}">${avatar(attendance.user)}<span><strong>${escapeHtml(attendance.user.display_name || attendance.user.username)}</strong><small>★ ${attendance.user.karma || 'new'} · ${attendance.user.xp} XP</small></span></button>`).join('') : '<p class="empty">Be the first person to join.</p>';
     const ratingsByTarget = new Map(ratings.map(rating => [rating.target.id, rating.reaction]));
     const ratingCandidates = attendees.filter(attendance => attendance.user.id !== state.user.id);
     const ratingPanel = event.is_finished && event.my_attendance_status === 'ACCEPTED' ? `<section class="detail-section rating-panel"><div class="detail-heading"><h2>Rate your fellow guests</h2><p>Only people accepted into this event can be rated.</p></div>${ratingCandidates.length ? `<div class="rating-list">${ratingCandidates.map(attendance => { const selected = ratingsByTarget.get(attendance.user.id); return `<article class="rating-row"><button class="rating-person" data-action="open-profile" data-id="${attendance.user.id}">${avatar(attendance.user)}<span><strong>${escapeHtml(attendance.user.display_name || attendance.user.username)}</strong><small>${selected ? `Your response: ${reactionLabel(selected)}` : 'Choose a response'}</small></span></button><div class="rating-actions">${['LIKE', 'DISLIKE', 'NONE'].map(reaction => `<button class="rating-choice ${selected === reaction ? 'selected' : ''}" aria-pressed="${selected === reaction}" data-action="rate-attendee" data-event-id="${event.id}" data-target-id="${attendance.user.id}" data-reaction="${reaction}">${reactionLabel(reaction)}</button>`).join('')}</div></article>`; }).join('')}</div>` : '<p class="empty">No other accepted attendees are available to rate.</p>'}</section>` : '';
-    const hostControls = isHost ? `<section class="host-console"><div class="host-console-title"><div><p class="eyebrow">HOST CONSOLE</p><h2>Interested people <span>${pending.length}</span></h2></div><p>${requestWindowClosed ? 'Requests are closed because the event has ended.' : 'Review public XP and karma before deciding.'}</p></div><div class="request-list">${pending.length ? pending.map(attendance => `<article class="request"><button class="event-person" data-action="open-profile" data-id="${attendance.user.id}">${avatar(attendance.user)}<span><strong>${escapeHtml(attendance.user.display_name || attendance.user.username)}</strong><small>★ ${attendance.user.karma || 'new'} · ${attendance.user.xp} XP</small>${attendance.note ? `<em>“${escapeHtml(attendance.note)}”</em>` : ''}</span></button>${requestWindowClosed ? '<span class="attendance-state">requests closed</span>' : `<div class="request-actions"><button class="deny" data-action="review-request" data-event-id="${event.id}" data-attendance-id="${attendance.id}" data-decision="DENIED">Decline</button><button class="approve" data-action="review-request" data-event-id="${event.id}" data-attendance-id="${attendance.id}" data-decision="ACCEPTED">Accept</button></div>`}</article>`).join('') : '<p class="empty">No pending requests. Your community will find you.</p>'}</div></section>` : '';
+    const hostControls = isHost ? `<section class="host-console"><div class="host-console-title"><div><p class="eyebrow">HOST CONSOLE</p><h2>Interested people <span>${pending.length}</span></h2></div><div class="request-actions"><button class="approve" data-action="invite-event" data-id="${event.id}">Invite people</button><button class="deny" data-action="edit-event">Edit event</button><button class="deny" data-action="delete-event" data-id="${event.id}">Delete event</button></div></div><p>${requestWindowClosed ? 'Requests are closed because the event has ended.' : 'Review public XP and karma before deciding.'}</p><div class="request-list">${pending.length ? pending.map(attendance => `<article class="request"><button class="event-person" data-action="open-profile" data-id="${attendance.user.id}">${avatar(attendance.user)}<span><strong>${escapeHtml(attendance.user.display_name || attendance.user.username)}</strong><small>★ ${attendance.user.karma || 'new'} · ${attendance.user.xp} XP</small>${attendance.note ? `<em>"${escapeHtml(attendance.note)}"</em>` : ''}</span></button>${requestWindowClosed ? '<span class="attendance-state">requests closed</span>' : `<div class="request-actions"><button class="deny" data-action="review-request" data-event-id="${event.id}" data-attendance-id="${attendance.id}" data-decision="DENIED">Decline</button><button class="approve" data-action="review-request" data-event-id="${event.id}" data-attendance-id="${attendance.id}" data-decision="ACCEPTED">Accept</button></div>`}</article>`).join('') : '<p class="empty">No pending requests. Your community will find you.</p>'}</div></section>` : '';
     const questGeneration = isHost && !event.is_finished && !event.has_quests ? `<button class="submit" data-action="generate-quests" data-id="${event.id}">Generate quest line</button>` : '';
-    const proofPanel = isHost ? `<section class="detail-section proof-review"><div class="detail-heading"><h2>Review quest proof</h2><p>Approve completed quests to award XP.</p></div>${proofs.length ? proofs.map(proof => `<article class="proof-card"><h3>${escapeHtml(proof.quest_title)}</h3><p>${escapeHtml(proof.participant.display_name || proof.participant.username)} · ${proof.xp_reward} XP</p>${proof.media_type === 'REEL' ? `<video src="${escapeHtml(proof.media)}" controls playsinline preload="metadata"></video>` : `<img src="${escapeHtml(proof.media)}" alt="Quest proof by ${escapeHtml(proof.participant.display_name || proof.participant.username)}" loading="lazy">`}<p>${escapeHtml(proof.caption)}</p><p>Proof ${escapeHtml(proof.status.toLowerCase())}</p>${proof.status !== 'APPROVED' ? `<div class="request-actions"><button class="deny" data-action="review-proof" data-id="${proof.id}" data-decision="REJECTED">Reject</button><button class="approve" data-action="review-proof" data-id="${proof.id}" data-decision="APPROVED">Approve · +${proof.xp_reward} XP</button></div>` : ''}</article>`).join('') : '<p class="empty">No proof submitted yet.</p>'}</section>` : '';
-    const join = event.host.id === state.user.id ? '<span class="you-host">You are hosting this adventure</span>' : event.my_attendance_status ? `<span class="attendance-state">${escapeHtml(event.my_attendance_status.toLowerCase())}</span>` : requestWindowClosed ? '<span class="attendance-state">requests closed</span>' : `<button class="request-button detail-request" data-action="join-event" data-id="${event.id}">Request to join ↗</button>`;
+    const join = event.host.id === state.user.id ? '<span class="you-host">You are hosting this adventure</span>' : requestWindowClosed ? '<span class="attendance-state">requests closed</span>' : event.my_attendance_status === 'INVITED' ? `<button class="deny" data-action="cancel-rsvp" data-id="${event.id}">Decline</button><button class="request-button detail-request" data-action="join-event" data-id="${event.id}">Accept invite ↗</button>` : ['PENDING', 'ACCEPTED'].includes(event.my_attendance_status) ? `<button class="deny" data-action="cancel-rsvp" data-id="${event.id}">${escapeHtml(event.my_attendance_status.toLowerCase())} · cancel</button>` : `<button class="request-button detail-request" data-action="join-event" data-id="${event.id}">${event.my_attendance_status ? 'Request again' : 'Request to join'} ↗</button>`;
     const shareButton = `<button class="detail-share" data-action="share-event" data-id="${event.id}">↗ Share</button>`;
-    view.innerHTML = `<header class="event-hero"><button class="back-link" data-view="explore">‹ All events</button><p class="eyebrow">${eventDate(event.starts_at)} · ${escapeHtml(event.location_name)}</p><h1>${escapeHtml(event.name)}</h1><p>${escapeHtml(event.description)}</p><div class="event-hero-footer"><button class="event-host" data-action="open-profile" data-id="${event.host.id}">${avatar(event.host)}<span>Hosted by <strong>${escapeHtml(event.host.display_name || event.host.username)}</strong><small>★ ${event.host.karma || 'new'} karma · ${event.host.xp} XP</small></span></button><div class="event-hero-actions">${shareButton}${join}</div></div></header><div class="event-detail"><section class="detail-section"><div class="detail-heading"><h2>The quest line</h2><span>${quests.length} quests</span></div>${questList}${questGeneration}</section>${eventMoments}<section class="detail-section"><div class="detail-heading"><h2>Going <span>${event.accepted_count}/${event.capacity}</span></h2><p>Meet the people who are already in.</p></div><div class="attendee-list">${attendeeList}</div></section>${ratingPanel}${hostControls}${proofPanel}</div>`;
+    view.innerHTML = `<header class="event-hero"><button class="back-link" data-view="explore">‹ All events</button><p class="eyebrow">${eventDate(event.starts_at)} · ${escapeHtml(event.location_name)}</p><h1>${escapeHtml(event.name)}</h1><p>${escapeHtml(event.description)}</p><div class="event-hero-footer"><button class="event-host" data-action="open-profile" data-id="${event.host.id}">${avatar(event.host)}<span>Hosted by <strong>${escapeHtml(event.host.display_name || event.host.username)}</strong><small>★ ${event.host.karma || 'new'} karma · ${event.host.xp} XP</small></span></button><div class="event-hero-actions">${shareButton}${join}</div></div></header><div class="event-detail"><section class="detail-section"><div class="detail-heading"><h2>The quest line</h2><span>${quests.length} quests</span></div>${questList}${questGeneration}</section>${eventMoments}<section class="detail-section"><div class="detail-heading"><h2>Going <span>${event.accepted_count}/${event.capacity}</span></h2><p>Meet the people who are already in.</p></div><div class="attendee-list">${attendeeList}</div></section>${ratingPanel}${hostControls}</div>`;
   } catch (error) { if (error.name === 'AbortError') return; view.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
 }
 async function renderReels() {
@@ -466,20 +485,32 @@ function editCommentModal(button) { showModal(`<div class="modal-inner"><h2>Edit
 function editMessageModal(button) { showModal(`<div class="modal-inner"><h2>Edit message.</h2><p>The updated message will be visible to everyone in this chat.</p><form id="edit-message-form" data-id="${button.dataset.id}"><label>Message<textarea name="body" maxlength="2000" required>${escapeHtml(button.dataset.body || '')}</textarea></label><button class="submit">Save message →</button></form></div>`); }
 function messageOptionsModal(button) { const mine = button.dataset.mine === 'true'; const edit = mine ? `<button class="modal-action" data-action="edit-message" data-id="${button.dataset.id}" data-body="${escapeHtml(button.dataset.body || '')}">Edit message</button>` : ''; const deleteForEveryone = mine ? `<button class="modal-action danger" data-action="delete-message" data-id="${button.dataset.id}" data-scope="everyone">Delete for everyone</button>` : ''; showModal(`<div class="modal-inner"><h2>Message options</h2><p>${mine ? 'You can edit this message, hide it only for yourself, or remove it for everyone.' : 'You can hide this message from your own view.'}</p><div class="modal-actions">${edit}<button class="modal-action" data-action="delete-message" data-id="${button.dataset.id}" data-scope="me">Delete for me</button>${deleteForEveryone}</div></div>`); }
 function manageChatModal(conversation) { showModal(`<div class="modal-inner"><h2>Manage chat.</h2><p>Editing the chat name updates it for both people. Removing it only clears it from your inbox; a new message brings it back.</p><form id="conversation-form" data-id="${conversation.id}"><label>Chat name<input name="title" maxlength="100" value="${escapeHtml(conversation.title || '')}" placeholder="Use the default name"></label><button class="submit">Save chat name →</button></form><div class="modal-actions"><button class="modal-action danger" data-action="delete-conversation" data-id="${conversation.id}">Remove from my inbox</button></div></div>`); }
-function removeCommentFromUI(commentId, control) {
-  const postId = control.closest('[data-post-id]')?.dataset.postId;
-  document.querySelectorAll(`[data-comment-id="${commentId}"]`).forEach(comment => comment.remove());
-  if (!postId) return;
+async function refreshPostComments(postId) {
+  // Deleting a parent also deletes replies. Refresh the thread without navigating or replacing drafts.
+  if (!document.querySelector(`[data-post-id="${postId}"]`)) return;
+  const {post, comments} = await fetchPostDetail(postId);
   document.querySelectorAll(`button[data-id="${postId}"][data-action="focus-comment"], button[data-id="${postId}"][data-action="focus-detail-comment"]`).forEach(button => {
-    button.textContent = button.textContent.replace(/\d+/, count => String(Math.max(0, Number(count) - 1)));
+    button.textContent = `◌ ${post.comment_count} replies`;
   });
   document.querySelectorAll(`[data-post-id="${postId}"] .post-detail-replies`).forEach(replies => {
-    if (!replies.querySelector('.post-detail-comment')) replies.insertAdjacentHTML('beforeend', '<p class="post-detail-empty">Start the conversation with a kind reply.</p>');
+    replies.innerHTML = '<h3>Replies</h3>' + postDetailCommentsMarkup(comments);
+  });
+  document.querySelectorAll(`.post[data-post-id="${postId}"] .comments`).forEach(holder => {
+    holder.querySelectorAll('.comment').forEach(comment => comment.remove());
+    holder.insertAdjacentHTML('afterbegin', (post.recent_comments || []).map(commentMarkup).join(''));
   });
 }
-async function refreshCommentsAfterChange() { if (modal.open && state.openPostId) await renderPostModal(state.openPostId); else await loadView(state.currentView); }
-function composeModal(reel = false) { showModal(`<div class="modal-inner"><h2>${reel ? 'Share a quest reel.' : 'Share a moment.'}</h2><p>Bring someone along in the little moment that made your day better.</p><form id="modal-compose"><label>What happened?<textarea name="body" maxlength="1200" placeholder="A few words go a long way…"></textarea></label><label>Photo or video${reel ? ' (required)' : ''}<input type="file" name="media" accept="image/*,video/*" ${reel ? 'required' : ''}></label><div class="media-preview" data-media-preview hidden></div><label>Location (optional)<input name="location_name" maxlength="120" placeholder="Indiranagar, Bengaluru"></label><input type="hidden" name="kind" value="${reel ? 'REEL' : 'POST'}"><button class="submit">Share with the community →</button></form></div>`); }
-function submitQuestModal(quest) { showModal(`<div class="modal-inner"><p class="eyebrow">QUEST PROOF</p><h2>${escapeHtml(quest.title)}</h2><p>Share the photo or reel that shows how you completed this quest. It will be added to this event's Quest moments.</p><form id="quest-submission-form" data-quest="${quest.id}"><label>Caption (optional)<textarea name="caption" maxlength="280" placeholder="What made this moment memorable?"></textarea></label><label>Photo or video<input type="file" name="media" accept="image/*,video/*" required></label><div class="media-preview" data-media-preview hidden></div><label>Proof type<select name="media_type"><option value="IMAGE">Photo</option><option value="REEL">Reel</option></select></label><button class="submit">Share quest proof →</button></form></div>`); }
+function composeModal(reel = false) {
+  window.SocialQuestPostStudio.open({user:state.user, reel, api, showModal, closeModal, published:() => loadView('home')});
+}
+function submitQuestModal(quest) {
+  const eventId = state.eventId;
+  window.SocialQuestPostStudio.open({user:state.user, quest, api, showModal, closeModal, published:async () => {
+    state.user = await api('/people/me/');
+    syncUser();
+    await loadView('event', {eventId, history:false});
+  }});
+}
 function directConversationFor(personId) { return state.conversations.find(conversation => conversation.participants.some(person => person.id === Number(personId))); }
 async function startOrOpenDirectConversation(personId) { const targetId = Number(personId); if (targetId === state.user.id) return alert('You cannot start a chat with yourself.'); try { const conversation = directConversationFor(targetId) || await api('/conversations/direct/', {method:'POST', body:JSON.stringify({user_id:targetId})}); state.conversations = rows(await api('/conversations/')); state.activeConversation = conversation.id; state.chatOpen = true; if (modal.open) closeModal(); await loadView('chats'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
 async function openPeoplePicker() { try { const people = rows(await api('/people/following/')); showModal(`<div class="modal-inner"><h2>Start a conversation.</h2><p>Only people you follow appear here. Choose someone you would genuinely like to know better.</p><div class="people-picker">${people.map(person => { const existing = directConversationFor(person.id); return `<button class="picker-person" data-action="${existing ? 'open-chat' : 'start-direct'}" data-id="${existing ? existing.id : person.id}">${avatar(person)}<span><strong>${escapeHtml(person.display_name || person.username)}</strong><br><span>@${escapeHtml(person.username)} · ★ ${person.karma || 'new'}${existing ? ' · chat started' : ''}</span></span></button>`; }).join('') || '<p class="empty">Follow someone first, then they will appear here.</p>'}</div></div>`); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
@@ -548,7 +579,14 @@ async function requestBrowserLocation(onSuccess, setStatus) {
 }
 function requestNearbyEvents() { requestBrowserLocation(position => { state.nearby = {latitude: Number(position.coords.latitude.toFixed(6)), longitude: Number(position.coords.longitude.toFixed(6))}; state.exploreQuery = ''; setNearbyStatus('Showing upcoming and ongoing events near you.'); loadView('explore', {history:false}); }, setNearbyStatus); }
 function captureEventLocation(button) { const status = button.parentElement?.querySelector('[data-event-location-status]'); const setStatus = message => { if (status) status.textContent = message; }; requestBrowserLocation(position => { const form = button.closest('form'); form.querySelector('[name="latitude"]').value = position.coords.latitude.toFixed(6); form.querySelector('[name="longitude"]').value = position.coords.longitude.toFixed(6); setStatus('Current location attached for nearby discovery.'); }, setStatus); }
-function hostEventModal() { showModal(`<div class="modal-inner"><h2>Host a little adventure.</h2><p>Attach your approximate location so nearby discovery can surface this event to people close by.</p><form id="event-form"><label>Event name<input name="name" required maxlength="120"></label><label>Description<textarea name="description" required maxlength="2000"></textarea></label><label>Location<input name="location_name" required maxlength="160"></label><button class="location-capture" type="button" data-action="event-use-location">⌖ Use my current location</button><small class="location-capture-status" data-event-location-status>Optional — your coordinates are used only for nearby event matching.</small><input type="hidden" name="latitude"><input type="hidden" name="longitude"><label>Starts at<input name="starts_at" type="datetime-local" required></label><label>Ends at<input name="ends_at" type="datetime-local" required></label><label>Capacity<input name="capacity" type="number" min="2" value="12" required></label><button class="submit">Publish adventure →</button></form></div>`); }
+const localDateInput = value => { if (!value) return ''; const date = new Date(value); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
+function hostEventModal(event = null) { showModal(`<div class="modal-inner"><h2>${event ? 'Edit this adventure.' : 'Host a little adventure.'}</h2><p>Attach your approximate location so nearby discovery can surface this event to people close by.</p><form id="event-form" data-event-id="${event?.id || ''}"><label>Event name<input name="name" value="${escapeHtml(event?.name || '')}" required maxlength="120"></label><label>Description<textarea name="description" required maxlength="2000">${escapeHtml(event?.description || '')}</textarea></label><label>Location<input name="location_name" value="${escapeHtml(event?.location_name || '')}" required maxlength="160"></label><button class="location-capture" type="button" data-action="event-use-location">⌖ Use my current location</button><small class="location-capture-status" data-event-location-status>Optional — your coordinates are used only for nearby event matching.</small><input type="hidden" name="latitude" value="${event?.latitude ?? ''}"><input type="hidden" name="longitude" value="${event?.longitude ?? ''}"><label>Starts at<input name="starts_at" type="datetime-local" value="${localDateInput(event?.starts_at)}" required></label><label>Ends at<input name="ends_at" type="datetime-local" value="${localDateInput(event?.ends_at)}" required></label><label>Capacity<input name="capacity" type="number" min="2" value="${event?.capacity || 12}" required></label><label>Who can see it?<select name="privacy"><option value="PUBLIC"${event?.privacy === 'PRIVATE' ? '' : ' selected'}>Public</option><option value="PRIVATE"${event?.privacy === 'PRIVATE' ? ' selected' : ''}>Invite only</option></select></label><button class="submit">${event ? 'Save adventure' : 'Publish adventure'} →</button></form></div>`); }
+async function eventInviteModal(eventId) {
+  try {
+    const people = rows(await api('/people/'));
+    showModal(`<div class="modal-inner"><h2>Invite people.</h2><p>Invited people can open a private event and accept it themselves.</p><div class="people-picker">${people.filter(person => person.id !== state.user.id).map(person => `<button class="picker-person" data-action="invite-person" data-event-id="${eventId}" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(person.display_name || person.username)}</strong><br><span>@${escapeHtml(person.username)} · ★ ${person.karma || 'new'}</span></span></button>`).join('') || '<p class="empty">No other members yet.</p>'}</div></div>`);
+  } catch (error) { alert(error.message); }
+}
 function cleanFormData(form) { const data = new FormData(form); for (const [key, value] of data) if (value instanceof File && !value.size) data.delete(key); return data; }
 async function submitPost(form) { const data = cleanFormData(form); try { await api('/posts/', {method:'POST', body:data}); clearMediaPreview(form); closeModal(); if (form.id === 'composer') form.reset(); await loadView('home'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
 async function loadView(name, options = {}) {
@@ -563,12 +601,15 @@ async function loadView(name, options = {}) {
   state.eventId = nextEventId;
   state.postId = nextPostId;
   state.currentView = name;
+  updatePresence(!document.hidden && navigator.onLine);
+  window.SocialQuestNotifications.sync();
   if (options.history !== false && changed) history.pushState({view:name, profileId:nextProfileId, eventId:nextEventId, postId:nextPostId}, '', routeUrl(name, nextProfileId, nextEventId, nextPostId));
   if (changed) window.scrollTo({top:0, behavior:'instant'});
   document.title = `SocialQuest — ${name[0].toUpperCase() + name.slice(1)}`;
   setNav(name === 'event' ? 'explore' : name === 'post' ? 'home' : name);
   const renderer = {home:renderHome, explore:renderExplore, reels:renderReels, chats:renderChats, notifications:renderNotifications, profile:renderProfile, event:renderEventDetail, post:renderPostDetail}[name];
   if (renderer) await renderer();
+  window.SocialQuestNotifications.render();
 }
 
 document.addEventListener('click', async event => {
@@ -590,8 +631,12 @@ document.addEventListener('click', async event => {
   if (action === 'retry-people') return searchPeopleDirectory();
   if (action === 'profile-tab') return selectProfileTab(actionTarget.dataset.profileTab);
   if (action === 'join-event') { try { await api(`/events/${button.dataset.id}/join/`, {method:'POST', body:'{}'}); await loadView(state.currentView === 'event' ? 'event' : 'explore'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
+  if (action === 'cancel-rsvp') { try { await api(`/events/${actionTarget.dataset.id}/cancel-rsvp/`, {method:'POST', body:'{}'}); await loadView(state.currentView === 'event' ? 'event' : 'explore'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
+  if (action === 'invite-event') return eventInviteModal(Number(actionTarget.dataset.id));
+  if (action === 'invite-person') { try { await api(`/events/${actionTarget.dataset.eventId}/invite/`, {method:'POST', body:JSON.stringify({user_id:Number(actionTarget.dataset.id)})}); actionTarget.disabled = true; actionTarget.querySelector('strong').textContent += ' · invited'; } catch (error) { alert(error.message); } return; }
+  if (action === 'edit-event') return hostEventModal(state.eventDetail);
+  if (action === 'delete-event') { if (window.confirm('Delete this event, its quests, and its group chat messages? Private event moments will remain private.')) { try { await api(`/events/${actionTarget.dataset.id}/`, {method:'DELETE'}); await loadView('explore'); } catch (error) { alert(error.message); } } return; }
   if (action === 'generate-quests') { try { await api(`/events/${actionTarget.dataset.id}/generate-quests/`, {method:'POST', body:'{}'}); await loadView('event', {eventId:Number(actionTarget.dataset.id)}); } catch (error) { alert(error.message); } }
-  if (action === 'review-proof') { try { await api(`/submissions/${actionTarget.dataset.id}/review/`, {method:'POST', body:JSON.stringify({decision:actionTarget.dataset.decision})}); await loadView('event'); } catch (error) { alert(error.message); } }
   if (action === 'review-request') { try { await api(`/events/${actionTarget.dataset.eventId}/review-request/`, {method:'POST', body:JSON.stringify({attendance_id:Number(actionTarget.dataset.attendanceId), decision:actionTarget.dataset.decision})}); await loadView('event'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
   if (action === 'rate-attendee') { try { await api('/ratings/', {method:'POST', body:JSON.stringify({event:Number(actionTarget.dataset.eventId), target_id:Number(actionTarget.dataset.targetId), reaction:actionTarget.dataset.reaction})}); await loadView('event'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
   if (action === 'share-post') return shareLink('A SocialQuest moment', 'Come see this community moment on SocialQuest.', `/s/post/${actionTarget.dataset.id}/`);
@@ -611,7 +656,7 @@ document.addEventListener('click', async event => {
   if (action === 'edit-post') { try { editPostModal(await api('/posts/' + button.dataset.id + '/')); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
   if (action === 'delete-post') { if (window.confirm('Delete this post? This cannot be undone.')) { try { await api('/posts/' + button.dataset.id + '/', {method:'DELETE'}); if (modal.open) closeModal(); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
   if (action === 'edit-comment') return editCommentModal(actionTarget);
-  if (action === 'delete-comment') { if (window.confirm('Delete this comment?')) { try { await api('/comments/' + actionTarget.dataset.id + '/', {method:'DELETE'}); removeCommentFromUI(actionTarget.dataset.id, actionTarget); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
+  if (action === 'delete-comment') { if (window.confirm('Delete this comment and its replies?')) { try { const postId = Number(actionTarget.closest('[data-post-id]')?.dataset.postId); await api('/comments/' + actionTarget.dataset.id + '/', {method:'DELETE'}); if (postId) await refreshPostComments(postId); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
   if (action === 'message-options') return messageOptionsModal(actionTarget);
   if (action === 'edit-message') return editMessageModal(actionTarget);
   if (action === 'delete-message') { const scope = actionTarget.dataset.scope; const warning = scope === 'everyone' ? 'Delete this message for everyone?' : 'Delete this message from your view?'; if (window.confirm(warning)) { try { await api(`/messages/${actionTarget.dataset.id}/?scope=${scope}`, {method:'DELETE'}); if (modal.open) closeModal(); state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(state.activeConversation); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
@@ -621,6 +666,7 @@ document.addEventListener('click', async event => {
   if (action === 'notification-event') return loadView('event', {eventId:Number(actionTarget.dataset.eventId)});
   if (action === 'chat-list') { state.chatOpen = false; state.activeConversation = null; stopMessagePolling(); document.querySelector('.chats-layout')?.classList.remove('chat-open'); renderConversationList(); return; }
   if (action === 'notification-chat') { state.activeConversation = Number(actionTarget.dataset.conversationId); state.chatOpen = true; return loadView('chats'); }
+  if (action === 'notification-post') return loadView('post', {postId:Number(actionTarget.dataset.postId)});
   if (action === 'open-chat') { if (modal.open) closeModal(); state.activeConversation = Number(button.dataset.id); state.chatOpen = true; return loadView('chats'); }
   if (action === 'start-direct') return startOrOpenDirectConversation(button.dataset.id);
   if (action === 'edit-profile') showModal(`<div class="modal-inner"><h2>Make it feel like you.</h2><form id="profile-form"><label>Display name<input name="display_name" value="${escapeHtml(state.user.display_name)}" maxlength="80"></label><label>Bio<textarea name="bio" maxlength="280">${escapeHtml(state.user.bio)}</textarea></label><label>City<input name="city" value="${escapeHtml(state.user.city)}" maxlength="80"></label><label>Avatar<input name="avatar" type="file" accept="image/*"></label><button class="submit">Save profile →</button></form></div>`);
@@ -630,11 +676,13 @@ onFormSubmit(async event => {
   if (!form.matches('.post-detail-comment-form')) return;
   event.preventDefault();
   const input = form.querySelector('textarea');
-  if (!input.value.trim()) return;
+  const body = input.value.trim();
+  if (!body) return;
   try {
-    await api('/comments/', {method:'POST', body:JSON.stringify({post:Number(form.dataset.post), body:input.value.trim()})});
-    if (modal.open && state.openPostId === Number(form.dataset.post)) await renderPostModal(state.openPostId);
-    else await renderPostDetail();
+    const postId = Number(form.dataset.post);
+    await api('/comments/', {method:'POST', body:JSON.stringify({post:postId, body})});
+    if (input.value.trim() === body) input.value = '';
+    await refreshPostComments(postId);
   } catch (error) { if (error.name === 'AbortError') return; alert(error.message); }
 });
 onFormSubmit(async event => {
@@ -656,13 +704,17 @@ document.addEventListener('change', event => {
     updateMediaPreview(input);
     const mediaType = input.closest('form')?.querySelector('select[name="media_type"]');
     const file = input.files?.[0];
+    if (file?.size > 50 * 1024 * 1024) { alert('Choose a photo or video that is 50 MB or smaller.'); input.value = ''; clearMediaPreview(input.closest('form')); return; }
     if (mediaType && file) mediaType.value = file.type.startsWith('video/') ? 'REEL' : 'IMAGE';
+    // Auto-detect proof type — works for both hidden <input> and <select>
+    const mediaTypeField = input.closest('form')?.querySelector('[name="media_type"]');
+    if (mediaTypeField && file) mediaTypeField.value = file.type.startsWith('video/') ? 'REEL' : 'IMAGE';
     const kind = input.closest('form')?.querySelector('[name=kind]');
     if (kind && file) kind.value = file.type.startsWith('video/') ? 'REEL' : 'POST';
   }
 });
 
-onFormSubmit(async event => { const form = event.target; if (form.id === 'explore-search') { event.preventDefault(); state.exploreQuery = String(new FormData(form).get('q') || '').trim(); state.nearby = null; return loadView('explore', {history:false}); } if (form.id === 'composer' || form.id === 'modal-compose') { event.preventDefault(); return submitPost(form); } if (form.matches('.comment-form')) { event.preventDefault(); const input = form.querySelector('textarea'); if (!input.value.trim()) return; try { await api('/comments/', {method:'POST', body:JSON.stringify({post:form.dataset.post, body:input.value.trim()})}); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.matches('.message-form')) { event.preventDefault(); const input = form.querySelector('input'); if (!input.value.trim()) return; try { await api('/messages/', {method:'POST', body:JSON.stringify({conversation:form.dataset.conversation, body:input.value.trim()})}); input.value = ''; state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(Number(form.dataset.conversation)); input.focus(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'profile-form') { event.preventDefault(); try { state.user = await api('/people/me/', {method:'PATCH', body:cleanFormData(form)}); syncUser(); closeModal(); await renderProfile(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'event-form') { event.preventDefault(); try { const raw = Object.fromEntries(new FormData(form)); raw.capacity = Number(raw.capacity); raw.starts_at = new Date(raw.starts_at).toISOString(); raw.ends_at = new Date(raw.ends_at).toISOString(); if (raw.latitude === '') delete raw.latitude; else raw.latitude = Number(raw.latitude); if (raw.longitude === '') delete raw.longitude; else raw.longitude = Number(raw.longitude); const created = await api('/events/', {method:'POST', body:JSON.stringify(raw)}); closeModal(); try { await api(`/events/${created.id}/generate-quests/`, {method:'POST', body:'{}'}); } catch (_) { alert('Your event was published. Quest generation is temporarily unavailable.'); } await loadView('event', {eventId:created.id}); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } });
+onFormSubmit(async event => { const form = event.target; if (form.id === 'explore-search') { event.preventDefault(); state.exploreQuery = String(new FormData(form).get('q') || '').trim(); state.nearby = null; return loadView('explore', {history:false}); } if (form.id === 'composer' || form.id === 'modal-compose') { event.preventDefault(); return submitPost(form); } if (form.matches('.comment-form')) { event.preventDefault(); const input = form.querySelector('textarea'); if (!input.value.trim()) return; try { await api('/comments/', {method:'POST', body:JSON.stringify({post:form.dataset.post, body:input.value.trim()})}); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.matches('.message-form')) { event.preventDefault(); const input = form.querySelector('input'); if (!input.value.trim()) return; try { await api('/messages/', {method:'POST', body:JSON.stringify({conversation:form.dataset.conversation, body:input.value.trim()})}); input.value = ''; state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(Number(form.dataset.conversation)); input.focus(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'profile-form') { event.preventDefault(); try { state.user = await api('/people/me/', {method:'PATCH', body:cleanFormData(form)}); syncUser(); closeModal(); await renderProfile(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'event-form') { event.preventDefault(); try { const raw = Object.fromEntries(new FormData(form)); raw.capacity = Number(raw.capacity); raw.starts_at = new Date(raw.starts_at).toISOString(); raw.ends_at = new Date(raw.ends_at).toISOString(); if (raw.latitude === '') delete raw.latitude; else raw.latitude = Number(raw.latitude); if (raw.longitude === '') delete raw.longitude; else raw.longitude = Number(raw.longitude); const eventId = Number(form.dataset.eventId) || null; const saved = await api(eventId ? `/events/${eventId}/` : '/events/', {method:eventId ? 'PATCH' : 'POST', body:JSON.stringify(raw)}); closeModal(); if (!eventId) { try { await api(`/events/${saved.id}/generate-quests/`, {method:'POST', body:'{}'}); } catch (_) { alert('Your event was published. Quest generation is temporarily unavailable.'); } } await loadView('event', {eventId:saved.id}); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } });
 onFormSubmit(async event => { const form = event.target; if (!['edit-comment-form', 'edit-message-form', 'conversation-form'].includes(form.id)) return; event.preventDefault(); const body = String(new FormData(form).get('body') || '').trim(); try { if (form.id === 'edit-comment-form') { if (!body) return; await api(`/comments/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); if (state.openPostId) await renderPostModal(state.openPostId); else { closeModal(); await loadView(state.currentView); } } if (form.id === 'edit-message-form') { if (!body) return; await api(`/messages/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); closeModal(); state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(state.activeConversation); } if (form.id === 'conversation-form') { const title = String(new FormData(form).get('title') || '').trim(); await api(`/conversations/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({title})}); closeModal(); state.conversations = rows(await api('/conversations/')); await loadView('chats'); } } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } });
 
 (async function init() {
@@ -670,10 +722,13 @@ onFormSubmit(async event => { const form = event.target; if (!['edit-comment-for
     state.user = await api('/people/me/');
     syncUser();
     const route = routeFromLocation();
+    const conversationId = Number(new URLSearchParams(location.search).get('conversation'));
+    if (route.name === 'chats' && Number.isInteger(conversationId) && conversationId > 0) { state.activeConversation = conversationId; state.chatOpen = true; }
     history.replaceState({view:route.name, profileId:route.profileId, eventId:route.eventId, postId:route.postId}, '', routeUrl(route.name, route.profileId, route.eventId, route.postId));
     await Promise.all([loadView(route.name, {profileId:route.profileId, eventId:route.eventId, postId:route.postId, history:false}), loadSide(), loadNotificationBadge()]);
     startNotificationPolling();
     startPresence();
+    await window.SocialQuestNotifications.init({api, userId:state.user.id, isChatsOpen:() => state.currentView === 'chats', open:openSystemNotification});
   } catch (error) { if (error.name !== 'AbortError') view.innerHTML = `<div class="empty">${escapeHtml(error.message)} <button data-action="retry-app">Try again</button></div>`; }
 })();
 window.addEventListener('popstate', () => {

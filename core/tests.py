@@ -10,13 +10,19 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from PIL import Image
-from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from .models import Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message, Notification, Post, PostLikeReward, PostShareClick, Quest, QuestSubmission, UserPresence
-from .media import MAX_IMAGE_DIMENSION, compress_image_upload
+from .models import AuthSession, Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message, Notification, NotificationDevice, Post, PostLikeReward, PostShareClick, Quest, QuestSubmission, UserPresence
+from .media import MAX_IMAGE_DIMENSION, MAX_UPLOAD_BYTES, compress_image_upload
+from .serializers import PostSerializer
 
 User = get_user_model()
+
+
+def image_upload(name="proof.jpg", size=(8, 8)):
+    source = BytesIO()
+    Image.new("RGB", size, color=(120, 80, 180)).save(source, format="JPEG")
+    return SimpleUploadedFile(name, source.getvalue(), content_type="image/jpeg")
 
 
 class SocialQuestFlowTests(TestCase):
@@ -60,6 +66,8 @@ class SocialQuestFlowTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("token", response.data)
+        second = browser_client.post("/api/auth/login/", {"username": "alex", "password": "password123"}, format="json")
+        self.assertNotEqual(response.data["token"], second.data["token"])
 
     def test_host_generates_one_main_quest_and_private_side_quests(self):
         self.client.force_authenticate(self.host)
@@ -98,22 +106,53 @@ class SocialQuestFlowTests(TestCase):
         quest = Quest.objects.create(event=self.event, kind="MAIN", title="Say hello", instructions="Make a friend.", xp_reward=75)
         Attendance.objects.create(event=self.event, user=self.alex, status=Attendance.Status.ACCEPTED)
         self.client.force_authenticate(self.alex)
-        proof = SimpleUploadedFile("proof.jpg", b"not-a-real-image", content_type="image/jpeg")
+        proof = image_upload()
         response = self.client.post("/api/submissions/", {"quest": quest.id, "media": proof, "media_type": "IMAGE"}, format="multipart")
         self.assertEqual(response.status_code, 201)
         submission = QuestSubmission.objects.get()
+        # Submission is auto-approved — no host review required.
+        self.assertEqual(submission.status, QuestSubmission.Status.APPROVED)
         quest_moment = Post.objects.get(author=self.alex, quest=quest)
         self.assertEqual(quest_moment.event, self.event)
         self.assertEqual(quest_moment.media.name, submission.media.name)
         self.assertEqual(self.client.get(f"/api/posts/?event={self.event.id}").data["count"], 1)
-        self.client.force_authenticate(self.host)
-        response = self.client.post(f"/api/submissions/{submission.id}/review/", {"decision": "APPROVED"})
-        self.assertEqual(response.status_code, 200)
+        # XP is awarded immediately on submission — verify right away.
         self.alex.profile.refresh_from_db()
         self.assertEqual(self.alex.profile.total_xp, 75)
-        self.client.post(f"/api/submissions/{submission.id}/review/", {"decision": "APPROVED"})
+        # A second submission for the same quest is rejected — XP is not doubled.
+        proof2 = image_upload("proof2.jpg")
+        response2 = self.client.post("/api/submissions/", {"quest": quest.id, "media": proof2, "media_type": "IMAGE"}, format="multipart")
+        self.assertEqual(response2.status_code, 400)
         self.alex.profile.refresh_from_db()
         self.assertEqual(self.alex.profile.total_xp, 75)
+
+    def test_quest_photo_and_reel_include_event_attribution_without_private_leaks(self):
+        self.event.starts_at = timezone.now() - timedelta(minutes=5)
+        self.event.ends_at = timezone.now() + timedelta(hours=1)
+        self.event.privacy = Event.Privacy.PRIVATE
+        self.event.save()
+        Attendance.objects.create(event=self.event, user=self.alex, status=Attendance.Status.ACCEPTED)
+        self.client.force_authenticate(self.alex)
+        for media_type in ["IMAGE", "REEL"]:
+            quest = Quest.objects.create(event=self.event, kind="MAIN", title="Meet a new friend " + media_type, instructions="Share your moment", xp_reward=50)
+            media = image_upload() if media_type == "IMAGE" else SimpleUploadedFile("proof.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 20, content_type="video/mp4")
+            submitted = self.client.post("/api/submissions/", {"quest": quest.id, "media": media, "media_type": media_type, "caption": "We did it!"}, format="multipart")
+            self.assertEqual(submitted.status_code, 201, submitted.data)
+            moment = Post.objects.get(quest=quest)
+            response = self.client.get(f"/api/posts/{moment.id}/")
+            self.assertEqual(response.data["event_name"], self.event.name)
+            self.assertEqual(response.data["quest_title"], quest.title)
+            self.assertEqual(response.data["kind"], "POST" if media_type == "IMAGE" else "REEL")
+            edited = self.client.patch(f"/api/posts/{moment.id}/", {"event_name": "Forged event", "quest_title": "Forged quest", "body": "Great afternoon"}, format="json")
+            self.assertEqual(edited.status_code, 200)
+            self.assertEqual(edited.data["event_name"], self.event.name)
+            self.assertEqual(edited.data["quest_title"], quest.title)
+        self.alex.profile.refresh_from_db()
+        self.assertEqual(self.alex.profile.total_xp, 100)
+        for viewer in [None, self.sam]:
+            self.client.force_authenticate(viewer)
+            self.assertEqual(self.client.get(f"/api/posts/{moment.id}/").status_code, 404)
+            self.assertEqual(self.client.get("/api/posts/").data["results"], [])
 
     def test_quests_only_exist_during_the_event_and_requests_close_afterward(self):
         quest = Quest.objects.create(event=self.event, kind="MAIN", title="Say hello", instructions="Make a friend.", xp_reward=75)
@@ -136,7 +175,7 @@ class SocialQuestFlowTests(TestCase):
         self.assertEqual(self.client.get(f"/api/events/{self.event.id}/").data["quest_status"], "ACTIVE")
 
         self.client.force_authenticate(self.alex)
-        proof = SimpleUploadedFile("proof.jpg", b"not-a-real-image", content_type="image/jpeg")
+        proof = image_upload()
         self.assertEqual(self.client.post("/api/submissions/", {"quest": quest.id, "media": proof, "media_type": "IMAGE"}, format="multipart").status_code, 201)
 
         self.event.ends_at = timezone.now() - timedelta(minutes=1)
@@ -147,7 +186,7 @@ class SocialQuestFlowTests(TestCase):
         self.assertEqual(self.client.get(f"/api/events/{self.event.id}/quests/").data, [])
         self.assertEqual(self.client.get(f"/api/events/{self.event.id}/").data["quest_status"], "EXPIRED")
         self.client.force_authenticate(self.alex)
-        late_proof = SimpleUploadedFile("late-proof.jpg", b"not-a-real-image", content_type="image/jpeg")
+        late_proof = image_upload("late-proof.jpg")
         self.assertEqual(self.client.post("/api/submissions/", {"quest": quest.id, "media": late_proof, "media_type": "IMAGE"}, format="multipart").status_code, 400)
 
     def test_karma_is_available_only_after_an_event_and_only_for_attendees(self):
@@ -365,14 +404,22 @@ class SocialQuestFlowTests(TestCase):
         self.assertEqual(first.status_code, 201)
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.data["id"], first.data["id"])
-        self.assertEqual(Conversation.objects.count(), 1)
+        self.assertEqual(Conversation.objects.filter(is_group=False).count(), 1)
+
+    def test_inbox_is_ordered_by_latest_message_activity(self):
+        self.client.force_authenticate(self.alex)
+        older = self.client.post("/api/conversations/direct/", {"user_id": self.sam.id}, format="json").data
+        newer = self.client.post("/api/conversations/direct/", {"user_id": self.jordan.id}, format="json").data
+        self.client.post("/api/messages/", {"conversation": older["id"], "body": "Newest activity"}, format="json")
+        inbox = self.client.get("/api/conversations/").data["results"]
+        self.assertEqual([item["id"] for item in inbox[:2]], [older["id"], newer["id"]])
 
     def test_direct_chat_cannot_target_the_current_user(self):
         self.client.force_authenticate(self.alex)
         response = self.client.post("/api/conversations/direct/", {"user_id": self.alex.id}, format="json")
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(Conversation.objects.count(), 0)
+        self.assertEqual(Conversation.objects.filter(is_group=False).count(), 0)
 
     def test_participants_can_edit_and_remove_chats_from_their_own_inboxes(self):
         self.client.force_authenticate(self.alex)
@@ -428,6 +475,36 @@ class SocialQuestFlowTests(TestCase):
         self.assertEqual(self.client.delete(f"/api/comments/{comment['id']}/").status_code, 204)
         self.assertFalse(Comment.objects.filter(id=comment["id"]).exists())
 
+    def test_comment_replies_are_nested_and_alert_the_relevant_person(self):
+        post = Post.objects.create(author=self.alex, body="A small win")
+        self.client.force_authenticate(self.sam)
+        root = self.client.post("/api/comments/", {"post": post.id, "body": "Love this"}, format="json")
+        self.assertEqual(root.status_code, 201)
+        self.assertIsNone(root.data["parent"])
+        self.assertTrue(Notification.objects.filter(
+            recipient=self.alex,
+            actor=self.sam,
+            comment_id=root.data["id"],
+            kind=Notification.Kind.COMMENT_REPLY,
+        ).exists())
+
+        self.client.force_authenticate(self.jordan)
+        reply = self.client.post("/api/comments/", {"post": post.id, "parent": root.data["id"], "body": "Me too"}, format="json")
+        self.assertEqual(reply.status_code, 201)
+        self.assertEqual(reply.data["parent"], root.data["id"])
+        notification = Notification.objects.get(recipient=self.sam, comment_id=reply.data["id"])
+        self.assertEqual(notification.kind, Notification.Kind.COMMENT_REPLY)
+        self.assertEqual(notification.actor, self.jordan)
+
+        self.client.force_authenticate(self.sam)
+        alert = self.client.get("/api/notifications/").data["results"][0]
+        self.assertEqual(alert["comment_post_id"], post.id)
+        self.assertIn("replied to your comment", alert["text"])
+
+        other_post = Post.objects.create(author=self.alex, body="Another moment")
+        invalid = self.client.post("/api/comments/", {"post": other_post.id, "parent": root.data["id"], "body": "Wrong thread"}, format="json")
+        self.assertEqual(invalid.status_code, 400)
+
     def test_rsvp_is_limited_to_two_upcoming_or_active_events(self):
         second_event = Event.objects.create(
             host=self.host, name="Board games", description="Bring a favourite game.", location_name="Bengaluru",
@@ -444,7 +521,7 @@ class SocialQuestFlowTests(TestCase):
         self.assertEqual(blocked.status_code, 400)
         self.assertIn("at most 2", blocked.data["detail"])
 
-    def test_rsvp_decision_and_chat_create_notifications_for_the_right_people(self):
+    def test_rsvp_decisions_notify_but_chat_messages_stay_out_of_notifications(self):
         self.client.force_authenticate(self.alex)
         self.assertEqual(self.client.post(f"/api/events/{self.event.id}/join/", {}, format="json").status_code, 201)
         self.client.force_authenticate(self.host)
@@ -459,9 +536,8 @@ class SocialQuestFlowTests(TestCase):
         conversation = self.client.post("/api/conversations/direct/", {"user_id": self.sam.id}, format="json").data
         self.assertEqual(self.client.post("/api/messages/", {"conversation": conversation["id"], "body": "Hello Sam"}, format="json").status_code, 201)
         self.client.force_authenticate(self.sam)
-        chat_notifications = self.client.get("/api/notifications/")
-        self.assertEqual(chat_notifications.data["results"][0]["kind"], Notification.Kind.MESSAGE)
-        self.assertEqual(self.client.post("/api/notifications/mark-read/", {"ids": [chat_notifications.data["results"][0]["id"]]}, format="json").data["marked_read"], 1)
+        self.assertFalse(Notification.objects.filter(recipient=self.sam, kind=Notification.Kind.MESSAGE).exists())
+        self.assertEqual(self.client.get("/api/notifications/").data["count"], 0)
 
     def test_event_detail_exposes_accepted_people_but_keeps_pending_requests_host_only(self):
         accepted = Attendance.objects.create(event=self.event, user=self.alex, status=Attendance.Status.ACCEPTED)
@@ -477,13 +553,22 @@ class SocialQuestFlowTests(TestCase):
         self.assertEqual(requests.status_code, 200)
         self.assertIn(pending.id, [row["id"] for row in requests.data])
 
-    def test_logout_revokes_the_authentication_token(self):
-        token = Token.objects.create(user=self.alex)
+    def test_logout_revokes_only_the_current_client_session(self):
+        token = AuthSession.objects.create(user=self.alex)
+        other_token = AuthSession.objects.create(user=self.alex)
+        device = NotificationDevice.objects.create(user=self.alex, transport="LOCAL", address={})
         self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
         response = self.client.post("/api/auth/logout/")
         self.assertEqual(response.status_code, 204)
-        self.assertFalse(Token.objects.filter(key=token.key).exists())
+        self.assertFalse(AuthSession.objects.filter(key=token.key).exists())
+        self.assertTrue(AuthSession.objects.filter(key=other_token.key).exists())
+        device.refresh_from_db()
+        self.assertTrue(device.enabled)
         self.assertEqual(self.client.get("/api/people/me/").status_code, 401)
+
+        other_client = APIClient()
+        other_client.credentials(HTTP_AUTHORIZATION=f"Token {other_token.key}")
+        self.assertEqual(other_client.get("/api/people/me/").status_code, 200)
 
     def test_search_finds_events_and_people(self):
         self.host.profile.display_name = "Riya Kapoor"
@@ -570,34 +655,38 @@ class AuditRegressionTests(TestCase):
         self.assertEqual(self.client.patch(url, {'starts_at': (self.event.ends_at+timedelta(hours=1)).isoformat()}, format='json').status_code, 400)
         self.assertEqual(self.client.patch(url, {'capacity': 0}, format='json').status_code, 400)
 
-    def test_proof_review_is_accessible_only_to_host_and_cannot_repeat_xp(self):
+    def test_proof_is_auto_approved_and_xp_is_awarded_immediately(self):
+        # Submissions are auto-approved on create — no host review endpoint.
+        self.event.starts_at = timezone.now() - timedelta(hours=1)
+        self.event.ends_at = timezone.now() + timedelta(hours=1)
+        self.event.save()
         quest = Quest.objects.create(event=self.event, kind='MAIN', title='Meet', instructions='Say hello', xp_reward=120)
-        proof = QuestSubmission.objects.create(quest=quest, participant=self.guest, media='quest_proofs/example.jpg', media_type='IMAGE')
-        url = f'/api/events/{self.event.id}/submissions/'
-        result = self.client.get(url)
-        self.assertEqual(result.status_code, 200)
-        self.assertEqual(result.data[0]['quest_title'], 'Meet')
-        review = f'/api/submissions/{proof.id}/review/'
-        self.assertEqual(self.client.post(review, {'decision':'APPROVED'}, format='json').status_code, 200)
-        self.assertEqual(self.client.post(review, {'decision':'REJECTED'}, format='json').status_code, 400)
-        self.assertEqual(self.client.post(review, {'decision':'APPROVED'}, format='json').status_code, 200)
+        Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        self.client.force_authenticate(self.guest)
+        proof_file = image_upload()
+        response = self.client.post('/api/submissions/', {'quest': quest.id, 'media_type': 'IMAGE', 'media': proof_file}, format='multipart')
+        self.assertEqual(response.status_code, 201)
+        submission = QuestSubmission.objects.get()
+        self.assertEqual(submission.status, QuestSubmission.Status.APPROVED)
         self.guest.profile.refresh_from_db()
         self.assertEqual(self.guest.profile.total_xp, 120)
-        self.client.force_authenticate(self.other)
-        self.assertEqual(self.client.get(url).status_code, 403)
-        self.assertEqual(self.client.post(review, {'decision':'APPROVED'}, format='json').status_code, 403)
+        # The review endpoint no longer exists.
+        self.client.force_authenticate(self.host)
+        self.assertEqual(self.client.post(f'/api/submissions/{submission.id}/review/', {'decision': 'APPROVED'}, format='json').status_code, 404)
+        # The event-level submissions list endpoint no longer exists.
+        self.assertEqual(self.client.get(f'/api/events/{self.event.id}/submissions/').status_code, 404)
 
     def test_duplicate_proof_returns_validation_error(self):
         quest = Quest.objects.create(event=self.event, kind='MAIN', title='Meet', instructions='Say hello')
         Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
         QuestSubmission.objects.create(quest=quest, participant=self.guest, media='quest_proofs/example.jpg', media_type='IMAGE')
         self.client.force_authenticate(self.guest)
-        response = self.client.post('/api/submissions/', {'quest':quest.id, 'media_type':'IMAGE', 'media':SimpleUploadedFile('proof.jpg', b'photo', content_type='image/jpeg')}, format='multipart')
+        response = self.client.post('/api/submissions/', {'quest':quest.id, 'media_type':'IMAGE', 'media':image_upload()}, format='multipart')
         self.assertEqual(response.status_code, 400)
         self.assertEqual(QuestSubmission.objects.count(), 1)
 
     def test_unread_count_includes_every_page_and_empty_ids_mark_nothing(self):
-        Notification.objects.bulk_create([Notification(recipient=self.host, kind='MESSAGE') for _ in range(26)])
+        Notification.objects.bulk_create([Notification(recipient=self.host, kind='COMMENT_REPLY') for _ in range(26)])
         self.assertEqual(self.client.get('/api/notifications/unread-count/').data['count'], 26)
         self.assertEqual(self.client.post('/api/notifications/mark-read/', {'ids':[]}, format='json').data['marked_read'], 0)
         self.assertEqual(self.client.post('/api/notifications/mark-read/', {'ids':'bad'}, format='json').status_code, 400)
@@ -613,8 +702,17 @@ class AuditRegressionTests(TestCase):
             self.assertEqual(self.client.post(url, {**payload,'decision':decision}, format='json').status_code, 200)
 
     def test_reel_rejects_image_and_post_rejects_non_media(self):
-        self.assertEqual(self.client.post('/api/posts/', {'kind':'REEL','media':SimpleUploadedFile('photo.jpg', b'photo', content_type='image/jpeg')}, format='multipart').status_code, 400)
+        self.assertEqual(self.client.post('/api/posts/', {'kind':'REEL','media':image_upload('photo.jpg')}, format='multipart').status_code, 400)
         self.assertEqual(self.client.post('/api/posts/', {'body':'Text','media':SimpleUploadedFile('test.html', b'<script></script>', content_type='text/html')}, format='multipart').status_code, 400)
+
+    def test_uploads_reject_corrupt_content_and_oversized_files(self):
+        corrupt = SimpleUploadedFile('fake.jpg', b'not really an image', content_type='image/jpeg')
+        self.assertEqual(self.client.post('/api/posts/', {'body':'Fake', 'media':corrupt}, format='multipart').status_code, 400)
+        oversized = image_upload('large.jpg')
+        oversized.size = MAX_UPLOAD_BYTES + 1
+        serializer = PostSerializer(data={'body':'Large', 'media':oversized})
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('50 MB', str(serializer.errors))
 
     def test_generated_quests_have_bounded_fields_and_distinct_fallbacks(self):
         from .ai import _fallback_main_quest, _fallback_side_quests, _validated_quests
@@ -642,6 +740,149 @@ class AuditRegressionTests(TestCase):
         self.assertEqual(self.client.get(f'/api/events/{self.event.id}/').status_code, 200)
         self.assertEqual(self.client.get(f'/api/posts/{post.id}/').status_code, 200)
         self.assertEqual(self.client.get(f'/api/comments/?post={post.id}').data['count'], 1)
+
+    def test_private_event_invitation_can_be_accepted(self):
+        self.event.privacy = Event.Privacy.PRIVATE
+        self.event.save()
+        self.client.force_authenticate(self.host)
+        invited = self.client.post(f'/api/events/{self.event.id}/invite/', {'user_id': self.guest.id}, format='json')
+        self.assertEqual(invited.status_code, 201)
+        self.assertEqual(invited.data['status'], Attendance.Status.INVITED)
+        invitation_id = invited.data['id']
+        self.assertEqual(self.client.post(f'/api/events/{self.event.id}/review-request/', {'attendance_id': invitation_id, 'decision': 'ACCEPTED'}, format='json').status_code, 400)
+        self.client.force_authenticate(self.guest)
+        recommended = self.client.get('/api/events/recommended/').data
+        self.assertEqual(recommended[0]['id'], self.event.id)
+        self.assertEqual(recommended[0]['recommendation_reason'], 'You were invited')
+        self.assertEqual(self.client.get(f'/api/events/{self.event.id}/').status_code, 200)
+        accepted = self.client.post(f'/api/events/{self.event.id}/join/', {}, format='json')
+        self.assertEqual(accepted.status_code, 201)
+        self.assertEqual(accepted.data['status'], Attendance.Status.ACCEPTED)
+
+    def test_denied_guest_can_request_to_join_again_and_cancel(self):
+        attendance = Attendance.objects.create(event=self.event, user=self.guest, status=Attendance.Status.DENIED)
+        self.client.force_authenticate(self.guest)
+        retried = self.client.post(f'/api/events/{self.event.id}/join/', {}, format='json')
+        self.assertEqual(retried.status_code, 201)
+        self.assertEqual(retried.data['status'], Attendance.Status.PENDING)
+        cancelled = self.client.post(f'/api/events/{self.event.id}/cancel-rsvp/', {}, format='json')
+        self.assertEqual(cancelled.status_code, 200)
+        attendance.refresh_from_db()
+        self.assertEqual(attendance.status, Attendance.Status.CANCELLED)
+
+    def test_deleted_private_event_never_publishes_its_moments(self):
+        self.event.privacy = Event.Privacy.PRIVATE
+        self.event.save()
+        post = Post.objects.create(event=self.event, author=self.host, body='Private forever')
+        self.event.delete()
+        post.refresh_from_db()
+        self.assertTrue(post.restricted_to_event)
+        self.assertIsNone(post.event_id)
+        for viewer in (None, self.guest):
+            self.client.force_authenticate(viewer)
+            self.assertEqual(self.client.get(f'/api/posts/{post.id}/').status_code, 404)
+        self.client.force_authenticate(self.host)
+        self.assertEqual(self.client.get(f'/api/posts/{post.id}/').status_code, 200)
+
+    def test_non_numeric_query_params_do_not_crash_endpoints(self):
+        self.client.force_authenticate(self.guest)
+        # Ratings
+        response = self.client.get("/api/ratings/?event=not-a-number")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+        # Messages
+        response = self.client.get("/api/messages/?conversation=abc")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+        # Comments
+        response = self.client.get("/api/comments/?post=xyz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+        # Events
+        response = self.client.get("/api/events/?host=bad&participant=invalid")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+        # Posts
+        response = self.client.get("/api/posts/?author=none&event=invalid")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+    def test_invalid_body_ids_return_bad_request_instead_of_crashing(self):
+        self.client.force_authenticate(self.guest)
+        response = self.client.post("/api/conversations/direct/", {"user_id": "not_an_int"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("user_id must be a valid integer", response.data["detail"])
+
+        self.client.force_authenticate(self.host)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/review-request/",
+            {"attendance_id": "invalid", "decision": "ACCEPTED"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("attendance_id must be a valid integer", response.data["detail"])
+
+    def test_chat_notifications_are_not_exposed_in_the_alerts_feed(self):
+        chat = Conversation.objects.create(is_group=False)
+        chat.participants.add(self.guest, self.other)
+        msg = Message.objects.create(conversation=chat, sender=self.guest, body="", deleted_for_everyone=True)
+        notif = Notification.objects.create(recipient=self.other, actor=self.guest, conversation=chat, message=msg, kind=Notification.Kind.MESSAGE)
+        self.client.force_authenticate(self.other)
+        res = self.client.get("/api/notifications/")
+        self.assertEqual(res.status_code, 200)
+        items = res.data["results"] if "results" in res.data else res.data
+        self.assertFalse(any(item["id"] == notif.id for item in items))
+
+    def test_quest_regeneration_blocked_when_submissions_exist(self):
+        self.client.force_authenticate(self.host)
+        quest = Quest.objects.create(event=self.event, kind=Quest.Kind.MAIN, title="Existing quest", instructions="Do something.", xp_reward=50)
+        image_bytes = BytesIO()
+        Image.new("RGB", (100, 100), color="blue").save(image_bytes, format="JPEG")
+        image_bytes.seek(0)
+        proof = SimpleUploadedFile("proof.jpg", image_bytes.read(), content_type="image/jpeg")
+        QuestSubmission.objects.create(quest=quest, participant=self.guest, caption="Done", media=proof, media_type="IMAGE")
+
+        response = self.client.post(f"/api/events/{self.event.id}/generate-quests/", {"replace": True}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Cannot regenerate quests after submissions have been made", response.data["detail"])
+        self.assertTrue(Quest.objects.filter(id=quest.id).exists())
+
+    def test_rsvp_note_truncation_and_cancel_flow(self):
+        self.client.force_authenticate(self.other)
+        long_note = "A" * 500
+        response = self.client.post(f"/api/events/{self.event.id}/join/", {"note": long_note}, format="json")
+        self.assertEqual(response.status_code, 201)
+        attendance = Attendance.objects.get(event=self.event, user=self.other)
+        self.assertEqual(len(attendance.note), 240)
+        self.assertEqual(attendance.status, Attendance.Status.PENDING)
+
+        # Cancel RSVP
+        cancel_res = self.client.post(f"/api/events/{self.event.id}/cancel-rsvp/")
+        self.assertEqual(cancel_res.status_code, 200)
+        attendance.refresh_from_db()
+        self.assertEqual(attendance.status, Attendance.Status.CANCELLED)
+
+        # Cancelling again fails
+        second_cancel = self.client.post(f"/api/events/{self.event.id}/cancel-rsvp/")
+        self.assertEqual(second_cancel.status_code, 400)
+
+        # Re-joining succeeds and resets status to PENDING
+        rejoin_res = self.client.post(f"/api/events/{self.event.id}/join/", {"note": "Second attempt"}, format="json")
+        self.assertEqual(rejoin_res.status_code, 201)
+        attendance.refresh_from_db()
+        self.assertEqual(attendance.status, Attendance.Status.PENDING)
+        self.assertEqual(attendance.note, "Second attempt")
+
+    def test_unread_notification_count_does_not_bulk_create_on_poll(self):
+        self.client.force_authenticate(self.guest)
+        with patch("core.views.Notification.objects.bulk_create") as mock_bulk:
+            res = self.client.get("/api/notifications/unread-count/")
+            self.assertEqual(res.status_code, 200)
+            mock_bulk.assert_not_called()
 
 
 class PeopleAndPresenceTests(TestCase):
@@ -736,10 +977,259 @@ class PeopleAndPresenceTests(TestCase):
         self.client.force_authenticate(self.alex)
         self.assertFalse(self.sam_is_online())
 
-    def test_logout_clears_presence_and_background_reads_do_not_mark_online(self):
-        UserPresence.objects.create(user=self.alex, session_id=uuid4())
+    def test_logout_does_not_clear_another_clients_presence(self):
+        first, second = uuid4(), uuid4()
+        UserPresence.objects.create(user=self.alex, session_id=first)
+        UserPresence.objects.create(user=self.alex, session_id=second)
         self.assertEqual(self.client.post('/api/auth/logout/').status_code, 204)
-        self.assertFalse(UserPresence.objects.filter(user=self.alex).exists())
+        self.assertEqual(UserPresence.objects.filter(user=self.alex).count(), 2)
+        self.client.delete('/api/people/presence/', {'session_id': first}, format='json')
+        self.assertEqual(UserPresence.objects.filter(user=self.alex).count(), 1)
         self.client.get('/api/notifications/')
         self.client.get('/api/people/me/')
-        self.assertFalse(UserPresence.objects.filter(user=self.alex).exists())
+        self.assertTrue(UserPresence.objects.filter(user=self.alex, session_id=second).exists())
+
+
+class NotificationDeliveryTests(TestCase):
+    def setUp(self):
+        from .models import NotificationDevice
+        self.sender = User.objects.create_user('notice_sender')
+        self.recipient = User.objects.create_user('notice_recipient')
+        self.client = APIClient()
+        self.client.force_authenticate(self.recipient)
+        self.chat = Conversation.objects.create(direct_key=f'direct:{self.sender.id}:{self.recipient.id}')
+        self.chat.participants.add(self.sender, self.recipient)
+        self.device = NotificationDevice.objects.create(user=self.recipient, transport='LOCAL')
+
+    def send_message(self):
+        self.client.force_authenticate(self.sender)
+        response = self.client.post('/api/messages/', {'conversation': self.chat.id, 'body': 'Hello from a test'}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.client.force_authenticate(self.recipient)
+        return response.data
+
+    def poll(self):
+        response = self.client.post('/api/notifications/poll-delivery/', {'id': str(self.device.id)}, format='json')
+        self.assertEqual(response.status_code, 200)
+        return response.data['deliveries']
+
+    def test_new_message_delivers_once_without_adding_to_alerts_feed(self):
+        self.send_message()
+        deliveries = self.poll()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]['kind'], 'MESSAGE')
+        self.assertEqual(deliveries[0]['conversation_id'], self.chat.id)
+        self.assertEqual(self.poll(), [])
+        self.assertEqual(self.client.get('/api/notifications/').data['count'], 0)
+
+    def test_open_chats_suppresses_any_conversation_and_does_not_replay_later(self):
+        session = str(uuid4())
+        self.client.put('/api/people/presence/', {'session_id': session, 'chats_open': True}, format='json')
+        self.send_message()
+        self.assertEqual(self.poll(), [])
+        self.client.put('/api/people/presence/', {'session_id': session, 'chats_open': False}, format='json')
+        self.assertEqual(self.poll(), [])
+        self.send_message()
+        self.assertEqual(len(self.poll()), 1)
+
+    def test_opening_chats_after_enqueue_suppresses_pending_notifications(self):
+        self.send_message()
+        self.client.put('/api/people/presence/', {'session_id': str(uuid4()), 'chats_open': True}, format='json')
+        self.assertEqual(self.poll(), [])
+        UserPresence.objects.filter(user=self.recipient).delete()
+        self.assertEqual(self.poll(), [])
+
+    def test_background_or_expired_chat_session_does_not_suppress(self):
+        session = uuid4()
+        UserPresence.objects.create(user=self.recipient, session_id=session, chats_open=True, last_seen=timezone.now() - timedelta(seconds=61))
+        self.send_message()
+        self.assertEqual(len(self.poll()), 1)
+        self.client.put('/api/people/presence/', {'session_id': str(session), 'chats_open': True}, format='json')
+        self.client.delete('/api/people/presence/', {'session_id': str(session)}, format='json')
+        self.send_message()
+        self.assertEqual(len(self.poll()), 1)
+
+    def test_other_activity_still_delivers_while_chats_are_open(self):
+        UserPresence.objects.create(user=self.recipient, session_id=uuid4(), chats_open=True)
+        Notification.objects.create(recipient=self.recipient, actor=self.sender, kind=Notification.Kind.RSVP)
+        self.assertEqual(self.poll()[0]['kind'], 'RSVP')
+
+    def test_device_endpoints_require_ownership_and_never_expose_tokens(self):
+        self.client.force_authenticate(self.sender)
+        self.assertEqual(self.client.post('/api/notifications/poll-delivery/', {'id':str(self.device.id)}, format='json').status_code, 404)
+        self.assertEqual(self.client.put('/api/notifications/device/', {'id':str(self.device.id),'transport':'LOCAL'}, format='json').status_code, 403)
+        self.assertEqual(self.client.delete('/api/notifications/device/', {'id':str(self.device.id)}, format='json').status_code, 403)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get('/api/notifications/delivery-config/').status_code, 401)
+        self.client.force_authenticate(self.recipient)
+        self.assertNotIn('address', self.client.get('/api/notifications/device/?id=' + str(self.device.id)).data)
+
+    def test_device_registration_rejects_internal_push_urls_and_bad_tokens(self):
+        for address in [{'endpoint':'http://127.0.0.1:8000/api/'}, {'endpoint':'https://127.0.0.1/api/'}, {'endpoint':'https://example.com/push'}]:
+            self.assertEqual(self.client.put('/api/notifications/device/', {'id':str(uuid4()),'transport':'WEB','address':address}, format='json').status_code, 400)
+        self.assertEqual(self.client.put('/api/notifications/device/', {'id':str(uuid4()),'transport':'EXPO','address':{'token':'invalid'}}, format='json').status_code, 400)
+        self.assertEqual(self.client.put('/api/notifications/device/', {'id':'bad','transport':'LOCAL'}, format='json').status_code, 400)
+
+    def test_revoking_one_device_stops_it_without_logout_disabling_others(self):
+        self.send_message()
+        self.client.delete('/api/notifications/device/', {'id':str(self.device.id)}, format='json')
+        self.assertEqual(self.client.post('/api/notifications/poll-delivery/', {'id':str(self.device.id)}, format='json').status_code, 404)
+        self.device.refresh_from_db(); self.assertFalse(self.device.enabled)
+        self.client.put('/api/notifications/device/', {'id':str(self.device.id),'transport':'LOCAL'}, format='json')
+        self.assertEqual(self.poll(), [])
+        self.client.post('/api/auth/logout/')
+        self.device.refresh_from_db(); self.assertTrue(self.device.enabled)
+
+    @patch('core.notification_delivery.expo_request')
+    def test_expo_ticket_is_checked_and_duplicate_worker_does_not_resend(self, push):
+        from .models import NotificationDelivery
+        from .notification_delivery import send_delivery, check_receipts
+        self.device.transport = 'EXPO'; self.device.address = {'token':'ExpoPushToken[test-token-123]'}; self.device.save()
+        self.send_message(); delivery = NotificationDelivery.objects.get(device=self.device)
+        push.return_value = {'data':{'status':'ok','id':'ticket-123'}}
+        send_delivery(delivery); send_delivery(delivery)
+        self.assertEqual(push.call_count, 1)
+        delivery.refresh_from_db(); self.assertEqual(delivery.status, 'ACCEPTED')
+        delivery.available_at = timezone.now() - timedelta(seconds=1); delivery.save()
+        push.return_value = {'data':{'ticket-123':{'status':'error','details':{'error':'DeviceNotRegistered'}}}}
+        check_receipts()
+        self.device.refresh_from_db(); self.assertFalse(self.device.enabled)
+        delivery.refresh_from_db(); self.assertEqual(delivery.status, 'FAILED')
+
+    @patch('core.notification_delivery.expo_request', side_effect=TimeoutError)
+    def test_transient_push_failures_are_queued_for_retry(self, push):
+        from .models import NotificationDelivery
+        from .notification_delivery import send_delivery
+        self.device.transport = 'EXPO'; self.device.address = {'token':'ExpoPushToken[test-token-123]'}; self.device.save()
+        self.send_message(); delivery = NotificationDelivery.objects.get(device=self.device)
+        send_delivery(delivery); delivery.refresh_from_db()
+        self.assertEqual(delivery.status, 'PENDING'); self.assertEqual(delivery.attempts, 1)
+        self.assertGreater(delivery.available_at, timezone.now())
+
+    @patch('core.notification_delivery.expo_request')
+    def test_dispatch_rechecks_chat_presence_and_deleted_messages(self, push):
+        from .models import NotificationDelivery
+        from .notification_delivery import send_delivery
+        self.device.transport = 'EXPO'; self.device.address = {'token':'ExpoPushToken[test-token-123]'}; self.device.save()
+        self.send_message(); delivery = NotificationDelivery.objects.get(device=self.device)
+        UserPresence.objects.create(user=self.recipient, session_id=uuid4(), chats_open=True)
+        send_delivery(delivery); self.assertFalse(push.called)
+        UserPresence.objects.filter(user=self.recipient).delete()
+        message = self.send_message()
+        Message.objects.filter(pk=message['id']).update(deleted_for_everyone=True, body='')
+        send_delivery(NotificationDelivery.objects.get(message_id=message['id']))
+        self.assertFalse(push.called)
+
+    @patch('pywebpush.webpush')
+    def test_web_push_uses_encrypted_subscription_and_notification_target(self, push):
+        from .models import NotificationDelivery
+        from .notification_delivery import send_delivery
+        self.device.transport = 'WEB'; self.device.address = {'endpoint':'https://fcm.googleapis.com/fcm/send/test'}; self.device.save()
+        self.send_message(); delivery = NotificationDelivery.objects.get(device=self.device)
+        send_delivery(delivery)
+        payload = __import__('json').loads(push.call_args.kwargs['data'])
+        self.assertEqual(payload['conversation_id'], self.chat.id)
+        self.assertEqual(payload['recipient_id'], self.recipient.id)
+        self.assertEqual(push.call_args.kwargs['ttl'], 300)
+
+
+class EventGroupChatTests(TestCase):
+    def setUp(self):
+        self.host = User.objects.create_user('chat-host')
+        self.guest = User.objects.create_user('chat-guest')
+        self.other = User.objects.create_user('chat-other')
+        self.event = Event.objects.create(host=self.host, name='Coffee walk', description='Meet friends', location_name='Park', starts_at=timezone.now() + timedelta(hours=1), ends_at=timezone.now() + timedelta(hours=3))
+        self.client = APIClient()
+        self.client.force_authenticate(self.host)
+
+    def test_one_chat_includes_host_and_only_accepted_people(self):
+        chat = self.event.conversation
+        self.assertTrue(chat.is_group)
+        self.assertEqual(set(chat.participants.all()), {self.host})
+        attendance = Attendance.objects.create(event=self.event, user=self.guest)
+        Attendance.objects.create(event=self.event, user=self.other, status='INVITED')
+        self.client.force_authenticate(self.guest)
+        self.assertEqual(self.client.post(f'/api/events/{self.event.id}/chat/').status_code, 403)
+        self.assertEqual(self.client.get(f'/api/conversations/{chat.id}/').status_code, 404)
+        self.client.force_authenticate(self.host)
+        for _ in range(2):
+            response = self.client.post(f'/api/events/{self.event.id}/review-request/', {'attendance_id': attendance.id, 'decision': 'ACCEPTED'}, format='json')
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(Conversation.objects.filter(event=self.event).count(), 1)
+        self.assertEqual(set(chat.participants.all()), {self.host, self.guest})
+        self.client.force_authenticate(self.guest)
+        opened = self.client.post(f'/api/events/{self.event.id}/chat/')
+        self.assertEqual(opened.data['id'], chat.id)
+        self.assertEqual(opened.data['event_name'], self.event.name)
+        self.assertEqual(opened.data['event'], self.event.id)
+        self.assertTrue(opened.data['is_group'])
+        self.assertEqual(self.client.post('/api/messages/', {'conversation': chat.id, 'body': 'Hello everyone'}, format='json').status_code, 201)
+        self.client.force_authenticate(self.host)
+        self.assertEqual(self.client.get(f'/api/messages/?conversation={chat.id}').data['count'], 1)
+
+    def test_cancel_and_rejection_revoke_message_and_chat_access(self):
+        attendance = Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        chat = self.event.conversation
+        message = Message.objects.create(conversation=chat, sender=self.host, body='Private event plans')
+        for decision in ['CANCELLED', 'DENIED']:
+            attendance.status = 'ACCEPTED'; attendance.save()
+            self.client.force_authenticate(self.guest)
+            if decision == 'CANCELLED':
+                response = self.client.post(f'/api/events/{self.event.id}/cancel-rsvp/')
+            else:
+                self.client.force_authenticate(self.host)
+                response = self.client.post(f'/api/events/{self.event.id}/review-request/', {'attendance_id': attendance.id, 'decision': decision}, format='json')
+                self.client.force_authenticate(self.guest)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(self.client.get(f'/api/conversations/{chat.id}/').status_code, 404)
+            self.assertEqual(self.client.get(f'/api/messages/{message.id}/').status_code, 404)
+            self.assertEqual(self.client.get(f'/api/messages/?conversation={chat.id}').data['count'], 0)
+            self.assertEqual(self.client.post('/api/messages/', {'conversation': chat.id, 'body': 'Not allowed'}, format='json').status_code, 403)
+            self.assertEqual(set(chat.participants.all()), {self.host})
+
+    def test_host_invites_join_group_only_when_accepted(self):
+        self.event.privacy = 'PRIVATE'; self.event.save()
+        self.client.post(f'/api/events/{self.event.id}/invite/', {'user_id': self.guest.id}, format='json')
+        self.client.force_authenticate(self.guest)
+        self.assertEqual(self.client.post(f'/api/events/{self.event.id}/chat/').status_code, 403)
+        self.assertEqual(self.client.post(f'/api/events/{self.event.id}/join/').status_code, 201)
+        response = self.client.post(f'/api/events/{self.event.id}/chat/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({person['id'] for person in response.data['participants']}, {self.host.id, self.guest.id})
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.post(f'/api/events/{self.event.id}/chat/').status_code, 404)
+
+    def test_hide_reopen_rename_and_event_deletion(self):
+        chat = self.event.conversation
+        self.client.delete(f'/api/conversations/{chat.id}/')
+        self.assertEqual(self.client.get('/api/conversations/').data['count'], 0)
+        self.assertEqual(self.client.post(f'/api/events/{self.event.id}/chat/').data['id'], chat.id)
+        self.assertEqual(self.client.patch(f'/api/conversations/{chat.id}/', {'title': 'Different name'}, format='json').status_code, 400)
+        self.event.name = 'New adventure'; self.event.save()
+        self.assertEqual(self.client.get(f'/api/conversations/{chat.id}/').data['display_name'], 'New adventure')
+        Message.objects.create(conversation=chat, sender=self.host, body='Hello')
+        self.event.delete()
+        self.assertFalse(Conversation.objects.filter(pk=chat.pk).exists())
+        self.assertFalse(Message.objects.filter(conversation_id=chat.pk).exists())
+
+    def test_deleting_attendance_and_changing_host_sync_membership(self):
+        attendance = Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        chat = self.event.conversation
+        attendance.delete()
+        self.assertEqual(set(chat.participants.all()), {self.host})
+        self.event.host = self.other; self.event.save()
+        self.assertEqual(set(chat.participants.all()), {self.other})
+
+    def test_backfill_is_idempotent_and_keeps_existing_event_members(self):
+        from importlib import import_module
+        from types import SimpleNamespace
+        from django.apps import apps
+        Attendance.objects.create(event=self.event, user=self.guest, status='ACCEPTED')
+        Attendance.objects.create(event=self.event, user=self.other, status='PENDING')
+        Conversation.objects.filter(event=self.event).delete()
+        migrate = import_module('core.migrations.0016_event_group_chat').create_existing_event_chats
+        for _ in range(2):
+            migrate(apps, SimpleNamespace(connection=SimpleNamespace(alias='default')))
+        chat = Conversation.objects.get(event=self.event)
+        self.assertEqual(set(chat.participants.all()), {self.host, self.guest})
+        self.assertEqual(chat.created_at, self.event.created_at)

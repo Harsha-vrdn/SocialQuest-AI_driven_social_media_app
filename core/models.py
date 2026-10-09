@@ -3,6 +3,19 @@ from django.db import models
 from django.db.models import Sum
 from django.utils import timezone
 from datetime import timedelta
+from secrets import token_hex
+from uuid import uuid4
+
+
+def generate_auth_session_key():
+    return token_hex(20)
+
+
+class AuthSession(models.Model):
+    """One independently revocable API session for one signed-in client."""
+    key = models.CharField(max_length=40, primary_key=True, default=generate_auth_session_key, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="auth_sessions")
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class Profile(models.Model):
@@ -27,6 +40,7 @@ class UserPresence(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="presence_sessions")
     session_id = models.UUIDField()
     last_seen = models.DateTimeField(default=timezone.now, db_index=True)
+    chats_open = models.BooleanField(default=False)
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["user", "session_id"], name="unique_user_presence_session")]
@@ -78,9 +92,16 @@ class Event(models.Model):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # Keep each existing moment's original access boundary in sync while
+        # the event exists. The flag survives SET_NULL when an event is deleted.
+        self.moments.update(restricted_to_event=self.privacy == self.Privacy.PRIVATE)
+
 
 class Attendance(models.Model):
     class Status(models.TextChoices):
+        INVITED = "INVITED", "Invited"
         PENDING = "PENDING", "Pending"
         ACCEPTED = "ACCEPTED", "Accepted"
         DENIED = "DENIED", "Denied"
@@ -190,6 +211,7 @@ class Post(models.Model):
     author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="posts")
     event = models.ForeignKey(Event, blank=True, null=True, on_delete=models.SET_NULL, related_name="moments")
     quest = models.ForeignKey(Quest, blank=True, null=True, on_delete=models.SET_NULL, related_name="moment_posts")
+    restricted_to_event = models.BooleanField(default=False, editable=False)
     kind = models.CharField(max_length=4, choices=Kind.choices, default=Kind.POST)
     body = models.CharField(max_length=1200, blank=True)
     media = models.FileField(upload_to="posts/", blank=True, null=True)
@@ -198,6 +220,11 @@ class Post(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if self.event_id:
+            self.restricted_to_event = self.event.privacy == Event.Privacy.PRIVATE
+        super().save(*args, **kwargs)
 
 
 class PostLike(models.Model):
@@ -232,6 +259,7 @@ class PostShareClick(models.Model):
 class Comment(models.Model):
     post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="comments")
     author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="comments")
+    parent = models.ForeignKey("self", on_delete=models.CASCADE, related_name="replies", blank=True, null=True)
     body = models.CharField(max_length=500)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -240,6 +268,7 @@ class Comment(models.Model):
 
 
 class Conversation(models.Model):
+    event = models.OneToOneField(Event, on_delete=models.CASCADE, related_name="conversation", blank=True, null=True)
     participants = models.ManyToManyField(settings.AUTH_USER_MODEL, related_name="conversations")
     hidden_for = models.ManyToManyField(settings.AUTH_USER_MODEL, related_name="hidden_conversations", blank=True)
     is_group = models.BooleanField(default=False)
@@ -249,9 +278,10 @@ class Conversation(models.Model):
     # one-to-one conversations from being created for the same pair.
     direct_key = models.CharField(max_length=64, blank=True, null=True, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-created_at"]
+        ordering = ["-updated_at"]
 
 
 class Message(models.Model):
@@ -269,11 +299,14 @@ class Message(models.Model):
 
 class Notification(models.Model):
     class Kind(models.TextChoices):
+        EVENT_INVITE = "EVENT_INVITE", "Event invitation"
+        INVITE_ACCEPTED = "INVITE_ACCEPTED", "Invitation accepted"
         RSVP = "RSVP", "New RSVP"
         RSVP_ACCEPTED = "RSVP_ACCEPTED", "RSVP accepted"
         RSVP_DENIED = "RSVP_DENIED", "RSVP declined"
         MESSAGE = "MESSAGE", "New message"
         EVENT_ENDED = "EVENT_ENDED", "Event ended"
+        COMMENT_REPLY = "COMMENT_REPLY", "New comment reply"
 
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notifications")
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True, related_name="triggered_notifications")
@@ -281,6 +314,7 @@ class Notification(models.Model):
     attendance = models.ForeignKey(Attendance, on_delete=models.CASCADE, blank=True, null=True, related_name="notifications")
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, blank=True, null=True, related_name="notifications")
     message = models.ForeignKey(Message, on_delete=models.CASCADE, blank=True, null=True, related_name="notifications")
+    comment = models.ForeignKey(Comment, on_delete=models.CASCADE, blank=True, null=True, related_name="notifications")
     created_at = models.DateTimeField(auto_now_add=True)
     read_at = models.DateTimeField(blank=True, null=True)
 
@@ -289,4 +323,33 @@ class Notification(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["recipient", "attendance", "kind"], name="unique_attendance_notification"),
             models.UniqueConstraint(fields=["recipient", "message"], name="unique_message_notification"),
+            models.UniqueConstraint(fields=["recipient", "comment", "kind"], name="unique_comment_notification"),
+        ]
+
+
+class NotificationDevice(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notification_devices")
+    transport = models.CharField(max_length=8, choices=[("LOCAL", "In-app"), ("WEB", "Web Push"), ("EXPO", "Expo Push")])
+    address = models.JSONField(default=dict)
+    enabled = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class NotificationDelivery(models.Model):
+    device = models.ForeignKey(NotificationDevice, on_delete=models.CASCADE, related_name="deliveries")
+    notification = models.ForeignKey(Notification, on_delete=models.CASCADE, null=True, blank=True)
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, null=True, blank=True)
+    payload = models.JSONField()
+    status = models.CharField(max_length=12, default="PENDING", db_index=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    available_at = models.DateTimeField(default=timezone.now, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    receipt_id = models.CharField(max_length=128, blank=True)
+    last_error = models.CharField(max_length=80, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["device", "notification"], name="unique_notification_delivery"),
+            models.UniqueConstraint(fields=["device", "message"], name="unique_message_delivery"),
         ]

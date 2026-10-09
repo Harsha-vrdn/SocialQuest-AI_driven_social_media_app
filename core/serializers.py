@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import serializers
-from .media import compress_image_upload
+from .media import compress_image_upload, validate_media_upload
 from .models import (Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
                      Notification, Post, Profile, Quest, QuestSubmission, UserPresence)
 
@@ -14,7 +14,7 @@ class PublicUserSerializer(serializers.ModelSerializer):
     city = serializers.CharField(source="profile.city", read_only=True)
     avatar = serializers.ImageField(source="profile.avatar", read_only=True)
     xp = serializers.IntegerField(source="profile.total_xp", read_only=True)
-    karma = serializers.IntegerField(source="profile.karma", read_only=True)
+    karma = serializers.SerializerMethodField()
     follower_count = serializers.SerializerMethodField()
     following_count = serializers.SerializerMethodField()
     is_followed_by_me = serializers.SerializerMethodField()
@@ -24,14 +24,23 @@ class PublicUserSerializer(serializers.ModelSerializer):
         fields = ["id", "username", "display_name", "bio", "city", "avatar", "xp", "karma", "follower_count", "following_count", "is_followed_by_me"]
 
     def get_follower_count(self, obj):
+        if hasattr(obj, "follower_count_value"):
+            return obj.follower_count_value
         return obj.follower_relations.filter(follower__is_active=True).count()
 
     def get_following_count(self, obj):
+        if hasattr(obj, "following_count_value"):
+            return obj.following_count_value
         return obj.following_relations.filter(following__is_active=True).count()
 
     def get_is_followed_by_me(self, obj):
+        if hasattr(obj, "is_followed_value"):
+            return obj.is_followed_value
         request = self.context.get("request")
         return bool(request and request.user.is_authenticated and Follow.objects.filter(follower=request.user, following=obj).exists())
+
+    def get_karma(self, obj):
+        return obj.karma_value if hasattr(obj, "karma_value") else obj.profile.karma
 
 
 class EventSerializer(serializers.ModelSerializer):
@@ -65,24 +74,39 @@ class EventSerializer(serializers.ModelSerializer):
         if longitude is not None and not -180 <= longitude <= 180:
             raise serializers.ValidationError({"longitude": "Longitude must be between -180 and 180."})
         if attrs.get("cover_image"):
+            try:
+                validate_media_upload(attrs["cover_image"], "IMAGE")
+            except ValueError as error:
+                raise serializers.ValidationError({"cover_image": str(error)})
             attrs["cover_image"] = compress_image_upload(attrs["cover_image"])
         return attrs
 
     def get_accepted_count(self, obj):
+        if "attendances" in getattr(obj, "_prefetched_objects_cache", {}):
+            return sum(attendance.status == Attendance.Status.ACCEPTED for attendance in obj.attendances.all())
         return obj.attendances.filter(status=Attendance.Status.ACCEPTED).count()
 
     def get_pending_count(self, obj):
         request = self.context.get("request")
-        return obj.attendances.filter(status=Attendance.Status.PENDING).count() if request and request.user == obj.host else None
+        if not request or request.user != obj.host:
+            return None
+        if "attendances" in getattr(obj, "_prefetched_objects_cache", {}):
+            return sum(attendance.status == Attendance.Status.PENDING for attendance in obj.attendances.all())
+        return obj.attendances.filter(status=Attendance.Status.PENDING).count()
 
     def get_my_attendance_status(self, obj):
         request = self.context.get("request")
         if not request or not request.user.is_authenticated:
             return None
-        attendance = obj.attendances.filter(user=request.user).first()
+        if "attendances" in getattr(obj, "_prefetched_objects_cache", {}):
+            attendance = next((item for item in obj.attendances.all() if item.user_id == request.user.id), None)
+        else:
+            attendance = obj.attendances.filter(user=request.user).first()
         return attendance.status if attendance else None
 
     def get_has_quests(self, obj):
+        if "quests" in getattr(obj, "_prefetched_objects_cache", {}):
+            return any(quest.kind == Quest.Kind.MAIN for quest in obj.quests.all())
         return obj.quests.filter(kind=Quest.Kind.MAIN).exists()
 
     def get_quest_status(self, obj):
@@ -129,15 +153,14 @@ class QuestSubmissionSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         request = self.context.get("request")
         if request and QuestSubmission.objects.filter(quest=attrs.get("quest"), participant=request.user).exists():
-            raise serializers.ValidationError("You have already submitted proof for this quest.")
-        if attrs.get("media"):
-            if attrs["media"].size > 50 * 1024 * 1024:
-                raise serializers.ValidationError({"media": "Uploads must be smaller than 50 MB."})
-            content_type = getattr(attrs["media"], "content_type", "")
-            expected = "video/" if attrs.get("media_type") == "REEL" else "image/"
-            if not content_type.startswith(expected):
-                raise serializers.ValidationError({"media": "Choose a photo for image proof or a video for reel proof."})
-            attrs["media"] = compress_image_upload(attrs["media"])
+            raise serializers.ValidationError("Looks like you already snapped proof for this one — nice work! 🎉")
+        if not attrs.get("media"):
+            raise serializers.ValidationError({"media": "📸 Drop a photo (or reel) — no snap, no proof!"})
+        try:
+            validate_media_upload(attrs["media"], attrs.get("media_type"))
+        except ValueError as error:
+            raise serializers.ValidationError({"media": str(error)})
+        attrs["media"] = compress_image_upload(attrs["media"])
         return attrs
 
 
@@ -147,6 +170,10 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
         fields = ["display_name", "bio", "city", "avatar"]
 
     def validate_avatar(self, value):
+        try:
+            validate_media_upload(value, "IMAGE")
+        except ValueError as error:
+            raise serializers.ValidationError(str(error))
         return compress_image_upload(value)
 
 
@@ -180,16 +207,31 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 class CommentSerializer(serializers.ModelSerializer):
     author = PublicUserSerializer(read_only=True)
+    parent = serializers.PrimaryKeyRelatedField(queryset=Comment.objects.all(), required=False, allow_null=True)
 
     class Meta:
         model = Comment
-        fields = ["id", "post", "author", "body", "created_at"]
+        fields = ["id", "post", "parent", "author", "body", "created_at"]
         read_only_fields = ["author", "created_at"]
+
+    def validate(self, attrs):
+        parent = attrs.get("parent")
+        post = attrs.get("post", getattr(self.instance, "post", None))
+        if self.instance and "post" in attrs and post != self.instance.post:
+            raise serializers.ValidationError({"post": "A comment cannot be moved to another post."})
+        if self.instance and "parent" in attrs and parent != self.instance.parent:
+            raise serializers.ValidationError({"parent": "A reply cannot be moved to another comment."})
+        if parent and parent.post_id != getattr(post, "id", None):
+            raise serializers.ValidationError({"parent": "Replies must belong to a comment on the same post."})
+        if self.instance and parent and parent.id == self.instance.id:
+            raise serializers.ValidationError({"parent": "A comment cannot reply to itself."})
+        return attrs
 
 
 class PostSerializer(serializers.ModelSerializer):
     author = PublicUserSerializer(read_only=True)
     quest_title = serializers.SerializerMethodField()
+    event_name = serializers.SerializerMethodField()
     liked_by_me = serializers.SerializerMethodField()
     like_count = serializers.SerializerMethodField()
     comment_count = serializers.SerializerMethodField()
@@ -197,8 +239,8 @@ class PostSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Post
-        fields = ["id", "author", "event", "quest", "quest_title", "kind", "body", "media", "location_name", "created_at", "liked_by_me", "like_count", "comment_count", "recent_comments"]
-        read_only_fields = ["author", "quest", "quest_title", "created_at"]
+        fields = ["id", "author", "event", "event_name", "quest", "quest_title", "kind", "body", "media", "location_name", "created_at", "liked_by_me", "like_count", "comment_count", "recent_comments"]
+        read_only_fields = ["author", "event_name", "quest", "quest_title", "created_at"]
 
     def validate(self, attrs):
         current = self.instance
@@ -213,12 +255,11 @@ class PostSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("A quest moment must remain connected to its original event.")
         if attrs.get("media"):
             upload = attrs["media"]
-            content_type = getattr(upload, "content_type", "")
-            if upload.size > 50 * 1024 * 1024:
-                raise serializers.ValidationError({"media": "Uploads must be smaller than 50 MB."})
-            if not content_type.startswith(("image/", "video/")):
-                raise serializers.ValidationError({"media": "Choose an image or video file."})
-            if content_type.startswith("video/"):
+            try:
+                media_type = validate_media_upload(upload)
+            except ValueError as error:
+                raise serializers.ValidationError({"media": str(error)})
+            if media_type == "REEL":
                 attrs["kind"] = Post.Kind.REEL
             elif kind == Post.Kind.REEL:
                 raise serializers.ValidationError({"media": "A reel needs a video upload."})
@@ -230,17 +271,27 @@ class PostSerializer(serializers.ModelSerializer):
     def get_quest_title(self, obj):
         return obj.quest.title if obj.quest_id else ""
 
+    def get_event_name(self, obj):
+        return obj.event.name if obj.event_id else ""
+
     def get_liked_by_me(self, obj):
         request = self.context.get("request")
+        if request and request.user.is_authenticated and "likes" in getattr(obj, "_prefetched_objects_cache", {}):
+            return any(like.user_id == request.user.id for like in obj.likes.all())
         return bool(request and request.user.is_authenticated and obj.likes.filter(user=request.user).exists())
 
     def get_like_count(self, obj):
         return obj.likes.count()
 
     def get_comment_count(self, obj):
+        if hasattr(obj, "prefetched_comments"):
+            return len(obj.prefetched_comments)
         return obj.comments.count()
 
     def get_recent_comments(self, obj):
+        if hasattr(obj, "prefetched_comments"):
+            comments = obj.prefetched_comments[:2]
+            return CommentSerializer(comments, many=True, context=self.context).data
         return CommentSerializer(obj.comments.select_related("author", "author__profile").order_by("-created_at")[:2], many=True, context=self.context).data
 
 
@@ -266,19 +317,24 @@ class ChatParticipantSerializer(PublicUserSerializer):
 
 class PresenceSerializer(serializers.Serializer):
     session_id = serializers.UUIDField()
+    chats_open = serializers.BooleanField(default=False)
 
 
 class ConversationSerializer(serializers.ModelSerializer):
+    event_name = serializers.CharField(source="event.name", read_only=True, default="")
     participants = ChatParticipantSerializer(many=True, read_only=True)
     latest_message = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ["id", "participants", "is_group", "title", "created_at", "display_name", "latest_message"]
-        read_only_fields = ["participants", "is_group", "created_at"]
+        fields = ["id", "event", "event_name", "participants", "is_group", "title", "created_at", "updated_at", "display_name", "latest_message"]
+        read_only_fields = ["event", "participants", "is_group", "created_at", "updated_at"]
 
     def get_latest_message(self, obj):
+        if hasattr(obj, "visible_messages"):
+            message = max(obj.visible_messages, key=lambda item: item.created_at, default=None)
+            return MessageSerializer(message, context=self.context).data if message else None
         messages = obj.messages.select_related("sender", "sender__profile")
         request = self.context.get("request")
         if request and request.user.is_authenticated:
@@ -287,10 +343,15 @@ class ConversationSerializer(serializers.ModelSerializer):
         return MessageSerializer(message, context=self.context).data if message else None
 
     def get_display_name(self, obj):
+        if obj.event_id:
+            return obj.event.name
         if obj.title:
             return obj.title
         request = self.context.get("request")
-        other_people = obj.participants.exclude(id=getattr(request.user, "id", None)) if request else obj.participants.all()
+        if "participants" in getattr(obj, "_prefetched_objects_cache", {}):
+            other_people = [person for person in obj.participants.all() if person.id != getattr(getattr(request, "user", None), "id", None)]
+        else:
+            other_people = obj.participants.exclude(id=getattr(request.user, "id", None)) if request else obj.participants.all()
         return ", ".join(person.profile.display_name or person.username for person in other_people) or "Just you"
 
 
@@ -299,11 +360,12 @@ class NotificationSerializer(serializers.ModelSerializer):
     text = serializers.SerializerMethodField()
     event = serializers.SerializerMethodField()
     conversation_id = serializers.IntegerField(source="conversation.id", read_only=True)
+    comment_post_id = serializers.IntegerField(source="comment.post.id", read_only=True)
     is_read = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
-        fields = ["id", "kind", "actor", "text", "event", "conversation_id", "created_at", "is_read"]
+        fields = ["id", "kind", "actor", "text", "event", "conversation_id", "comment_post_id", "created_at", "is_read"]
 
     def get_event(self, obj):
         if not obj.attendance:
@@ -316,6 +378,10 @@ class NotificationSerializer(serializers.ModelSerializer):
 
     def get_text(self, obj):
         actor_name = obj.actor.profile.display_name or obj.actor.username if obj.actor else "Someone"
+        if obj.kind == Notification.Kind.EVENT_INVITE and obj.attendance:
+            return actor_name + " invited you to " + obj.attendance.event.name + "."
+        if obj.kind == Notification.Kind.INVITE_ACCEPTED and obj.attendance:
+            return actor_name + " accepted your invitation to " + obj.attendance.event.name + "."
         if obj.kind == Notification.Kind.RSVP and obj.attendance:
             return actor_name + " wants to join " + obj.attendance.event.name + "."
         if obj.kind == Notification.Kind.RSVP_ACCEPTED and obj.attendance:
@@ -323,7 +389,12 @@ class NotificationSerializer(serializers.ModelSerializer):
         if obj.kind == Notification.Kind.RSVP_DENIED and obj.attendance:
             return actor_name + " declined your RSVP for " + obj.attendance.event.name + "."
         if obj.kind == Notification.Kind.MESSAGE and obj.message:
+            if obj.message.deleted_for_everyone:
+                return actor_name + ": Message deleted"
             return actor_name + ": " + obj.message.body
         if obj.kind == Notification.Kind.EVENT_ENDED and obj.attendance:
             return obj.attendance.event.name + " has ended. Rate the people who attended."
+        if obj.kind == Notification.Kind.COMMENT_REPLY and obj.comment:
+            action = "replied to your comment" if obj.comment.parent_id else "commented on your post"
+            return actor_name + " " + action + ": " + obj.comment.body
         return "You have a new SocialQuest update."

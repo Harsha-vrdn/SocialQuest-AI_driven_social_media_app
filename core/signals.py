@@ -2,7 +2,28 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
-from .models import Event, Post, Profile, QuestSubmission
+from .models import Attendance, Event, Notification, Post, Profile, QuestSubmission
+
+
+@receiver(post_save, sender=Event)
+@receiver(post_save, sender=Attendance)
+def update_event_chat(sender, instance, raw=False, **kwargs):
+    if not raw:
+        from .event_chat import sync_event_conversation
+        sync_event_conversation(instance.pk if sender is Event else instance.event_id)
+
+
+@receiver(post_delete, sender=Attendance)
+def remove_event_chat_attendee(sender, instance, **kwargs):
+    from .event_chat import sync_event_conversation
+    sync_event_conversation(instance.event_id, create=False)
+
+
+@receiver(post_save, sender=Notification)
+def queue_device_notification(sender, instance, created, raw=False, **kwargs):
+    if created and not raw and instance.kind != Notification.Kind.MESSAGE:
+        from .notification_delivery import queue_notification
+        queue_notification(instance)
 
 
 @receiver(post_save, sender=get_user_model())

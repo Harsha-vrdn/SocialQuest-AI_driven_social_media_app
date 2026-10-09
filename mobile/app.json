@@ -25,10 +25,11 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "SocialQuest uses your location only when you choose to find nearby events or tag a post with your current place."
+          "locationWhenInUsePermission": "SocialQuest uses your location to suggest a venue when you host, find nearby events, or tag a post. You can also enter a place manually."
         }
       ],
       "expo-font",
+      "expo-secure-store",
       "expo-asset",
       [
         "expo-status-bar",
@@ -42,6 +43,13 @@
         {
           "style": "light",
           "enforceContrast": false
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "activity",
+          "color": "#9a65ff"
         }
       ]
     ],

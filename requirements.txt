@@ -5,3 +5,4 @@ Pillow>=11.0
 langchain>=0.3
 langchain-openai>=0.2
 python-dotenv>=1.0
+pywebpush>=2,<3

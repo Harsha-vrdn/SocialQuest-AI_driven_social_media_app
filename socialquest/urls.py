@@ -6,6 +6,7 @@ from django.views.generic import TemplateView
 from core.views import shared_post_link
 
 urlpatterns = [
+    path("notification-worker.js", TemplateView.as_view(template_name="notification-worker.js", content_type="application/javascript")),
     path("admin/", admin.site.urls),
     path("api/", include("core.urls")),
     path("s/post/<int:post_id>/", shared_post_link, name="shared-post"),
