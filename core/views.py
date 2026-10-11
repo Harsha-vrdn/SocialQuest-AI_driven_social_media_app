@@ -13,10 +13,12 @@ from rest_framework.generics import get_object_or_404 as get_api_object_or_404
 from rest_framework.response import Response
 from .ai import generate_quests, generate_side_quests
 from .authentication import SessionTokenAuthentication
-from .models import (AuthSession, Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
+from .models import (AuthSession, Attendance, Comment, Conversation, ConversationReadState, Event, Follow, KarmaRating, Message,
                      Notification, NotificationDevice, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission, UserPresence)
 from .permissions import IsHostOrReadOnly, visible_events, visible_posts
 from .recommendations import rank_events, rank_posts
+from .search import EVENT_FIELDS, PEOPLE_FIELDS, ranked_search
+from .chat_reads import with_unread_counts
 from .serializers import (AttendanceSerializer, EventSerializer, KarmaRatingSerializer,
                           CommentSerializer, ConversationSerializer, MessageSerializer,
                           NotificationSerializer, PostSerializer, PublicUserSerializer, QuestSerializer,
@@ -125,13 +127,7 @@ class EventViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(ends_at__gt=timezone.now())
         query = self.request.query_params.get("q", "").strip()[:100]
         if query:
-            queryset = queryset.filter(
-                Q(name__icontains=query)
-                | Q(description__icontains=query)
-                | Q(location_name__icontains=query)
-                | Q(host__username__icontains=query)
-                | Q(host__profile__display_name__icontains=query)
-            )
+            return ranked_search(queryset, query, EVENT_FIELDS, ("starts_at",))
         return queryset.order_by("starts_at")
 
     def perform_create(self, serializer):
@@ -441,15 +437,13 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        queryset = with_public_user_stats(User.objects.filter(is_active=True), self.request.user)
-        query = self.request.query_params.get("q", "").strip()[:100].lstrip("@")
+        queryset = User.objects.filter(is_active=True)
+        query = self.request.query_params.get("q", "").strip()[:100]
         if query:
-            queryset = queryset.filter(
-                Q(username__icontains=query)
-                | Q(profile__display_name__icontains=query)
-                | Q(profile__city__icontains=query)
-            )
-        return queryset.order_by("username")
+            queryset = ranked_search(queryset, query, PEOPLE_FIELDS, ("username",))
+        else:
+            queryset = queryset.order_by("username")
+        return with_public_user_stats(queryset, self.request.user)
 
     @action(detail=False, methods=["get", "patch"], permission_classes=[permissions.IsAuthenticated])
     def me(self, request):
@@ -644,7 +638,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         participants = with_public_user_stats(User.objects.all(), self.request.user).prefetch_related("presence_sessions")
         visible_messages = Message.objects.exclude(hidden_for=self.request.user).select_related("sender", "sender__profile")
-        return Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user).select_related("event").prefetch_related(
+        return with_unread_counts(Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user), self.request.user).select_related("event").prefetch_related(
             Prefetch("participants", queryset=participants),
             Prefetch("messages", queryset=visible_messages, to_attr="visible_messages"),
         ).order_by("-updated_at")
@@ -661,6 +655,20 @@ class ConversationViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """Removing a chat only hides it for the requesting participant."""
         instance.hidden_for.add(self.request.user)
+
+    @action(detail=True, methods=["post"], url_path="mark-read")
+    def mark_read(self, request, pk=None):
+        conversation = self.get_object()
+        message_id = request.data.get("message_id")
+        if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
+            raise ValidationError({"message_id": "Provide the ID of the last displayed message."})
+        get_api_object_or_404(conversation.messages.exclude(hidden_for=request.user), pk=message_id)
+        with transaction.atomic():
+            read_state, _ = ConversationReadState.objects.get_or_create(conversation=conversation, user=request.user)
+            # The conditional update cannot move a cursor backwards when devices race.
+            ConversationReadState.objects.filter(pk=read_state.pk, last_read_message_id__lt=message_id).update(last_read_message_id=message_id)
+        current = with_unread_counts(Conversation.objects.filter(pk=conversation.pk), request.user).get()
+        return Response({"unread_count": current.unread_count, "read_through_message_id": current.read_through_message_id})
 
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def direct(self, request):

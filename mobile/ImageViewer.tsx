@@ -1,13 +1,18 @@
+import {useTheme} from './ThemeProvider';
+import {createThemedStyles} from './themedStyles';
 import {useEffect, useRef, useState} from 'react';
-import {Animated, Image, PanResponder, PixelRatio, StyleSheet, Text, View, type GestureResponderEvent} from 'react-native';
+import {Animated, Image, PanResponder, PixelRatio, Text, View, type GestureResponderEvent} from 'react-native';
 import {Ionicons} from '@expo/vector-icons';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {MotionModal, SoftPressable as Pressable} from './Motion';
-import {colors, fonts} from './theme';
+import {fonts} from './theme';
 import {boundTransform, imageRenderLayout, focalZoom, type Point, type Transform} from './imageZoom';
 
 const initial: Transform = {scale: 1, x: 0, y: 0};
 export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) {
+  const {theme} = useTheme();
+  const {colors} = theme;
+  const s = getStyles(theme);
   const insets = useSafeAreaInsets();
   const frame = useRef<View>(null);
   const viewport = useRef({width: 0, height: 0, pageX: 0, pageY: 0});
@@ -106,7 +111,7 @@ export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) 
           <Image key={uri + ':' + attempt} source={{uri, width: sourceSize.current.width, height: sourceSize.current.height, scale: 1}} style={s.image} resizeMode="contain" resizeMethod="resize" accessibilityLabel="Expanded photo"
             onLoad={() => {setLoading(false); setFailed(false);}} onError={() => {setLoading(false); setFailed(true);}} />
         </Animated.View> : null}
-        {loading || failed ? <View pointerEvents="none" style={s.status}><Text style={s.hint}>{failed ? 'This photo could not be loaded.' : 'Loading photo…'}</Text></View> : null}
+        {loading || failed ? <View pointerEvents="none" style={s.status}><Text style={[s.hint, {color: colors.onMedia}]}>{failed ? 'This photo could not be loaded.' : 'Loading photo…'}</Text></View> : null}
       </View>
       <View style={s.footer}>{failed ? <Pressable accessibilityRole="button" accessibilityLabel="Retry loading photo" style={s.reset} onPress={() => setAttempt(current => current + 1)}><Text style={s.label}>Try again</Text></Pressable> : null}<Text style={s.hint}>Pinch or double-tap to zoom · Drag to explore</Text><View style={s.controls}>
         <Pressable accessibilityRole="button" accessibilityLabel="Zoom out" disabled={percent <= 100 || loading || failed} style={[s.button, percent <= 100 && s.dim]} onPress={() => zoom(value.current.scale / 1.5)}><Ionicons name="remove" size={23} color={colors.text} /></Pressable>
@@ -117,18 +122,18 @@ export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) 
   </MotionModal>;
 }
 
-const s = StyleSheet.create({
+const getStyles = createThemedStyles(({colors}) => ({
   screen: {flex: 1, backgroundColor: colors.background},
-  header: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 10},
-  title: {fontFamily: fonts.heading, fontSize: 15, color: colors.text},
-  viewport: {flex: 1, overflow: 'hidden', alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background},
+  header: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 12},
+  title: {fontFamily: fonts.heading, fontSize: 16, color: colors.text},
+  viewport: {flex: 1, overflow: 'hidden', alignItems: 'center', justifyContent: 'center', backgroundColor: colors.mediaBackground},
   image: {width: '100%', height: '100%'},
   status: {position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, alignItems: 'center', justifyContent: 'center', padding: 32},
   footer: {padding: 16, gap: 12},
-  hint: {fontFamily: fonts.copy, fontSize: 14, lineHeight: 21, color: colors.muted, textAlign: 'center'},
-  controls: {flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 14},
-  button: {width: 46, height: 46, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.surface},
-  reset: {minHeight: 46, minWidth: 128, justifyContent: 'center', alignItems: 'center', borderRadius: 16, backgroundColor: colors.accentSoft},
-  label: {fontFamily: fonts.bold, fontSize: 15, color: colors.accent},
+  hint: {fontFamily: fonts.copy, fontSize: 14, lineHeight: 20, color: colors.muted, textAlign: 'center'},
+  controls: {flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 16},
+  button: {width: 44, height: 44, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.surface},
+  reset: {minHeight: 44, minWidth: 128, justifyContent: 'center', alignItems: 'center', borderRadius: 16, backgroundColor: colors.accentSoft},
+  label: {fontFamily: fonts.bold, fontSize: 14, color: colors.accent},
   dim: {opacity: 0.4},
-});
+}));

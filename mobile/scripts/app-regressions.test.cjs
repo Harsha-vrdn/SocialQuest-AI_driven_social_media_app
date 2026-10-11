@@ -379,6 +379,7 @@ function hostLocationContext() {
   const response = deferred();
   const context = {
     eventEditorVersion: {current: 1}, eventLocationRequest: {current: 0},
+    Platform: {OS: 'android'}, Keyboard: {dismiss: noop}, setEventEditorClosing: noop,
     locateHostVenue: () => response.promise,
     setEventEditor: value => {state.editor = typeof value === 'function' ? value(state.editor) : value;},
     setEventDateField: noop,
@@ -608,6 +609,7 @@ test('opening the event group reuses its returned chat and prevents duplicate ta
 test('chat refresh removes an open event chat when the member loses access', async () => {
   let active = {id: 9, event: 7};
   const context = {rows, api: async () => [{id: 2}], setConversations: noop,
+    chatRequestVersion: {current: 0}, chatReadVersion: {current: 0}, chatReadCursors: {current: new Map()},
     setActiveChat: update => {active = update(active);}};
   await nativeFunction('loadChats', context)();
   assert.equal(active, null);
@@ -623,7 +625,7 @@ test('empty cards preserve caller styles and measurement props', () => {
   const onLayout = () => {measured = true;};
   const Empty = vm.runInNewContext(source, {
     React: {createElement: (type, props, ...children) => ({type, props, children})},
-    View: 'View', Text: 'Text', activeStyles: {empty: baseStyle},
+    View: 'View', Text: 'Text', useTheme: () => ({theme: {colors: {}}}), getAppStyles: () => ({empty: baseStyle}),
   });
   const card = Empty({icon: '✦', title: 'This is a new conversation.', body: 'Say hello', style: callerStyle, onLayout});
   assert.equal(card.props.style[0], baseStyle);
@@ -657,9 +659,10 @@ test('upright chats follow new messages without interrupting someone reading his
   }};
   vm.runInNewContext(code, context);
   let data = [{id: 10, sender: {id: 1}}, {id: 11, sender: {id: 2}}];
+  const read = [];
   const render = () => {
     cursor = 0;
-    const list = context.exports.MessageList({data, currentUserId: 1});
+    const list = context.exports.MessageList({data, currentUserId: 1, onReadThrough: id => read.push(id)});
     list.props.ref.current = {scrollToEnd: () => scrolls++};
     effects.splice(0).forEach(effect => effect());
     assert.equal(list.props.inverted, false);
@@ -668,6 +671,10 @@ test('upright chats follow new messages without interrupting someone reading his
   };
   const position = y => ({nativeEvent: {contentSize: {height: 1200}, contentOffset: {y}, layoutMeasurement: {height: 300}}});
   let props = render(); assert.equal(scrolls, 1);
+  assert.equal(read.length, 0, 'Loading messages is not a read receipt');
+  props.onViewableItemsChanged({viewableItems: [{isViewable:true, item:data[0]}, {isViewable:false, item:data[1]}]});
+  assert.deepEqual(read, [10]);
+  assert.equal(props.viewabilityConfig.minimumViewTime, 250);
   props.onScroll(position(0)); props.onContentSizeChange(); assert.equal(scrolls, 2);
   props.onScrollBeginDrag(); props.onScroll(position(0)); props.onScrollEndDrag(position(0));
   props.onLayout(); assert.equal(scrolls, 2);
@@ -721,7 +728,7 @@ function imageViewerHarness() {
     Animated: {View: 'Animated.View', Value: class {setValue() {}}, multiply: (value, factor) => ({value, factor})},
     PanResponder: {create: () => ({panHandlers: {}})},
     Image, MotionModal: 'Modal', View: 'View', Text: 'Text', Pressable: 'Pressable', Ionicons: 'Icon',
-    s: {}, colors: {},
+    useTheme: () => ({theme: {colors: {}}}), getStyles: () => ({}),
   });
   function all(node, predicate) {
     if (!node || typeof node !== 'object') return [];
@@ -733,6 +740,101 @@ function imageViewerHarness() {
     byLabel: label => all(rendered, node => node.props?.accessibilityLabel === label)[0],
     measure: () => all(rendered, node => !!node.props?.onLayout)[0].props.onLayout({nativeEvent: {layout: {width: 390, height: 620, x: 0, y: 0}}})};
 }
+
+test('native unread chat refresh ignores snapshots predating a read or a newer refresh', async () => {
+  const first = deferred(), latest = deferred(); let calls = 0, chats = [];
+  const context = {rows, chatRequestVersion:{current:0}, chatReadVersion:{current:0}, chatReadCursors:{current:new Map()},
+    api: () => ++calls === 1 ? first.promise : latest.promise, setConversations:value => {chats=value;}, setActiveChat:noop};
+  const refresh = nativeFunction('loadChats', context);
+  const old = refresh(), next = refresh();
+  latest.resolve([{id:1,unread_count:0,read_through_message_id:8}]); await next;
+  first.resolve([{id:1,unread_count:4,read_through_message_id:0}]); await old;
+  assert.equal(chats[0].unread_count, 0);
+  const pending = deferred(); context.api=()=>pending.promise;
+  const beforeRead = refresh(); context.chatReadVersion.current++;
+  pending.resolve([{id:1,unread_count:3}]); await beforeRead;
+  assert.equal(chats[0].unread_count, 0);
+});
+
+test('native read receipts are foreground-only, scoped, and retryable after failure', async () => {
+  let chats=[{id:2,unread_count:3}], writes=0, fail=true;
+  const context = {activeChatId:{current:2},currentTab:{current:'Chats'},AppState:{currentState:'background'},
+    visibleChatMessage:{current:{chatId:0,messageId:0}},chatReadCursors:{current:new Map()},chatReadRequests:{current:new Set()},chatReadVersion:{current:0},
+    api:async (url,options)=>{writes++; assert.equal(url,'/conversations/2/mark-read/'); assert.equal(JSON.parse(options.body).message_id,9); if(fail)throw Error('Offline'); return {unread_count:1,read_through_message_id:9};},
+    setConversations:update=>{chats=update(chats);},setActiveChat:noop,loadChats:async()=>{}};
+  context.markChatRead=nativeFunction('markChatRead',context);
+  await context.markChatRead(2,9); assert.equal(writes,0);
+  context.AppState.currentState='active'; await context.markChatRead(3,9); assert.equal(writes,0);
+  await context.markChatRead(2,9); assert.equal(chats[0].unread_count,3); assert.equal(context.chatReadRequests.current.size,0);
+  fail=false; await context.markChatRead(2,9); assert.equal(chats[0].unread_count,1);
+  await context.markChatRead(2,9); assert.equal(writes,2,'Acknowledged messages are not written repeatedly');
+});
+
+test('native notification mark-all does not clear a notification that arrived during the request', async () => {
+  const pending=deferred(); let notifications=[{id:1,is_read:false}];
+  const context={notifications,notificationRequestVersion:{current:0},api:()=>pending.promise,
+    setNotifications:update=>{notifications=update(notifications);},Alert:{alert:()=>assert.fail('Unexpected failure')}};
+  const mark=nativeFunction('markNotificationsRead',context)();
+  notifications.push({id:2,is_read:false});pending.resolve({});await mark;
+  assert.equal(notifications[0].is_read,true);assert.equal(notifications[1].is_read,false);
+});
+
+test('web unread badges count messages, hide zero, and preserve exact accessible counts above 99', () => {
+  const nodes=[{setAttribute(key,value){this[key]=value;}}];
+  const context={state:{conversations:[{id:1,unread_count:105}],activeConversation:null},unreadMessages:()=>105,
+    document:{querySelectorAll:()=>nodes,querySelector:()=>null}};
+  webFunction('syncChatBadges',context)();
+  assert.equal(nodes[0].textContent,'99+');assert.equal(nodes[0]['aria-label'],'105 unread messages');assert.equal(nodes[0].hidden,false);
+  context.unreadMessages=()=>0;webFunction('syncChatBadges',context)();assert.equal(nodes[0].hidden,true);
+});
+
+test('web only marks messages visible in the active foreground thread', () => {
+  const read=[], messages=[
+    {dataset:{messageId:'8'},getBoundingClientRect:()=>({top:10,bottom:90,height:80})},
+    {dataset:{messageId:'9'},getBoundingClientRect:()=>({top:300,bottom:380,height:80})},
+  ];
+  const holder={getBoundingClientRect:()=>({top:0,bottom:200,height:200}),querySelectorAll:()=>messages};
+  const context={state:{currentView:'chats',activeConversation:2},document:{hidden:false,querySelector:()=>holder},markConversationRead:(...args)=>read.push(args)};
+  const mark=webFunction('markVisibleMessagesRead',context);
+  mark(2,holder);assert.deepEqual(read,[[2,8]]);
+  context.document.hidden=true;mark(2,holder);context.document.hidden=false;mark(3,holder);
+  assert.equal(read.length,1);
+});
+
+test('web unread conversation markup highlights rows and escapes names', () => {
+  const context={state:{user:{id:1},activeConversation:null},escapeHtml:value=>String(value).replaceAll('<','&lt;'),
+    avatar:()=>'',onlineMarkup:()=>'',when:()=>'',unreadBadge:count=>count?`<b>${count}</b>`:''};
+  const markup=webFunction('conversationMarkup',context);
+  const chat={id:1,participants:[{id:2}],display_name:'<Maya>',unread_count:3};
+  const unread=markup(chat);assert.match(unread,/conversation  unread/);assert.match(unread,/3 unread messages/);assert.match(unread,/&lt;Maya>/);
+  assert.doesNotMatch(markup({...chat,unread_count:0}),/conversation  unread/);
+});
+
+test('opening the web notifications list does not mark anything read', async () => {
+  const requests=[],counts=[],holder={innerHTML:'',querySelector:()=>null};
+  const context={notificationReadVersion:0,rows,document:{querySelector:()=>holder},
+    api:async url=>{requests.push(url);return [{id:1,is_read:false},{id:2,is_read:true}];},
+    notificationMarkup:item=>item.is_read?'read':'unread',syncNotificationBadges:count=>counts.push(count)};
+  await webFunction('refreshNotificationsList',context)();
+  assert.deepEqual(requests,['/notifications/']);assert.deepEqual(counts,[1]);assert.match(holder.innerHTML,/unread/);
+});
+
+test('web message refresh never marks or renders a thread left during loading', async () => {
+  const pending=deferred(), holder={dataset:{},innerHTML:'Old thread'};let reads=0;
+  const context={rows,state:{currentView:'chats',activeConversation:2},document:{hidden:false,querySelector:()=>holder},
+    api:()=>pending.promise,markVisibleMessagesRead:()=>reads++,messageMarkup:()=>'<div>New</div>'};
+  const refresh=webFunction('refreshMessageList',context)(2);context.state.activeConversation=3;
+  pending.resolve([{id:7}]);await refresh;
+  assert.equal(holder.innerHTML,'Old thread');assert.equal(reads,0);
+});
+
+test('web keeps scroll position and only acknowledges visible messages when new messages arrive', async () => {
+  const holder={dataset:{loaded:'true'},innerHTML:'',scrollHeight:1000,clientHeight:200,scrollTop:100};let checked;
+  const context={rows,state:{currentView:'chats',activeConversation:2},document:{hidden:false,querySelector:()=>holder},api:async()=>[{id:7}],
+    markVisibleMessagesRead:(id,node)=>{checked=node;},messageMarkup:()=>'<div>New</div>'};
+  await webFunction('refreshMessageList',context)(2);
+  assert.equal(holder.scrollTop,100);assert.equal(checked,holder);
+});
 
 test('viewer waits for dimensions and never treats a downsampled load event as the original size', () => {
   const viewer = imageViewerHarness();
@@ -804,6 +906,8 @@ function eventPickerHarness(props) {
     compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX},
   }).outputText;
   let cursor = 0, rendered, canceled = false;
+  const {themes} = pureModule('theme.ts');
+  let theme = themes.light;
   const slots = [], saved = [];
   const jsx = (type, props) => ({type, props});
   const context = {exports: {}, require: name => {
@@ -816,6 +920,8 @@ function eventPickerHarness(props) {
     if (name === '@expo/vector-icons') return {Ionicons: 'Icon'};
     if (name === 'react-native-safe-area-context') return {useSafeAreaInsets: () => ({top: 0, bottom: 0})};
     if (name === './Motion') return {SoftPressable: 'Pressable'};
+    if (name === './ThemeProvider') return {useTheme: () => ({theme})};
+    if (name === './themedStyles') return {createThemedStyles: factory => factory};
     if (name === './theme') return pureModule('theme.ts');
     if (name === './eventDateTime') return pureModule('eventDateTime.ts');
     throw Error('Unexpected import: ' + name);
@@ -830,6 +936,7 @@ function eventPickerHarness(props) {
   const byLabel = label => {const node = all(rendered).find(node => node.props?.accessibilityLabel === label || node.props?.accessibilityLabel === label + ', today'); assert.ok(node, label); return node.props;};
   render();
   return {render, saved, canceled: () => canceled, byLabel,
+    switchTheme: scheme => {theme = themes[scheme]; render();},
     press: label => {const control = byLabel(label); assert.ok(!control.disabled); control.onPress(); render();},
     errors: () => all(rendered).filter(node => node.props?.accessibilityRole === 'alert').map(node => node.props.children),
   };
@@ -852,6 +959,18 @@ test('canceling a calendar draft does not change the saved schedule, and edits r
   assert.equal(canceled.canceled(), true); assert.equal(canceled.saved.length, 0);
 });
 
+test('switching appearance keeps an open calendar and its unsaved date and time', () => {
+  const picker = eventPickerHarness();
+  picker.press('Next month'); picker.press('AM'); picker.press('45 minutes');
+  const day = new Date(2026, 10, 21).toLocaleDateString('en', {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'});
+  picker.press(day);
+  picker.switchTheme('dark');
+  assert.equal(picker.byLabel(day).accessibilityState.selected, true);
+  picker.switchTheme('light');
+  picker.press('Confirm date and time');
+  assert.equal(picker.saved[0], '2026-11-21T01:45');
+});
+
 test('end picker disables earlier dates and rejects an equal or earlier time', () => {
   const picker = eventPickerHarness({label: 'End time', value: '2026-10-10T13:00', minimum: '2026-10-10T13:00'});
   const yesterday = new Date(2026, 9, 9).toLocaleDateString('en', {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'});
@@ -860,4 +979,198 @@ test('end picker disables earlier dates and rejects an equal or earlier time', (
   picker.press('AM'); picker.press('Confirm date and time'); assert.equal(picker.saved.length, 0);
   picker.press('PM'); picker.press('2 PM'); picker.press('Confirm date and time');
   assert.equal(picker.saved[0], '2026-10-10T14:00');
+});
+
+function searchContext(api) {
+  const exploreSearch = {version: 0, items: [], count: 0, page: 0, more: false, loading: false, error: ''};
+  const state = {currentView: 'explore', viewVersion: 1, exploreKind: 'events', exploreQuery: 'coffee', nearby: null};
+  const context = {state, exploreSearch, api, rows, AbortController, encodeURIComponent, clearTimeout,
+    renderSearchResults: () => {}, cancelExploreSearch: () => {exploreSearch.version++; exploreSearch.controller?.abort();}};
+  return {state, exploreSearch, request: webFunction('requestExploreSearch', context)};
+}
+
+test('search switches categories without allowing late events to replace people', async () => {
+  const events = deferred(), people = deferred(), calls = [];
+  const search = searchContext((path, options) => {calls.push({path, options}); return path.startsWith('/events/') ? events.promise : people.promise;});
+  const first = search.request();
+  search.state.exploreKind = 'people';
+  const second = search.request();
+  people.resolve({results: [{id: 2}], count: 1, next: null}); await second;
+  events.resolve({results: [{id: 1}], count: 1, next: null}); await first;
+  assert.deepEqual(Array.from(search.exploreSearch.items, item => item.id), [2]);
+  assert.equal(calls[0].options.signal.aborted, true);
+  assert.equal(calls[1].options.singlePage, true);
+  assert.equal(search.state.exploreQuery, 'coffee');
+});
+
+test('a newer search ignores an old failure and preserves its count', async () => {
+  const old = deferred(), latest = deferred();
+  const search = searchContext(path => path.includes('coffee') ? old.promise : latest.promise);
+  const first = search.request(); search.state.exploreQuery = 'maya'; const second = search.request();
+  latest.resolve({results: [{id: 9}], count: 1}); await second;
+  old.reject(Error('Old request failed')); await first;
+  assert.equal(search.exploreSearch.error, ''); assert.equal(search.exploreSearch.count, 1);
+  assert.equal(search.exploreSearch.items[0].id, 9);
+});
+
+test('leaving search discards its outstanding response', async () => {
+  const pending = deferred(); const search = searchContext(() => pending.promise);
+  const request = search.request(); search.state.currentView = 'profile'; search.state.viewVersion++;
+  pending.resolve({results: [{id: 9}], count: 1}); await request;
+  assert.equal(search.exploreSearch.items.length, 0);
+});
+
+test('search pagination retains results on failure, retries the same page, and prevents double loads', async () => {
+  let calls = 0; const pending = deferred();
+  const search = searchContext(async path => {
+    calls++;
+    if (calls === 1) return {results: [{id: 1}], count: 2, next: '/api/events/?q=coffee&page=2'};
+    assert.match(path, /page=2/);
+    if (calls === 2) throw Error('Offline');
+    return pending.promise;
+  });
+  await search.request(); await search.request(true);
+  assert.equal(search.exploreSearch.items[0].id, 1); assert.equal(search.exploreSearch.error, 'Offline');
+  const retry = search.request(true); await search.request(true);
+  assert.equal(calls, 3); pending.resolve({results: [{id: 2}], count: 2, next: null}); await retry;
+  assert.deepEqual(Array.from(search.exploreSearch.items, item => item.id), [1, 2]);
+  assert.equal(search.exploreSearch.more, false); assert.equal(search.exploreSearch.error, '');
+});
+
+function nativeSearchContext() {
+  const tree = ts.createSourceFile('DiscoverSearch.tsx', fs.readFileSync(path.join(root, 'mobile/DiscoverSearch.tsx'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const node = find(tree, node => ts.isVariableDeclaration(node) && node.name.getText(tree) === 'requestSearch');
+  const code = ts.transpileModule('(' + node.initializer.getText(tree) + ')', {compilerOptions: {target: ts.ScriptTarget.ES2022}}).outputText;
+  const state = {loading: false, error: '', results: {key: '', items: [], page: 0}};
+  const context = {apiRef: {current: null}, controller: {current: null}, requestVersion: {current: 1}, inFlight: {current: false},
+    kind: 'events', term: 'coffee', key: 'coffee-events', nearby: false, nearbyEvents: null, AbortController,
+    setLoading: value => {state.loading = value;}, setError: value => {state.error = value;},
+    setResults: update => {state.results = update(state.results);}};
+  return {state, context, request: vm.runInNewContext(code, context)};
+}
+
+test('native search rejects stale results and failures after a tab/query change', async () => {
+  const old = deferred(), current = deferred(); const search = nativeSearchContext();
+  search.context.apiRef.current = path => path.startsWith('/events/') ? old.promise : current.promise;
+  const first = search.request(1, 1);
+  search.context.kind = 'people'; search.context.key = 'coffee-people'; search.context.requestVersion.current = 2;
+  const second = search.request(1, 2);
+  current.resolve({results: [{id: 7}], count: 1}); await second;
+  old.reject(Error('Stale failure')); await first;
+  assert.equal(search.state.error, ''); assert.equal(search.state.results.items[0].id, 7);
+  assert.equal(search.state.loading, false); assert.equal(search.context.inFlight.current, false);
+});
+
+test('native pagination appends in ranked order and keeps failed pages retryable', async () => {
+  const search = nativeSearchContext(); const paths = [];
+  search.context.apiRef.current = async (path, options) => {paths.push(path); assert.equal(options.singlePage, true); return {results: [{id: 1}], count: 2, next: 'next'};};
+  await search.request(1, 1);
+  search.context.apiRef.current = async () => {throw Error('Offline');};
+  await search.request(2, 1);
+  assert.equal(search.state.results.items.length, 1); assert.equal(search.state.results.page, 1);
+  search.context.apiRef.current = async path => {paths.push(path); return {results: [{id: 2}], count: 2, next: null};};
+  await search.request(2, 1);
+  assert.deepEqual(Array.from(search.state.results.items, item => item.id), [1, 2]);
+  assert.equal(search.state.results.more, false); assert.equal(search.state.error, '');
+  assert.match(paths[1], /page=2/);
+});
+
+test('native and web search requests fetch one page while other callers still follow pagination', async () => {
+  for (const platform of ['native', 'web']) {
+    let calls = 0;
+    const context = {token: 'session', sessionToken: {current: 'session'}, API_URL: 'https://example.test/api',
+      state: {viewVersion: 1}, localStorage: {getItem: () => 'session'}, TOKEN_KEY: 'token', FormData, URL, rows,
+      fetch: async () => {calls++; return {status: 200, ok: true, json: async () => ({results: [{id: 1}], count: 22, next: 'https://example.test/api/events/?page=2'})};}};
+    const api = platform === 'native' ? nativeFunction('api', context) : webFunction('api', context);
+    const response = await api('/events/?q=coffee', {singlePage: true});
+    assert.equal(calls, 1); assert.equal(response.count, 22); assert.ok(response.next);
+  }
+});
+
+
+function eventSheetHarness({height = 844, top = 44, bottom = 34, eventId = 5} = {}) {
+  const code = ts.transpileModule(fs.readFileSync(path.join(root, 'mobile/EventDetailsSheet.tsx'), 'utf8'), {
+    compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX},
+  }).outputText;
+  let closes = 0;
+  const jsx = (type, props, key) => ({type, props, key});
+  const context = {exports: {}, require: name => {
+    if (name === 'react/jsx-runtime') return {jsx, jsxs: jsx};
+    if (name === 'react-native') return {ScrollView: 'ScrollView', View: 'View', Text: 'Text',
+      useWindowDimensions: () => ({width: 390, height}), StyleSheet: {create: value => value, absoluteFill: {position: 'absolute', top: 0, bottom: 0, left: 0, right: 0}}};
+    if (name === 'react-native-safe-area-context') return {useSafeAreaInsets: () => ({top, bottom, left: 0, right: 0})};
+    if (name === '@expo/vector-icons') return {Ionicons: 'Icon'};
+    if (name === './Motion') return {MotionModal: 'Modal', SoftPressable: 'Pressable'};
+    if (name === './ThemeProvider') return {useTheme: () => ({theme: pureModule('theme.ts').themes.light})};
+    if (name === './themedStyles') return {createThemedStyles: factory => factory};
+    if (name === './theme') return pureModule('theme.ts');
+    throw Error('Unexpected import: ' + name);
+  }};
+  vm.runInNewContext(code, context);
+  const content = {type: 'LongEvent', props: {description: 'A long event description. '.repeat(80)}};
+  const tree = context.exports.EventDetailsSheet({visible: true, eventId, onClose: () => closes++, children: content});
+  const nodes = [];
+  function visit(node, ancestors = []) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) return node.forEach(child => visit(child, ancestors));
+    nodes.push({node, ancestors}); visit(node.props?.children, [...ancestors, node]);
+  }
+  visit(tree);
+  return {tree, content, nodes, closes: () => closes};
+}
+
+test('long event details have a bounded scroll view without pressable gesture ancestors', () => {
+  for (const height of [390, 740, 844]) {
+    const sheet = eventSheetHarness({height});
+    const {node: scroll, ancestors} = sheet.nodes.find(item => item.node.type === 'ScrollView');
+    assert.equal(scroll.props.children, sheet.content);
+    assert.equal(scroll.props.style.flex, 1);
+    assert.equal(scroll.props.style.minHeight, 0);
+    assert.equal(scroll.props.nestedScrollEnabled, true);
+    assert.equal(ancestors.some(node => node.type === 'Pressable' || node.props?.onPress), false);
+    const surface = ancestors.at(-1);
+    const styles = Object.assign({}, ...surface.props.style);
+    assert.ok(styles.height > 0 && styles.height <= height - 44 - 8);
+    const contentStyle = Object.assign({}, ...scroll.props.contentContainerStyle);
+    assert.ok(contentStyle.paddingBottom >= 34);
+    assert.equal(contentStyle.flex, undefined, 'Long content must be allowed to exceed the viewport');
+  }
+});
+
+test('event close controls remain outside the scrolling content and all dismiss the sheet', () => {
+  const sheet = eventSheetHarness();
+  const close = sheet.nodes.find(item => item.node.props?.accessibilityLabel === 'Close event details');
+  assert.equal(close.ancestors.some(node => node.type === 'ScrollView'), false);
+  close.node.props.onPress();
+  const backdrop = sheet.nodes.find(item => item.node.type === 'Pressable' && item.node.props.accessible === false);
+  backdrop.node.props.onPress(); sheet.tree.props.onRequestClose();
+  assert.equal(sheet.closes(), 3);
+});
+
+test('event scroll identity resets between events and stays stable when the current event refreshes', () => {
+  const scrollKey = id => eventSheetHarness({eventId: id}).nodes.find(item => item.node.type === 'ScrollView').node.key;
+  assert.equal(scrollKey(5), scrollKey(5)); assert.notEqual(scrollKey(5), scrollKey(6));
+});
+
+test('iOS publishing waits for editor dismissal before exposing the saved event sheet', () => {
+  const sheet = find(native, node => ts.isJsxOpeningElement(node) && node.tagName.getText(native) === 'EventDetailsSheet');
+  const visible = sheet.attributes.properties.find(prop => prop.name?.getText(native) === 'visible').initializer.expression.getText(native);
+  const editor = find(native, node => ts.isJsxOpeningElement(node) && node.tagName.getText(native) === 'Modal'
+    && node.attributes.properties.some(prop => prop.name?.getText(native) === 'visible' && prop.initializer?.expression?.getText(native) === '!!eventEditor'));
+  const dismissed = editor.attributes.properties.find(prop => prop.name?.getText(native) === 'onDismiss').initializer.expression.getText(native);
+  for (const platform of ['ios', 'android']) {
+    let keyboardDismissed = false;
+    const context = {Platform: {OS: platform}, Keyboard: {dismiss: () => {keyboardDismissed = true;}},
+      eventEditorVersion: {current: 1}, eventLocationRequest: {current: 1},
+      selectedEvent: {id: 12}, eventEditor: {name: 'Posted event'}, eventEditorClosing: false,
+      composeOpen: false, selectedUser: null, peoplePanel: null, commentPost: null, editingPost: null,
+      setEventDateField: noop, setEventLocating: noop, setEventLocationStatus: noop};
+    context.setEventEditor = value => {context.eventEditor = value;};
+    context.setEventEditorClosing = value => {context.eventEditorClosing = value;};
+    nativeFunction('closeEventEditor', context)();
+    assert.equal(keyboardDismissed, true);
+    assert.equal(vm.runInNewContext(visible, context), platform !== 'ios');
+    vm.runInNewContext('(' + dismissed + ')()', context);
+    assert.equal(vm.runInNewContext(visible, context), true);
+  }
 });

@@ -325,11 +325,27 @@ class ConversationSerializer(serializers.ModelSerializer):
     participants = ChatParticipantSerializer(many=True, read_only=True)
     latest_message = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+    read_through_message_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ["id", "event", "event_name", "participants", "is_group", "title", "created_at", "updated_at", "display_name", "latest_message"]
+        fields = ["id", "event", "event_name", "participants", "is_group", "title", "created_at", "updated_at", "display_name", "latest_message", "unread_count", "read_through_message_id"]
         read_only_fields = ["event", "participants", "is_group", "created_at", "updated_at"]
+
+    def _read_state(self, obj):
+        if not hasattr(obj, "unread_count"):
+            from .chat_reads import with_unread_counts
+            row = with_unread_counts(Conversation.objects.filter(pk=obj.pk), self.context["request"].user).get()
+            obj.unread_count = row.unread_count
+            obj.read_through_message_id = row.read_through_message_id
+        return obj
+
+    def get_unread_count(self, obj):
+        return self._read_state(obj).unread_count
+
+    def get_read_through_message_id(self, obj):
+        return self._read_state(obj).read_through_message_id
 
     def get_latest_message(self, obj):
         if hasattr(obj, "visible_messages"):

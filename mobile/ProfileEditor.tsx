@@ -1,12 +1,14 @@
 import {useEffect, useRef, useState} from 'react';
-import {Image, Keyboard, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
+import {Image, Keyboard, KeyboardAvoidingView, Platform, ScrollView, Text, TextInput, View} from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import {File} from 'expo-file-system';
 import {Ionicons} from '@expo/vector-icons';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {MotionModal, SoftPressable as Pressable} from './Motion';
-import {darkStyles as s} from './appStyles';
-import {colors, fonts} from './theme';
+import {getAppStyles} from './appStyles';
+import {useTheme} from './ThemeProvider';
+import {createThemedStyles} from './themedStyles';
+import {fonts} from './theme';
 
 export type ProfileDraft = {display_name: string; bio: string; city: string};
 type Props = {
@@ -16,6 +18,10 @@ type Props = {
 };
 
 export function ProfileEditor({user, onClose, onSave}: Props) {
+  const {theme} = useTheme();
+  const {colors} = theme;
+  const s = getAppStyles(theme);
+  const local = getLocalStyles(theme);
   const insets = useSafeAreaInsets();
   const [draft, setDraft] = useState<ProfileDraft>({display_name: user.display_name || '', bio: user.bio || '', city: user.city || ''});
   const [photo, setPhoto] = useState<ImagePicker.ImagePickerAsset | null>(null);
@@ -72,14 +78,14 @@ export function ProfileEditor({user, onClose, onSave}: Props) {
   </MotionModal>;
 }
 
-const local = StyleSheet.create({
+const getLocalStyles = createThemedStyles(({colors}) => ({
   header: {paddingHorizontal: 20, paddingBottom: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12},
   form: {paddingHorizontal: 20},
   avatarRow: {flexDirection: 'row', alignItems: 'center', gap: 16, marginVertical: 12},
-  avatar: {width: 84, height: 84, borderRadius: 30, borderCurve: 'continuous'},
+  avatar: {width: 80, height: 80, borderRadius: 28, borderCurve: 'continuous'},
   placeholder: {backgroundColor: colors.accentSoft, alignItems: 'center', justifyContent: 'center'},
-  initial: {fontFamily: fonts.heading, fontSize: 27, color: colors.accent},
+  initial: {fontFamily: fonts.heading, fontSize: 28, color: colors.accent},
   bio: {minHeight: 120},
   counter: {fontFamily: fonts.copy, fontSize: 13, color: colors.muted, textAlign: 'right', marginTop: 6},
   error: {fontFamily: fonts.copy, color: colors.danger, fontSize: 15, lineHeight: 22, marginTop: 16},
-});
+}));

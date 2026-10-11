@@ -284,6 +284,16 @@ class Conversation(models.Model):
         ordering = ["-updated_at"]
 
 
+class ConversationReadState(models.Model):
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="read_states")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="chat_read_states")
+    # A monotonic cursor survives message deletion and synchronizes all devices.
+    last_read_message_id = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["conversation", "user"], name="unique_conversation_reader")]
+
+
 class Message(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="messages")
     sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sent_messages")

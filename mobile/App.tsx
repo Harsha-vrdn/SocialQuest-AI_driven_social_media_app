@@ -1,3 +1,5 @@
+import {EventDetailsSheet} from './EventDetailsSheet';
+import {DiscoverSearch, type SearchKind} from './DiscoverSearch';
 import {MessageList} from './MessageList';
 import {EventDateTimeField, EventDateTimePicker} from './EventDateTimePicker';
 import {dateParts, localDateTimeValue, updateEventSchedule, type EventSchedule} from './eventDateTime';
@@ -7,9 +9,20 @@ import {ProfileEditor, type ProfileDraft} from './ProfileEditor';
 import {locateHostVenue} from './hostingLocation';
 import {QuestAttribution} from './QuestAttribution';
 import {useFonts} from 'expo-font';
-import {darkStyles, glassStyles, socialStyles, notificationStyles} from './appStyles';
-import {accents, colors, type Accent} from './theme';
-import {MotionProvider, SoftPressable as Pressable, MotionModal as Modal, ScreenTransition, LikeFeedback} from './Motion';
+import {getAppStyles, getGlassStyles, getSocialStyles, getNotificationStyles} from './appStyles';
+import {ThemeProvider, useTheme} from './ThemeProvider';
+import {AppearanceSettings} from './AppearanceSettings';
+import {UnreadBadge} from './UnreadBadge';
+import {type Accent} from './theme';
+import {KeyboardLift} from './KeyboardLift';
+import {PlaceSuggestions} from './PlaceSuggestions';
+import type {Place} from './placeSearch';
+import {MotionProvider, SoftPressable as Pressable, MotionModal as Modal, ScreenTransition, LikeFeedback, Pop, PulseBadge, makeRevealCell} from './Motion';
+
+const FeedCell = makeRevealCell('feed');
+const ReelCell = makeRevealCell('reel');
+const ChatCell = makeRevealCell('chat');
+const AlertCell = makeRevealCell('alert');
 import {EventArtwork} from './EventArtwork';
 import {LinearGradient} from 'expo-linear-gradient';
 import {useDeviceNotifications, DeliveryNotice} from './useDeviceNotifications';
@@ -27,8 +40,10 @@ import {Ionicons} from '@expo/vector-icons';
 import { type ComponentProps, type ReactNode, useEffect, useRef, useState } from 'react';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import {
+  ActivityIndicator,
   Alert,
   AppState,
+  BackHandler,
   FlatList,
   Image,
   Keyboard,
@@ -63,7 +78,7 @@ type EventEditor = { id?: number; name: string; description: string; location_na
 type CommentItem = { id: number; parent?: number | null; author: User; body: string; created_at: string };
 type Post = { id: number; kind: 'POST' | 'REEL'; body: string; media?: string; location_name?: string; quest_title?: string; event_name?: string; event?: number | null; recommendation_reason?: string; author: User; created_at: string; like_count: number; comment_count: number; liked_by_me?: boolean; recent_comments?: CommentItem[] };
 type Quest = { id: number; event: number; event_name?: string; kind: 'MAIN' | 'SIDE'; title: string; instructions: string; xp_reward: number; my_submission?: { status: string } | null };
-type Conversation = { id: number; is_group?: boolean; event?: number | null; event_name?: string; title?: string; display_name: string; participants: User[]; latest_message?: { body: string; created_at: string; deleted_for_everyone?: boolean } };
+type Conversation = { id: number; is_group?: boolean; event?: number | null; event_name?: string; title?: string; display_name: string; participants: User[]; unread_count: number; read_through_message_id: number; latest_message?: { id: number; body: string; created_at: string; deleted_for_everyone?: boolean } };
 type ChatMessage = { id: number; body: string; sender: User; created_at: string; edited_at?: string | null; deleted_for_everyone?: boolean };
 type Reaction = 'LIKE' | 'DISLIKE' | 'NONE';
 type RatingItem = { id: number; target: User; reaction: Reaction };
@@ -81,33 +96,39 @@ const reactionLabel = (reaction: Reaction) => reaction === 'LIKE' ? '♥ Like' :
 const chatEmojis = ['😊', '😂', '❤️', '👍', '🎉', '✨', '👋', '🙌'];
 const AUTH_TOKEN_KEY = 'socialquest_auth_token';
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
-let activeStyles = darkStyles;
 const iconLabelRow = {alignItems: 'center', flexDirection: 'row', gap: 5} as const;
-const avatarAccents = [accents.purple, accents.sky, accents.mint];
-const notificationAccent = (kind: NotificationItem['kind']) => kind === 'COMMENT_REPLY' ? accents.purple
-  : kind === 'RSVP_ACCEPTED' || kind === 'INVITE_ACCEPTED' ? accents.mint
-  : kind === 'RSVP_DENIED' ? accents.danger : accents.purple;
 
 function Avatar({ user, large = false }: { user?: User | null; large?: boolean }) {
-  const styles = activeStyles;
+  const {theme} = useTheme();
+  const {accents} = theme;
+  const avatarAccents = [accents.purple, accents.sky, accents.rose, accents.mint, accents.gold];
+  const styles = getAppStyles(theme);
   const tone = avatarAccents[Math.abs(user?.id || 0) % avatarAccents.length];
   return user?.avatar
-    ? <Image style={[styles.avatar, large && styles.avatarLarge]} source={{ uri: user.avatar }} />
+    ? <Image accessible accessibilityLabel={nameOf(user) + "'s profile photo"} style={[styles.avatar, large && styles.avatarLarge]} source={{ uri: user.avatar }} />
     : <View style={[styles.avatar, {backgroundColor: tone.surface}, large && styles.avatarLarge]}><Text style={[styles.avatarText, {color: tone.text}, large && styles.avatarLargeText]}>{initial(user)}</Text></View>;
 }
 
-function Empty({ icon, title, body, style, ...viewProps }: ViewProps & { icon: string; title: string; body: string }) {
-  const styles = activeStyles;
+function Empty({ icon, title, body, style, loading, ...viewProps }: ViewProps & { icon: string; title: string; body: string; loading?: boolean }) {
+  const {theme} = useTheme();
+  const {colors} = theme;
+  const styles = getAppStyles(theme);
   // Preserve any layout and measurement props supplied by the parent list.
+  if (loading) return <View {...viewProps} accessibilityRole="progressbar" accessibilityLabel="Loading" style={[styles.empty, style]}><ActivityIndicator color={colors.accent} /><Text style={styles.emptyBody}>Loading…</Text></View>;
   return <View {...viewProps} style={[styles.empty, style]}><Text style={styles.emptyIcon}>{icon}</Text><Text style={styles.emptyTitle}>{title}</Text><Text style={styles.emptyBody}>{body}</Text></View>;
 }
 
 function GroupAvatar() {
-  return <View style={[activeStyles.avatar, {backgroundColor: colors.accentSoft}]}><Ionicons name="people" size={23} color={colors.accent} /></View>;
+  const {theme} = useTheme();
+  const styles = getAppStyles(theme);
+  const {colors} = theme;
+  return <View style={[styles.avatar, {backgroundColor: colors.accentSoft}]}><Ionicons name="people" size={23} color={colors.accent} /></View>;
 }
 
 function InteractivePostImage({ post, onLike }: { post: Post; onLike: (post: Post) => void }) {
-  const styles = activeStyles;
+  const {theme} = useTheme();
+  const {colors} = theme;
+  const styles = getAppStyles(theme);
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heartTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showHeart, setShowHeart] = useState(false);
@@ -134,36 +155,58 @@ function InteractivePostImage({ post, onLike }: { post: Post; onLike: (post: Pos
     }, 230);
   };
 
-  return <><Pressable accessibilityRole="button" accessibilityLabel="Open photo" accessibilityHint="Open fullscreen to pinch or double-tap to zoom. Double-tap here to like." onPress={handlePress} style={styles.postImageTouch}>
+  return <><Pressable accessibilityRole="button" accessibilityLabel={'Open photo by ' + nameOf(post.author)} accessibilityHint="Open fullscreen to pinch or double-tap to zoom. Double-tap here to like." onPress={handlePress} style={styles.postImageTouch}>
     <Image style={styles.postImage} source={{ uri: post.media }} />
-    {showHeart ? <LikeFeedback style={styles.postMediaHeart}><Ionicons name="heart" size={76} color="#fff" /></LikeFeedback> : null}
+    {showHeart ? <LikeFeedback style={styles.postMediaHeart}><Ionicons name="heart" size={76} color={colors.onMedia} /></LikeFeedback> : null}
   </Pressable>{viewerOpen && post.media ? <ImageViewer key={post.media} uri={post.media} onClose={() => setViewerOpen(false)} /> : null}</>;
 }
 
 function PostCard({ post, onLike, mine, onEdit, onDelete, onShare, onComments, onOpenProfile }: { post: Post; onLike: (post: Post) => void; mine: boolean; onEdit: (post: Post) => void; onDelete: (post: Post) => void; onShare: (post: Post) => void; onComments: (post: Post) => void; onOpenProfile: (user: User) => void }) {
-  const styles = activeStyles;
-  return <View style={styles.post}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(post.author) + "'s profile"} style={styles.postHead} onPress={() => onOpenProfile(post.author)}><Avatar user={post.author} /><View style={{ flex: 1, minWidth: 0 }}><Text style={styles.personName}>{nameOf(post.author)}</Text><Text style={styles.personMeta}>@{post.author.username}{post.location_name ? ' · ' + post.location_name : ''}</Text><RelativeTime value={post.created_at} /></View></Pressable>{post.recommendation_reason ? <Text style={styles.recommendationTag}>For you · {post.recommendation_reason}</Text> : null}<QuestAttribution quest={post.quest_title} event={post.event_name} />{post.body ? <Text style={styles.postBody}>{post.body}</Text> : null}{post.media ? post.kind === 'POST' ? <InteractivePostImage post={post} onLike={onLike} /> : <ReelVideo uri={post.media} /> : null}<View style={styles.postFooter}><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel={post.liked_by_me ? "Unlike post" : "Like post"} onPress={() => onLike(post)}><Ionicons name={post.liked_by_me ? 'heart' : 'heart-outline'} size={18} color={post.liked_by_me ? colors.rose : colors.muted} /><Text style={[styles.postManageText, post.liked_by_me && { color: colors.rose }]}>{post.like_count}</Text></Pressable><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel="Open comments" onPress={() => onComments(post)}><Ionicons name="chatbubble-outline" size={17} color={colors.muted} /><Text style={styles.postManageText}>{post.comment_count} replies</Text></Pressable><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel="Share post" onPress={() => onShare(post)}><Ionicons name="paper-plane-outline" size={18} color={colors.muted} /><Text style={styles.postManageText}>Share</Text></Pressable>{mine ? <View style={styles.postManage}><Pressable style={styles.postAction} onPress={() => onEdit(post)}><Text style={styles.postManageText}>Edit</Text></Pressable><Pressable style={styles.postAction} onPress={() => onDelete(post)}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View> : null}</View><Pressable accessibilityRole="button" accessibilityLabel="Open replies" onPress={() => onComments(post)} style={styles.postRepliesLink}><Text style={styles.postRepliesLinkText}>{post.comment_count ? 'View ' + post.comment_count + (post.comment_count === 1 ? ' reply' : ' replies') : 'Start the conversation'}</Text></Pressable></View>;
+  const {theme} = useTheme();
+  const {colors} = theme;
+  const styles = getAppStyles(theme);
+  return <View style={styles.post}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(post.author) + "'s profile"} style={styles.postHead} onPress={() => onOpenProfile(post.author)}><Avatar user={post.author} /><View style={{ flex: 1, minWidth: 0 }}><Text style={styles.personName}>{nameOf(post.author)}</Text><Text style={styles.personMeta}>@{post.author.username}{post.location_name ? ' · ' + post.location_name : ''}</Text><RelativeTime value={post.created_at} /></View></Pressable>{post.recommendation_reason ? <Text style={styles.recommendationTag}>For you · {post.recommendation_reason}</Text> : null}<QuestAttribution quest={post.quest_title} event={post.event_name} />{post.body ? <Text style={styles.postBody}>{post.body}</Text> : null}{post.media ? post.kind === 'POST' ? <InteractivePostImage post={post} onLike={onLike} /> : <ReelVideo uri={post.media} /> : null}<View style={styles.postFooter}><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel={post.liked_by_me ? "Unlike post" : "Like post"} onPress={() => onLike(post)}><Pop active={!!post.liked_by_me}><Ionicons name={post.liked_by_me ? 'heart' : 'heart-outline'} size={18} color={post.liked_by_me ? colors.rose : colors.muted} /></Pop><Text style={[styles.postManageText, post.liked_by_me && { color: colors.rose }]}>{post.like_count}</Text></Pressable><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel="Open comments" onPress={() => onComments(post)}><Ionicons name="chatbubble-outline" size={17} color={colors.muted} /><Text style={styles.postManageText}>{post.comment_count} replies</Text></Pressable><Pressable style={[iconLabelRow, styles.postAction]} accessibilityRole="button" accessibilityLabel="Share post" onPress={() => onShare(post)}><Ionicons name="paper-plane-outline" size={18} color={colors.muted} /><Text style={styles.postManageText}>Share</Text></Pressable>{mine ? <View style={styles.postManage}><Pressable accessibilityRole="button" style={styles.postAction} onPress={() => onEdit(post)}><Text style={styles.postManageText}>Edit</Text></Pressable><Pressable accessibilityRole="button" style={styles.postAction} onPress={() => onDelete(post)}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View> : null}</View><Pressable accessibilityRole="button" accessibilityLabel="Open replies" onPress={() => onComments(post)} style={styles.postRepliesLink}><Text style={styles.postRepliesLinkText}>{post.comment_count ? 'View ' + post.comment_count + (post.comment_count === 1 ? ' reply' : ' replies') : 'Start the conversation'}</Text></Pressable></View>;
 }
 
 function ReelVideo({ uri }: { uri: string }) {
+  const {theme} = useTheme();
+  const {colors} = theme;
   const player = useVideoPlayer(uri);
-  return <VideoView player={player} nativeControls contentFit="contain" style={{ width: '100%', height: 230, borderRadius: 12, overflow: 'hidden', backgroundColor: '#050916' }} />;
+  return <VideoView player={player} nativeControls contentFit="contain" style={{ width: '100%', height: 230, borderRadius: 12, overflow: 'hidden', backgroundColor: colors.mediaBackground }} />;
 }
 
 export default function App() {
+  return <ThemeProvider><ThemedApp /></ThemeProvider>;
+}
+
+function ThemedApp() {
+  const {theme} = useTheme();
+  const {colors} = theme;
+  const barStyle = theme.scheme === 'dark' ? 'light' : 'dark';
   const [fontsLoaded, fontError] = useFonts({DepartureMono: require('./assets/fonts/DepartureMono-Regular.otf')});
   if (!fontsLoaded && !fontError) return <View style={{flex: 1, backgroundColor: colors.background}} />;
-  return <SafeAreaProvider><RelativeTimeProvider><MotionProvider><GlassPreferenceProvider><NavigationBar style="light" /><SocialQuestApp /></GlassPreferenceProvider></MotionProvider></RelativeTimeProvider></SafeAreaProvider>;
+  return <SafeAreaProvider><RelativeTimeProvider><MotionProvider><GlassPreferenceProvider><StatusBar style={barStyle} /><NavigationBar style={barStyle} /><SocialQuestApp /></GlassPreferenceProvider></MotionProvider></RelativeTimeProvider></SafeAreaProvider>;
 }
 
 function SocialQuestApp() {
+  const {theme} = useTheme();
+  const {colors, accents, gradients} = theme;
   const insets = useSafeAreaInsets();
   const {width} = useWindowDimensions();
-  const styles = darkStyles;
-  activeStyles = styles;
+  const styles = getAppStyles(theme);
+  const glassStyles = getGlassStyles(theme);
+  const socialStyles = getSocialStyles(theme);
+  const notificationStyles = getNotificationStyles(theme);
+  const notificationAccent = (kind: NotificationItem['kind']) => kind === 'COMMENT_REPLY' ? accents.purple
+    : kind === 'RSVP_ACCEPTED' || kind === 'INVITE_ACCEPTED' ? accents.mint
+    : kind === 'RSVP_DENIED' ? accents.danger : accents.purple;
   const [appHeaderHeight, setAppHeaderHeight] = useState(0);
   const [token, setToken] = useState('');
   const [authReady, setAuthReady] = useState(false);
+  const [accountLoading, setAccountLoading] = useState(false);
+  const usernameInput = useRef<TextInput>(null);
+  const emailInput = useRef<TextInput>(null);
+  const passwordInput = useRef<TextInput>(null);
   const [me, setMe] = useState<User | null>(null);
   const [tab, setTab] = useState<Tab>('Home');
   const currentTab = useRef(tab); currentTab.current = tab;
@@ -201,6 +244,8 @@ function SocialQuestApp() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [reels, setReels] = useState<Post[]>([]);
   const [query, setQuery] = useState('');
+  const [searchKind, setSearchKind] = useState<SearchKind>('events');
+  const [searchFocusRequest, setSearchFocusRequest] = useState(0);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeChat, setActiveChat] = useState<Conversation | null>(null);
   const [chatMembersOpen, setChatMembersOpen] = useState(false);
@@ -208,12 +253,20 @@ function SocialQuestApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const activeChatId = useRef<number | null>(null);
   activeChatId.current = activeChat?.id || null;
+  const chatRequestVersion = useRef(0);
+  const messageRequestVersion = useRef(0);
+  const chatReadVersion = useRef(0);
+  const visibleChatMessage = useRef({chatId: 0, messageId: 0});
+  const chatReadRequests = useRef(new Set<number>());
+  const chatReadCursors = useRef(new Map<number, number>());
+  const notificationRequestVersion = useRef(0);
   const [message, setMessage] = useState('');
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const [chatEditor, setChatEditor] = useState<{ kind: 'conversation' | 'message'; id: number; value: string } | null>(null);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<EventItem | null>(null);
   const [eventEditor, setEventEditor] = useState<EventEditor | null>(null);
+  const [eventEditorClosing, setEventEditorClosing] = useState(false);
   const [eventDateField, setEventDateField] = useState<keyof EventSchedule | null>(null);
   const eventEditorVersion = useRef(0);
   const eventLocationRequest = useRef(0);
@@ -259,11 +312,12 @@ function SocialQuestApp() {
   const profileRequestVersion = useRef(0);
 
   const api = async (path: string, options: any = {}, authToken = token): Promise<any> => {
+    const {singlePage = false, ...requestOptions} = options;
     const headers: any = { ...(authToken ? { Authorization: 'Token ' + authToken } : {}), ...(options.headers || {}) };
     if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
     let response: Response;
     try {
-      response = await fetch(API_URL + path, { ...options, headers });
+      response = await fetch(API_URL + path, { ...requestOptions, headers });
     } catch (_) {
       const help = API_URL.includes('YOUR_LAN_IP')
         ? 'Mobile API is not configured. Start Expo with EXPO_PUBLIC_API_URL=http://YOUR_LAN_IP:8000/api.'
@@ -282,7 +336,7 @@ function SocialQuestApp() {
     }
     if (!response.ok) throw new Error(data?.detail || Object.values(data || {}).flat().join(' ') || 'Something went wrong.');
     if (authToken && sessionToken.current !== authToken) throw new Error('Session changed.');
-    if ((!options.method || options.method === 'GET') && Array.isArray(data?.results) && data.next) {
+    if ((!options.method || options.method === 'GET') && Array.isArray(data?.results) && data.next && !singlePage) {
       const next = new URL(data.next);
       const base = new URL(API_URL);
       if (next.origin !== base.origin || !next.pathname.startsWith(base.pathname + '/')) throw new Error('Invalid pagination link.');
@@ -294,7 +348,7 @@ function SocialQuestApp() {
 
   useEffect(() => {
     eventEditorVersion.current += 1; eventLocationRequest.current += 1;
-    setEventEditor(null); setEventDateField(null); setEventLocating(false); setProfileEditorOpen(false);
+    setEventEditor(null); setEventEditorClosing(false); setEventDateField(null); setEventLocating(false); setProfileEditorOpen(false);
     composerDrafts.current.clear();
   }, [token]);
 
@@ -357,13 +411,46 @@ function SocialQuestApp() {
     if (currentProfileId.current) await loadProfilePosts(currentProfileId.current);
   };
   const loadFollowing = async () => setFollowing(rows<User>(await api('/people/following/')));
-  const loadChats = async () => {
-    const chats = rows<Conversation>(await api('/conversations/'));
+  const loadChats = async (signal?: AbortSignal) => {
+    const version = ++chatRequestVersion.current, readVersion = chatReadVersion.current;
+    const chats = rows<Conversation>(await api('/conversations/', signal ? {signal} : {}));
+    if (version !== chatRequestVersion.current || readVersion !== chatReadVersion.current) return;
+    chats.forEach(chat => chatReadCursors.current.set(chat.id, Math.max(chatReadCursors.current.get(chat.id) || 0, chat.read_through_message_id || 0)));
     setConversations(chats);
     setActiveChat(current => current ? chats.find(chat => chat.id === current.id) || (current.event ? null : current) : null);
   };
-  const loadMessages = async (id: number) => { const result = rows<ChatMessage>(await api('/messages/?conversation=' + id)); if (activeChatId.current === id) setMessages(result); };
-  const loadNotifications = async () => setNotifications(rows<NotificationItem>(await api('/notifications/')));
+  const markChatRead = async (id: number, messageId: number) => {
+    if (!messageId || activeChatId.current !== id || currentTab.current !== 'Chats' || AppState.currentState !== 'active') return;
+    visibleChatMessage.current = {chatId: id, messageId: Math.max(visibleChatMessage.current.chatId === id ? visibleChatMessage.current.messageId : 0, messageId)};
+    if (messageId <= (chatReadCursors.current.get(id) || 0) || chatReadRequests.current.has(id)) return;
+    chatReadRequests.current.add(id); chatReadVersion.current++;
+    let saved = false;
+    try {
+      const result = await api('/conversations/' + id + '/mark-read/', {method: 'POST', body: JSON.stringify({message_id: messageId})});
+      chatReadCursors.current.set(id, result.read_through_message_id);
+      saved = true;
+      const update = (chat: Conversation) => chat.id === id ? {...chat, ...result} : chat;
+      setConversations(current => current.map(update));
+      setActiveChat(current => current ? update(current) : null);
+    } catch (_) { /* Keep the badge; the next poll retries what was actually visible. */ }
+    finally { chatReadRequests.current.delete(id); chatReadVersion.current++; }
+    if (saved) {
+      void loadChats().catch(() => {});
+      if (visibleChatMessage.current.chatId === id && visibleChatMessage.current.messageId > messageId) void markChatRead(id, visibleChatMessage.current.messageId);
+    }
+  };
+  const loadMessages = async (id: number) => {
+    const version = ++messageRequestVersion.current;
+    const result = rows<ChatMessage>(await api('/messages/?conversation=' + id));
+    if (version !== messageRequestVersion.current || activeChatId.current !== id || currentTab.current !== 'Chats' || AppState.currentState !== 'active') return;
+    setMessages(result);
+    if (visibleChatMessage.current.chatId === id) void markChatRead(id, visibleChatMessage.current.messageId);
+  };
+  const loadNotifications = async () => {
+    const version = ++notificationRequestVersion.current;
+    const result = rows<NotificationItem>(await api('/notifications/'));
+    if (version === notificationRequestVersion.current) setNotifications(result);
+  };
 
   const closePeople = () => {
     peopleRequestVersion.current += 1;
@@ -435,7 +522,7 @@ function SocialQuestApp() {
   }, [token]);
   useEffect(() => { presenceSync.current?.(AppState.currentState === 'active'); }, [tab]);
   useEffect(() => {
-    if (!token || tab !== 'Chats' || !appActive) return;
+    if (!token || !appActive) return;
     let cancelled = false;
     let pending = false;
     const poll = async () => {
@@ -444,11 +531,7 @@ function SocialQuestApp() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 8000);
       try {
-        const chats = rows<Conversation>(await api('/conversations/', {signal: controller.signal}));
-        if (!cancelled) {
-          setConversations(chats);
-          setActiveChat(current => current ? chats.find(chat => chat.id === current.id) || (current.event ? null : current) : null);
-        }
+        await loadChats(controller.signal);
       } catch (_) {
         if (!cancelled) {
           const offline = (chat: Conversation) => ({...chat, participants: chat.participants.map(person => ({...person, is_online: false}))});
@@ -458,12 +541,16 @@ function SocialQuestApp() {
       } finally { clearTimeout(timeout); pending = false; }
     };
     void poll();
-    const timer = setInterval(() => void poll(), 5000);
+    const timer = setInterval(() => void poll(), tab === 'Chats' ? 5000 : 15000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [token, tab, appActive]);
 
   useEffect(() => {
     if (token) return;
+    chatRequestVersion.current++; chatReadVersion.current++;
+    chatReadCursors.current.clear(); chatReadRequests.current.clear();
+    visibleChatMessage.current = {chatId: 0, messageId: 0};
+    setConversations([]); setNotifications([]);
     closePeople();
   }, [token]);
   useEffect(() => {
@@ -488,22 +575,39 @@ function SocialQuestApp() {
   const refresh = async (task: () => Promise<unknown>) => { setRefreshing(true); try { await task(); } catch (error: any) { Alert.alert('Could not refresh', error.message); } finally { setRefreshing(false); } };
 
   useEffect(() => {
-    if (!token) return;
-    void Promise.all([loadMe(), loadDiscover(), loadFeed(), loadChats(), loadNotifications(), loadFollowing()]).catch(error => Alert.alert('Could not load your account', error.message));
+    if (!token) { setAccountLoading(false); return; }
+    let current = true;
+    setAccountLoading(true);
+    void Promise.all([loadMe(), loadDiscover(), loadFeed(), loadChats(), loadNotifications(), loadFollowing()]).catch(error => Alert.alert('Could not load your account', error.message)).finally(() => { if (current) setAccountLoading(false); });
+    return () => { current = false; };
   }, [token]);
+  // Android Back steps out of the open chat, then to Home, before leaving the app.
+  useEffect(() => {
+    if (Platform.OS !== 'android' || !token) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (activeChat) { setEmojiPickerOpen(false); Keyboard.dismiss(); setActiveChat(null); return true; }
+      if (tab !== 'Home') { setTab('Home'); return true; }
+      return false;
+    });
+    return () => subscription.remove();
+  }, [token, activeChat, tab]);
+  useEffect(() => {
+    setMessages([]);
+    visibleChatMessage.current = {chatId: activeChat?.id || 0, messageId: 0};
+  }, [activeChat?.id]);
   useEffect(() => {
     if (!activeChat) { setMessages([]); setChatMembersOpen(false); return; }
-    if (!token || tab !== 'Chats') return;
-    setMessages([]);
+    if (!token || tab !== 'Chats' || !appActive) return;
     void loadMessages(activeChat.id).catch(error => Alert.alert('Could not load chat', error.message));
     const timer = setInterval(() => void loadMessages(activeChat.id).catch(() => {}), 4000);
     return () => clearInterval(timer);
-  }, [activeChat?.id, token, tab]);
+  }, [activeChat?.id, token, tab, appActive]);
   useEffect(() => {
-    if (!token) return;
+    if (!token || !appActive) return;
+    void loadNotifications().catch(() => {});
     const timer = setInterval(() => void loadNotifications().catch(() => {}), 15000);
     return () => clearInterval(timer);
-  }, [token]);
+  }, [token, appActive]);
 
   const authenticate = async () => {
     if (busy) return;
@@ -528,6 +632,10 @@ function SocialQuestApp() {
     }
   };
 
+  const confirmLogout = () => Alert.alert('Log out?', 'You will need to log in again to see your feed and chats.', [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Log out', style: 'destructive', onPress: () => void logout() },
+  ]);
   const logout = async () => {
     await presenceSync.current?.(false);
     await deviceNotifications.disable();
@@ -543,10 +651,6 @@ function SocialQuestApp() {
     setActiveChat(null);
     setMessages([]);
     setTab('Home');
-  };
-
-  const search = async () => {
-    try { setNearbyActive(false); await loadDiscover(query.trim()); } catch (error: any) { Alert.alert('Search unavailable', error.message); }
   };
 
   const openChat = async (person: User) => {
@@ -575,6 +679,7 @@ function SocialQuestApp() {
       const nearby = await api('/events/recommended/?latitude=' + position.coords.latitude.toFixed(6) + '&longitude=' + position.coords.longitude.toFixed(6));
       setEvents(rows<EventItem>(nearby));
       setQuery('');
+      setSearchKind('events');
       setNearbyActive(true);
       setTab('Explore');
     } catch (error: any) { Alert.alert('Nearby events unavailable', error.message || 'We could not check events near you.'); }
@@ -659,7 +764,7 @@ function SocialQuestApp() {
       await api('/events/' + selectedEvent.id + '/join/', { method: 'POST', body: '{}' });
       Alert.alert(selectedEvent.my_attendance_status === 'INVITED' ? 'Invitation accepted' : 'Request sent', selectedEvent.my_attendance_status === 'INVITED' ? 'You are going to this adventure.' : 'The host can now review your public XP and karma.');
       await openEvent(selectedEvent.id);
-      await loadDiscover(query.trim());
+      await loadDiscover();
     } catch (error: any) { Alert.alert('Could not request entry', error.message); }
   };
 
@@ -668,7 +773,7 @@ function SocialQuestApp() {
     try {
       await api('/events/' + selectedEvent.id + '/cancel-rsvp/', {method: 'POST', body: '{}'});
       await openEvent(selectedEvent.id);
-      await loadDiscover(query.trim());
+      await loadDiscover();
     } catch (error: any) { Alert.alert('Could not cancel RSVP', error.message); }
   };
 
@@ -685,6 +790,10 @@ function SocialQuestApp() {
     return localDateTimeValue(dateParts(new Date(value)));
   };
   const closeEventEditor = () => {
+    Keyboard.dismiss();
+    // iOS keeps the presenting controller alive through its dismissal animation.
+    // Wait for onDismiss before showing the saved event underneath it.
+    setEventEditorClosing(Platform.OS === 'ios');
     eventEditorVersion.current += 1; eventLocationRequest.current += 1;
     setEventEditor(null); setEventDateField(null); setEventLocating(false); setEventLocationStatus('');
   };
@@ -706,6 +815,12 @@ function SocialQuestApp() {
     eventLocationRequest.current += 1;
     setEventLocating(false); setEventLocationStatus('');
     setEventEditor(current => current ? {...current, location_name: value, latitude: null, longitude: null} : current);
+  };
+  const pickEventPlace = (place: Place) => {
+    eventLocationRequest.current += 1;
+    setEventLocating(false); setEventLocationStatus('Venue chosen from search. Check it before publishing.');
+    setEventEditor(current => current ? {...current, location_name: place.label, latitude: place.latitude, longitude: place.longitude} : current);
+    Keyboard.dismiss();
   };
   const openEventEditor = (event?: EventItem) => {
     eventEditorVersion.current += 1; eventLocationRequest.current += 1;
@@ -736,7 +851,7 @@ function SocialQuestApp() {
       const saved = await api(eventEditor.id ? '/events/' + eventEditor.id + '/' : '/events/', {method: eventEditor.id ? 'PATCH' : 'POST', body: JSON.stringify(payload)});
       if (!eventEditor.id) await api('/events/' + saved.id + '/generate-quests/', {method: 'POST', body: '{}'}).catch(() => {});
       closeEventEditor();
-      await Promise.allSettled([loadMe(), loadDiscover(query.trim()), openEvent(saved.id)]);
+      await Promise.allSettled([loadMe(), loadDiscover(), openEvent(saved.id)]);
     } catch (error: any) { Alert.alert('Could not save event', error.message); }
     finally { eventSaveInFlight.current = false; setBusy(false); }
   };
@@ -745,7 +860,7 @@ function SocialQuestApp() {
     const eventId = selectedEvent.id;
     Alert.alert('Delete this event?', 'The event, its quests, and its group chat messages will be removed. Private moments will stay private.', [
       {text: 'Keep event', style: 'cancel'},
-      {text: 'Delete', style: 'destructive', onPress: () => void api('/events/' + eventId + '/', {method: 'DELETE'}).then(async () => { setSelectedEvent(null); await Promise.all([loadMe(), loadDiscover(query.trim())]); }).catch((error: any) => Alert.alert('Could not delete event', error.message))},
+      {text: 'Delete', style: 'destructive', onPress: () => void api('/events/' + eventId + '/', {method: 'DELETE'}).then(async () => { setSelectedEvent(null); await Promise.all([loadMe(), loadDiscover()]); }).catch((error: any) => Alert.alert('Could not delete event', error.message))},
     ]);
   };
 
@@ -811,8 +926,12 @@ function SocialQuestApp() {
 
   const openNotification = async (notification: NotificationItem) => {
     if (!notification.is_read) {
-      setNotifications(current => current.map(item => item.id === notification.id ? { ...item, is_read: true } : item));
-      void api('/notifications/mark-read/', { method: 'POST', body: JSON.stringify({ ids: [notification.id] }) }).catch(() => {});
+      notificationRequestVersion.current++;
+      try {
+        await api('/notifications/mark-read/', { method: 'POST', body: JSON.stringify({ ids: [notification.id] }) });
+        setNotifications(current => current.map(item => item.id === notification.id ? { ...item, is_read: true } : item));
+      } catch (_) { /* Do not hide an unread indicator when saving fails. */ }
+      finally { notificationRequestVersion.current++; }
     }
     try {
       if (notification.comment_post_id) {
@@ -828,10 +947,12 @@ function SocialQuestApp() {
   const markNotificationsRead = async () => {
     const unreadIds = notifications.filter(item => !item.is_read).map(item => item.id);
     if (!unreadIds.length) return;
+    notificationRequestVersion.current++;
     try {
       await api('/notifications/mark-read/', { method: 'POST', body: JSON.stringify({ ids: unreadIds }) });
-      setNotifications(current => current.map(item => ({ ...item, is_read: true })));
-    } catch (_) {}
+      setNotifications(current => current.map(item => unreadIds.includes(item.id) ? {...item, is_read: true} : item));
+    } catch (_) { Alert.alert('Could not mark notifications read', 'Please try again.'); }
+    finally { notificationRequestVersion.current++; }
   };
 
   const choosePhoto = async (videoOnly = false) => {
@@ -1122,13 +1243,12 @@ function SocialQuestApp() {
   const deviceNotifications = useDeviceNotifications({token, userId:me?.id, chatsOpen:tab === 'Chats', api, open:openDeviceNotification});
   const notificationPermissionCard = <View style={notificationStyles.card}><Text style={notificationStyles.copy}>{deviceNotifications.message}</Text><Pressable accessibilityRole="button" disabled={deviceNotifications.busy} style={styles.secondary} onPress={() => void (deviceNotifications.enabled ? deviceNotifications.disable() : deviceNotifications.enable())}><Text style={styles.secondaryText}>{deviceNotifications.busy ? 'Please wait…' : deviceNotifications.enabled ? 'Turn off notifications' : deviceNotifications.settingsNeeded ? 'Open notification settings' : 'Enable notifications'}</Text></Pressable></View>;
 
-  if (!authReady) return <View style={styles.auth}><Text style={styles.authWordBrand}>SocialQuest</Text><Text style={styles.copy}>Restoring your adventure…</Text></View>;
+  if (!authReady) return <View style={styles.auth}><Text style={styles.authWordBrand}>SocialQuest</Text><ActivityIndicator color={colors.accent} style={{marginTop: 16}} /><Text style={styles.copy}>Restoring your adventure…</Text></View>;
 
   if (!token) {
     return <View style={styles.auth}>
-      <StatusBar style="light" />
       <View style={[styles.authArt, { paddingTop: insets.top + 24 }]}>
-        <LinearGradient colors={['#3C2578', colors.field, colors.background]} style={styles.authBackdrop} /><View pointerEvents="none" style={styles.authOrbitLarge} /><View pointerEvents="none" style={styles.authOrbitSmall} />
+        <LinearGradient colors={gradients.auth} style={styles.authBackdrop} /><View pointerEvents="none" style={styles.authOrbitLarge} /><View pointerEvents="none" style={styles.authOrbitSmall} />
         <View style={styles.authArtContent}><View style={styles.authWordmark}><View style={styles.bigMark}><Text style={styles.markText}>S</Text></View><Text style={styles.authWordBrand}>SocialQuest</Text></View><Text style={styles.authKicker}>REAL WORLD · REAL PEOPLE</Text><Text style={[styles.authDisplayTitle, width < 360 && styles.authDisplayTitleCompact]}>A little adventure.{`\n`}<Text style={styles.authDisplayTitleAccent}>A real connection.</Text></Text></View>
       </View>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.authForm}>
@@ -1136,12 +1256,13 @@ function SocialQuestApp() {
           <Text style={styles.eyebrow}>{mode === 'login' ? 'WELCOME IN' : 'START YOUR STORY'}</Text>
           <Text style={styles.authTitle}>{mode === 'login' ? 'Find your people.' : 'Start your story.'}</Text>
           <Text style={styles.authDescription}>{mode === 'login' ? 'Log in and see what your community is up to.' : 'A few details and you are ready for your first quest.'}</Text>
-          {mode === 'register' && <><Text style={styles.authLabel}>DISPLAY NAME</Text><TextInput style={styles.input} value={displayName} onChangeText={setDisplayName} placeholder="What should people call you?" placeholderTextColor={colors.muted} autoCapitalize="words" /></>}
-          <Text style={styles.authLabel}>USERNAME</Text><TextInput style={styles.input} value={username} onChangeText={setUsername} placeholder="your_username" placeholderTextColor={colors.muted} autoCapitalize="none" />
-          {mode === 'register' && <><Text style={styles.authLabel}>EMAIL</Text><TextInput style={styles.input} value={email} onChangeText={setEmail} placeholder="you@example.com" placeholderTextColor={colors.muted} keyboardType="email-address" autoCapitalize="none" /></>}
-          <Text style={styles.authLabel}>PASSWORD</Text><TextInput style={styles.input} value={password} onChangeText={setPassword} placeholder="••••••••" placeholderTextColor={colors.muted} secureTextEntry autoCapitalize="none" onSubmitEditing={authenticate} />
-          <Pressable style={[styles.primary, busy && styles.dim]} onPress={authenticate} disabled={busy}><Text style={styles.primaryText}>{busy ? 'Please wait…' : mode === 'login' ? 'Log in →' : 'Create my account →'}</Text></Pressable>
-          <Pressable onPress={() => setMode(mode === 'login' ? 'register' : 'login')}><Text style={styles.switchText}>{mode === 'login' ? 'New here?  Create an account' : 'Already a member?  Log in'}</Text></Pressable>
+          {mode === 'register' && <><Text style={styles.authLabel}>DISPLAY NAME</Text><TextInput accessibilityLabel="Display name" style={styles.input} value={displayName} onChangeText={setDisplayName} placeholder="What should people call you?" placeholderTextColor={colors.muted} autoCapitalize="words" autoComplete="name" textContentType="name" returnKeyType="next" submitBehavior="submit" onSubmitEditing={() => usernameInput.current?.focus()} /></>}
+          <Text style={styles.authLabel}>USERNAME</Text><TextInput ref={usernameInput} accessibilityLabel="Username" style={styles.input} value={username} onChangeText={setUsername} placeholder="your_username" placeholderTextColor={colors.muted} autoCapitalize="none" autoCorrect={false} autoComplete={mode === 'login' ? 'username' : 'username-new'} textContentType="username" returnKeyType="next" submitBehavior="submit" onSubmitEditing={() => (mode === 'register' ? emailInput : passwordInput).current?.focus()} />
+          {mode === 'register' && <><Text style={styles.authLabel}>EMAIL</Text><TextInput ref={emailInput} accessibilityLabel="Email" style={styles.input} value={email} onChangeText={setEmail} placeholder="you@example.com" placeholderTextColor={colors.muted} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} autoComplete="email" textContentType="emailAddress" returnKeyType="next" submitBehavior="submit" onSubmitEditing={() => passwordInput.current?.focus()} /></>}
+          <Text style={styles.authLabel}>PASSWORD</Text><TextInput ref={passwordInput} accessibilityLabel="Password" style={styles.input} value={password} onChangeText={setPassword} placeholder="••••••••" placeholderTextColor={colors.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} textContentType={mode === 'login' ? 'password' : 'newPassword'} returnKeyType="go" onSubmitEditing={authenticate} />
+          <Pressable accessibilityRole="button" accessibilityState={{busy, disabled: busy}} style={[styles.primary, iconLabelRow, busy && styles.dim]} onPress={authenticate} disabled={busy}>{busy ? <ActivityIndicator color={colors.onPrimary} /> : null}<Text style={styles.primaryText}>{busy ? 'Please wait…' : mode === 'login' ? 'Log in →' : 'Create my account →'}</Text></Pressable>
+          <Pressable accessibilityRole="button" onPress={() => setMode(mode === 'login' ? 'register' : 'login')}><Text style={styles.switchText}>{mode === 'login' ? 'New here?  Create an account' : 'Already a member?  Log in'}</Text></Pressable>
+          <AppearanceSettings />
           <Text style={styles.authNote}>By continuing, you agree to build a kind, consent-first community.</Text>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -1152,7 +1273,7 @@ function SocialQuestApp() {
   const renderCommentThread = (comment: CommentItem, depth = 0): ReactNode => {
     const childComments = comments.filter(candidate => candidate.parent === comment.id);
     return <View key={comment.id} style={[styles.commentThread, depth > 0 && styles.commentThreadChild]}>
-      <Pressable onLongPress={() => showCommentOptions(comment)} style={[styles.commentCard, depth > 0 && styles.subcommentCard]}>
+      <Pressable accessibilityRole="button" onLongPress={() => showCommentOptions(comment)} style={[styles.commentCard, depth > 0 && styles.subcommentCard]}>
         <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(comment.author) + "'s profile"} onPress={() => { closeComments(); setSelectedUser(comment.author); }}><Avatar user={comment.author} /></Pressable>
         <View style={styles.commentCopy}>
           <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(comment.author) + "'s profile"} onPress={() => { closeComments(); setSelectedUser(comment.author); }}><Text style={styles.personName}>{nameOf(comment.author)}</Text></Pressable>
@@ -1167,12 +1288,15 @@ function SocialQuestApp() {
     </View>;
   };
 
-  const home = <FlatList data={posts} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><View style={socialStyles.homeHeading}><Text style={styles.eyebrow}>YOUR NEXT ADVENTURE</Text><Pressable accessibilityRole="button" accessibilityLabel="Search people" style={socialStyles.searchIconButton} onPress={() => openPeopleList('search')}><GlassBackdrop /><SearchIcon /></Pressable></View><Text style={styles.homeGreeting}>Hello,</Text><Text style={styles.title}>{nameOf(me)} <Text style={styles.homeSpark}>✦</Text></Text><View style={styles.questFilters}><Pressable accessibilityRole="button" accessibilityState={{selected: true}} style={[styles.questFilter, styles.questFilterActive]} onPress={() => void refresh(loadFeed)}><Text style={[styles.questFilterText, styles.questFilterTextActive]}>For you</Text></Pressable><Pressable accessibilityRole="button" style={styles.questFilter} onPress={() => void findNearbyEvents()}><Text style={styles.questFilterText}>Nearby</Text></Pressable><Pressable accessibilityRole="button" style={styles.questFilter} onPress={() => setTab('Reels')}><Text style={styles.questFilterText}>Reels</Text></Pressable></View><View style={styles.questSectionHeader}><Text style={styles.questSectionTitle}>Recommended quests</Text><Pressable onPress={() => setTab('Explore')}><Text style={styles.questSeeAll}>See all</Text></Pressable></View><View style={styles.mobileQuestDeck}>{events.slice(0, 2).map((event, index) => <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + event.name} key={event.id} style={styles.mobileQuestCard} onPress={() => void openEvent(event.id)}><EventArtwork image={event.cover_image} date={dateOf(event.starts_at)} live={event.quest_status === 'ACTIVE'} alternate={index % 2 === 1} compact /><View style={styles.mobileQuestCopy}><Text numberOfLines={2} style={styles.mobileQuestName}>{event.name}</Text><Text numberOfLines={1} style={styles.mobileQuestMeta}>{event.location_name}</Text><Text style={styles.mobileQuestXp}>{event.accepted_count}/{event.capacity} going</Text></View></Pressable>)}</View><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.homeComposer} onPress={() => openComposer(null)}><Avatar user={me} /><View style={styles.homeComposerCopy}><Text style={styles.homeComposerPrompt}>A moment worth sharing?</Text><View style={socialStyles.homeComposerActionRow}><Ionicons name="add-circle-outline" size={17} color={colors.accent} /><Text style={styles.homeComposerAction}>Share a photo, reel, or thought</Text></View></View></Pressable>{!deviceNotifications.enabled ? <Pressable accessibilityRole="button" accessibilityLabel="Set up notifications" style={styles.notificationNudge} onPress={() => setTab('Notifications')}><Ionicons name="notifications-outline" size={19} color={colors.gold} /><View style={{flex: 1}}><Text style={styles.notificationNudgeTitle}>Stay in the loop</Text><Text style={styles.personMeta}>A heads-up for your next adventure.</Text></View><Ionicons name="chevron-forward" size={16} color={colors.muted} /></Pressable> : null}</View>} ListEmptyComponent={<Empty icon="✦" title="Your feed is ready." body="Share a moment from your next adventure." />} renderItem={({ item }) => <PostCard onLike={post => void toggleLike(post)} post={item} mine={item.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={post => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + post.id + '/')} onComments={post => void openComments(post)} onOpenProfile={setSelectedUser} />} />;
-  const explore = <FlatList data={events} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(() => loadDiscover(query.trim()))} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>MAKE A PLAN</Text><Text style={styles.title}>Find your next <Text style={styles.serif}>story.</Text></Text><Text style={styles.copy}>Search events, places, hosts, and people.</Text><Pressable style={styles.primary} onPress={() => openEventEditor()}><View style={iconLabelRow}><Text style={styles.primaryText}>Host an adventure</Text><Ionicons name="add-circle-outline" size={19} color="#fff" /></View></Pressable><Pressable style={[styles.nearbyButton, iconLabelRow, nearbyActive && styles.nearbyButtonActive]} onPress={() => void findNearbyEvents()}><Ionicons name="navigate-outline" size={17} color={nearbyActive ? '#FFFFFF' : colors.accent} /><Text style={[styles.nearbyButtonText, nearbyActive && styles.nearbyButtonTextActive]}>{nearbyActive ? 'Showing events near you' : 'Find events near me'}</Text></Pressable><View style={styles.searchRow}><TextInput style={styles.searchInput} placeholderTextColor={colors.muted} value={query} onChangeText={setQuery} placeholder="Search events or people" returnKeyType="search" onSubmitEditing={search} /><Pressable style={styles.searchButton} onPress={search}><Text style={styles.searchText}>Search</Text></Pressable></View>{query.trim() ? <View style={styles.matches}><Text style={styles.section}>PEOPLE · {people.length}</Text>{people.length ? people.map(person => <Pressable key={person.id} style={styles.personCard} onPress={() => setSelectedUser(person)}><Avatar user={person} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(person)}</Text><Text style={styles.personMeta}>@{person.username} · ★ {person.karma ?? 0} · {person.xp || 0} XP</Text></View></Pressable>) : <Text style={styles.muted}>No matching people.</Text>}</View> : null}</View>} ListEmptyComponent={<Empty icon="⌖" title="No matching events." body="Try a place, event name, or host." />} renderItem={({ item }) => <View style={styles.eventCard}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + item.name} onPress={() => void openEvent(item.id)}><EventArtwork image={item.cover_image} date={dateOf(item.starts_at)} live={item.quest_status === 'ACTIVE'} alternate={item.id % 2 === 0} /><View style={styles.eventText}><Text style={styles.eventName}>{item.name}</Text><Text style={styles.eventMeta}>{item.location_name} · {item.accepted_count}/{item.capacity} going</Text>{item.recommendation_reason ? <Text style={styles.eventRecommendation}>For you · {item.recommendation_reason}</Text> : null}</View></Pressable><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.host) + "'s profile"} style={styles.eventHostLink} onPress={() => setSelectedUser(item.host)}><Text style={[styles.hostMeta, styles.eventHostLinkText]}>Hosted by {nameOf(item.host)} · ★ {item.host.karma ?? 0}</Text></Pressable></View>} />;
-  const reelsView = <FlatList data={reels} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>SMALL MOMENTS, ON REPEAT</Text><Text style={styles.title}>Quest <Text style={styles.serif}>reels.</Text></Text><Text style={styles.copy}>Keep the good moments moving.</Text></View>} ListEmptyComponent={<Empty icon="◉" title="No reels yet." body="The next great moment could be yours." />} renderItem={({ item, index }) => <View style={[styles.reel, { height: 'auto', minHeight: 300 }, index % 2 ? styles.reelBlue : styles.reelPurple]}>{item.media ? <ReelVideo uri={item.media} /> : <Ionicons name="play-circle-outline" size={54} color="#fff" />}<Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.author) + "'s profile"} onPress={() => setSelectedUser(item.author)}><Text style={styles.reelAuthor}>{nameOf(item.author)}</Text></Pressable><RelativeTime value={item.created_at} /><QuestAttribution quest={item.quest_title} event={item.event_name} /><Text style={styles.reelBody}>{item.body || 'A moment worth keeping.'}</Text><Pressable style={[styles.reelShare, iconLabelRow]} onPress={() => void shareResource('A SocialQuest reel', 'Come see this community reel on SocialQuest.', '/s/post/' + item.id + '/')}><Ionicons name="paper-plane-outline" size={16} color="#fff" /><Text style={styles.reelShareText}>Share</Text></Pressable></View>} />;
+  const home = <FlatList data={posts} CellRendererComponent={FeedCell} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><View style={socialStyles.homeHeading}><Text style={styles.eyebrow}>YOUR NEXT ADVENTURE</Text><Pressable accessibilityRole="button" accessibilityLabel="Search events or people" style={socialStyles.searchIconButton} onPress={() => { setSearchFocusRequest(value => value + 1); setTab('Explore'); }}><GlassBackdrop /><SearchIcon /></Pressable></View><Text style={styles.homeGreeting}>Hello,</Text><Text style={styles.title}>{nameOf(me)} <Text style={styles.homeSpark}>✦</Text></Text><View style={styles.questFilters}><Pressable accessibilityRole="button" accessibilityState={{selected: true}} style={[styles.questFilter, styles.questFilterActive]} onPress={() => void refresh(loadFeed)}><Text style={[styles.questFilterText, styles.questFilterTextActive]}>For you</Text></Pressable><Pressable accessibilityRole="button" style={styles.questFilter} onPress={() => void findNearbyEvents()}><Text style={styles.questFilterText}>Nearby</Text></Pressable><Pressable accessibilityRole="button" style={styles.questFilter} onPress={() => setTab('Reels')}><Text style={styles.questFilterText}>Reels</Text></Pressable></View><View style={styles.questSectionHeader}><Text style={styles.questSectionTitle}>Recommended quests</Text><Pressable accessibilityRole="button" onPress={() => setTab('Explore')}><Text style={styles.questSeeAll}>See all</Text></Pressable></View><View style={styles.mobileQuestDeck}>{events.slice(0, 2).map((event, index) => <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + event.name} key={event.id} style={styles.mobileQuestCard} onPress={() => void openEvent(event.id)}><EventArtwork image={event.cover_image} date={dateOf(event.starts_at)} live={event.quest_status === 'ACTIVE'} alternate={index % 2 === 1} compact /><View style={styles.mobileQuestCopy}><Text numberOfLines={2} style={styles.mobileQuestName}>{event.name}</Text><Text numberOfLines={1} style={styles.mobileQuestMeta}>{event.location_name}</Text><Text style={styles.mobileQuestXp}>{event.accepted_count}/{event.capacity} going</Text></View></Pressable>)}</View><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.homeComposer} onPress={() => openComposer(null)}><Avatar user={me} /><View style={styles.homeComposerCopy}><Text style={styles.homeComposerPrompt}>A moment worth sharing?</Text><View style={socialStyles.homeComposerActionRow}><Ionicons name="add-circle-outline" size={17} color={colors.accent} /><Text style={styles.homeComposerAction}>Share a photo, reel, or thought</Text></View></View></Pressable>{!deviceNotifications.enabled ? <Pressable accessibilityRole="button" accessibilityLabel="Set up notifications" style={styles.notificationNudge} onPress={() => setTab('Notifications')}><Ionicons name="notifications-outline" size={19} color={colors.muted} /><View style={{flex: 1}}><Text style={styles.notificationNudgeTitle}>Stay in the loop</Text><Text style={styles.personMeta}>A heads-up for your next adventure.</Text></View><Ionicons name="chevron-forward" size={16} color={colors.muted} /></Pressable> : null}</View>} ListEmptyComponent={<Empty loading={accountLoading} icon="✦" title="Your feed is ready." body="Share a moment from your next adventure." />} renderItem={({ item }) => <PostCard onLike={post => void toggleLike(post)} post={item} mine={item.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={post => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + post.id + '/')} onComments={post => void openComments(post)} onOpenProfile={setSelectedUser} />} />;
+  const explore = <DiscoverSearch<EventItem, User> api={api} query={query} onQuery={value => { setQuery(value); setNearbyActive(false); }} kind={searchKind} onKind={setSearchKind} focusRequest={searchFocusRequest} refreshKey={events} nearbyEvents={nearbyActive ? events : null} onNearby={() => void findNearbyEvents()} onHost={() => openEventEditor()}
+    renderEvent={item => <View style={styles.eventCard}><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + item.name} onPress={() => void openEvent(item.id)}><EventArtwork image={item.cover_image} date={dateOf(item.starts_at)} live={item.quest_status === 'ACTIVE'} alternate={item.id % 2 === 0} /><View style={styles.eventText}><Text style={styles.eventName}>{item.name}</Text><Text style={styles.eventMeta}>{item.location_name} · {item.accepted_count}/{item.capacity} going</Text>{item.recommendation_reason ? <Text style={styles.eventRecommendation}>For you · {item.recommendation_reason}</Text> : null}</View></Pressable><Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.host) + "'s profile"} style={styles.eventHostLink} onPress={() => setSelectedUser(item.host)}><Text style={[styles.hostMeta, styles.eventHostLinkText]}>Hosted by {nameOf(item.host)} · ★ {item.host.karma ?? 0}</Text></Pressable></View>}
+    renderPerson={person => <Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(person) + "'s profile"} style={styles.personCard} onPress={() => setSelectedUser(person)}><Avatar user={person} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(person)}</Text><Text style={styles.personMeta}>@{person.username}{person.city ? ' · ' + person.city : ''}</Text><Text style={styles.personMeta}>★ {person.karma ?? 0} · {person.xp || 0} XP</Text></View><Ionicons name="chevron-forward" size={17} color={colors.muted} /></Pressable>} />;
+  const reelsView = <FlatList data={reels} CellRendererComponent={ReelCell} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadFeed)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>SMALL MOMENTS, ON REPEAT</Text><Text style={styles.title}>Quest <Text style={styles.serif}>reels.</Text></Text><Text style={styles.copy}>Keep the good moments moving.</Text></View>} ListEmptyComponent={<Empty loading={accountLoading} icon="◉" title="No reels yet." body="The next great moment could be yours." />} renderItem={({ item, index }) => <View style={[styles.reel, { height: 'auto', minHeight: 300 }, index % 2 ? styles.reelBlue : styles.reelPurple]}>{item.media ? <ReelVideo uri={item.media} /> : <Ionicons name="play-circle-outline" size={54} color={colors.accent} />}<Pressable accessibilityRole="button" accessibilityLabel={'Open ' + nameOf(item.author) + "'s profile"} onPress={() => setSelectedUser(item.author)}><Text style={styles.reelAuthor}>{nameOf(item.author)}</Text></Pressable><RelativeTime value={item.created_at} /><QuestAttribution quest={item.quest_title} event={item.event_name} /><Text style={styles.reelBody}>{item.body || 'A moment worth keeping.'}</Text><Pressable accessibilityRole="button" style={[styles.reelShare, iconLabelRow]} onPress={() => void shareResource('A SocialQuest reel', 'Come see this community reel on SocialQuest.', '/s/post/' + item.id + '/')}><Ionicons name="paper-plane-outline" size={16} color={colors.accent} /><Text style={styles.reelShareText}>Share</Text></Pressable></View>} />;
+  const unreadMessageCount = conversations.reduce((count, chat) => count + (chat.unread_count || 0), 0);
   const activeChatPerson = activeChat?.participants.find(person => person.id !== me?.id);
-  const chats = activeChat ? <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={Platform.OS === 'ios' ? appHeaderHeight : 0} style={styles.chatScreen}><View style={[styles.chatHeader, glassStyles.toolbar]}><GlassBackdrop native /><Pressable accessibilityRole="button" accessibilityLabel="Back to conversations" style={styles.chatBackButton} onPress={() => { setEmojiPickerOpen(false); Keyboard.dismiss(); setActiveChat(null); }}><Ionicons name="chevron-back" size={24} color={colors.text} /></Pressable><Pressable accessibilityRole="button" accessibilityLabel={activeChat.is_group ? 'View group participants' : 'Open ' + nameOf(activeChatPerson) + "'s profile"} style={styles.chatPerson} onPress={() => activeChat.is_group ? setChatMembersOpen(true) : activeChatPerson && setSelectedUser(activeChatPerson)}>{activeChat.is_group ? <GroupAvatar /> : <Avatar user={activeChatPerson} />}<View style={styles.chatIdentity}><Text numberOfLines={2} style={styles.chatTitle}>{activeChat.display_name}</Text><Text style={[styles.chatSubtitle, appActive && !activeChat.is_group && activeChatPerson?.is_online && socialStyles.online]}>{activeChat.is_group ? (activeChat.event ? 'Event group' : 'Group chat') + ' · ' + activeChat.participants.length + ' participants' : appActive && activeChatPerson?.is_online ? '● Online' : 'Direct conversation'}</Text></View></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Manage chat" style={styles.chatMenu} onPress={showChatOptions}><Ionicons name="ellipsis-horizontal" size={23} color={colors.text} /></Pressable></View><MessageList key={activeChat.id} currentUserId={me?.id} style={styles.messageScroller} data={messages} keyExtractor={item => String(item.id)} contentContainerStyle={styles.messageList} keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} keyboardShouldPersistTaps="handled" onRefresh={() => void refresh(() => loadMessages(activeChat.id))} refreshing={refreshing} ListEmptyComponent={<Empty icon="✦" title="This is a new conversation." body="A thoughtful hello is plenty." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel="Message options" delayLongPress={300} onLongPress={() => showMessageOptions(item)} style={[styles.bubble, item.sender.id === me?.id && styles.bubbleMine]}>{activeChat.is_group && item.sender.id !== me?.id ? <Text style={styles.groupSender}>{nameOf(item.sender)}</Text> : null}<Text style={[styles.bubbleText, item.sender.id === me?.id && styles.bubbleMineText, item.deleted_for_everyone && styles.bubbleDeletedText]}>{item.deleted_for_everyone ? 'Message deleted' : item.body}</Text>{!item.deleted_for_everyone ? <Text style={[styles.bubbleTime, item.sender.id === me?.id && styles.bubbleMineTime]}>{item.sender.id === me?.id ? 'You · ' : ''}{new Date(item.created_at).toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' })}{item.edited_at ? ' · edited' : ''}</Text> : null}</Pressable>} />{emojiPickerOpen ? <View style={styles.emojiPicker}>{chatEmojis.map(emoji => <Pressable key={emoji} accessibilityRole="button" accessibilityLabel={'Add ' + emoji} style={styles.emojiChoice} onPress={() => { setMessage(current => current + emoji); setEmojiPickerOpen(false); }}><Text style={styles.emojiChoiceText}>{emoji}</Text></Pressable>)}</View> : null}<View style={[styles.composer, glassStyles.toolbar]}><GlassBackdrop native /><View style={styles.composerMark}><Ionicons name="sparkles-outline" size={20} color={colors.sky} /></View><Pressable accessibilityRole="button" accessibilityLabel="Add an emoji" style={styles.emojiTrigger} onPress={() => setEmojiPickerOpen(current => !current)}><Ionicons name="happy-outline" size={22} color={colors.muted} /></Pressable><TextInput numberOfLines={1} style={styles.messageInput} value={message} onChangeText={setMessage} maxLength={2000} accessibilityLabel="Message" placeholder="Message…" placeholderTextColor={colors.muted} multiline /><Pressable accessibilityRole="button" accessibilityLabel="Hide keyboard" style={styles.keyboardDismiss} onPress={Keyboard.dismiss}><Ionicons name="chevron-down" size={20} color={colors.muted} /></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Send message" style={styles.send} onPress={send}><Ionicons name="arrow-up" size={22} color="#FFFFFF" /></Pressable></View></KeyboardAvoidingView> : <FlatList data={conversations} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadChats)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>YOUR INBOX</Text><View style={styles.chatIntroTitle}><Text style={styles.title}>Messages</Text><View style={styles.chatCount}><Text style={styles.chatCountText}>{conversations.length}</Text></View></View><Text style={styles.copy}>Keep the good energy going after you meet.</Text><Text style={[styles.section, { marginTop: 22 }]}>START A NEW CHAT</Text>{following.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.contacts}>{following.map(person => <Pressable key={person.id} style={styles.contact} onPress={() => void openChat(person)} onLongPress={() => setSelectedUser(person)}><Avatar user={person} /><Text numberOfLines={1} style={styles.contactName}>{nameOf(person)}</Text></Pressable>)}</ScrollView> : <Text style={styles.chatFollowHint}>Follow someone to start a chat with them.</Text>}<Text style={styles.section}>CONVERSATIONS</Text></View>} ListEmptyComponent={<Empty icon="✉" title="Your conversations will live here." body="Start with someone you met in Explore." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel={'Open chat: ' + item.display_name} style={styles.conversation} onPress={() => setActiveChat(item)} onLongPress={() => { if (item.is_group) {setActiveChat(item); setChatMembersOpen(true); return;} const person = item.participants.find(person => person.id !== me?.id); if (person) setSelectedUser(person); }}>{item.is_group ? <GroupAvatar /> : <Avatar user={item.participants.find(person => person.id !== me?.id)} />}<View style={styles.conversationCopy}><View style={styles.conversationTop}><Text numberOfLines={1} style={styles.personName}>{item.display_name}</Text><Text style={styles.conversationTime}>{item.latest_message ? dateOf(item.latest_message.created_at) : ''}</Text></View><Text numberOfLines={1} style={styles.personMeta}>{item.latest_message?.deleted_for_everyone ? 'Message deleted' : item.latest_message?.body || (item.is_group ? 'Say hello to your event group' : 'Start with a simple hello')}</Text>{item.is_group ? <Text style={styles.personMeta}>{item.participants.length} participants · {item.event ? 'Event group' : 'Group chat'}</Text> : null}{appActive && item.participants.some(person => person.id !== me?.id && person.is_online) ? <Text style={socialStyles.online}>● Online</Text> : null}</View></Pressable>} />;
-  const notificationsView = <FlatList data={notifications} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadNotifications)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>STAY IN THE LOOP</Text><Text style={styles.title}>Your <Text style={styles.serif}>notifications.</Text></Text><Text style={styles.copy}>Comment replies, RSVP activity, and host decisions appear here.</Text><Pressable style={styles.outline} onPress={() => void markNotificationsRead()}><Text style={styles.outlineText}>Mark all read</Text></Pressable>{notificationPermissionCard}</View>} ListEmptyComponent={<Empty icon="✦" title="Nothing new yet." body="Comment replies and RSVP activity will show up here." />} renderItem={({ item }) => <Pressable style={[styles.notificationCard, !item.is_read && styles.notificationUnread]} onPress={() => void openNotification(item)}><View style={[styles.notificationIcon, {backgroundColor: notificationAccent(item.kind).surface}]}><Ionicons name={item.kind === 'COMMENT_REPLY' ? 'chatbubble-ellipses-outline' : 'notifications-outline'} size={21} color={notificationAccent(item.kind).text} /></View><View style={styles.notificationCopy}><Text style={styles.notificationText}>{item.text}</Text><Text style={styles.personMeta}>{item.event?.name || (item.kind === 'COMMENT_REPLY' ? 'Open replies' : 'SocialQuest')} · {dateOf(item.created_at)}</Text></View></Pressable>} />;
+  const chats = activeChat ? <View style={styles.chatScreen}><View style={[styles.chatHeader, glassStyles.toolbar]}><GlassBackdrop native /><Pressable accessibilityRole="button" accessibilityLabel="Back to conversations" style={styles.chatBackButton} onPress={() => { setEmojiPickerOpen(false); Keyboard.dismiss(); setActiveChat(null); }}><Ionicons name="chevron-back" size={24} color={colors.text} /></Pressable><Pressable accessibilityRole="button" accessibilityLabel={activeChat.is_group ? 'View group participants' : 'Open ' + nameOf(activeChatPerson) + "'s profile"} style={styles.chatPerson} onPress={() => activeChat.is_group ? setChatMembersOpen(true) : activeChatPerson && setSelectedUser(activeChatPerson)}>{activeChat.is_group ? <GroupAvatar /> : <Avatar user={activeChatPerson} />}<View style={styles.chatIdentity}><Text numberOfLines={2} style={styles.chatTitle}>{activeChat.display_name}</Text><Text style={[styles.chatSubtitle, appActive && !activeChat.is_group && activeChatPerson?.is_online && socialStyles.online]}>{activeChat.is_group ? (activeChat.event ? 'Event group' : 'Group chat') + ' · ' + activeChat.participants.length + ' participants' : appActive && activeChatPerson?.is_online ? '● Online' : 'Direct conversation'}</Text></View></Pressable><UnreadBadge count={activeChat.unread_count || 0} /><Pressable accessibilityRole="button" accessibilityLabel="Manage chat" style={styles.chatMenu} onPress={showChatOptions}><Ionicons name="ellipsis-horizontal" size={23} color={colors.text} /></Pressable></View><KeyboardLift><MessageList key={activeChat.id} currentUserId={me?.id} onReadThrough={id => void markChatRead(activeChat.id, id)} style={styles.messageScroller} data={messages} keyExtractor={item => String(item.id)} contentContainerStyle={styles.messageList} keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} keyboardShouldPersistTaps="handled" onRefresh={() => void refresh(() => loadMessages(activeChat.id))} refreshing={refreshing} ListEmptyComponent={<Empty icon="✦" title="This is a new conversation." body="A thoughtful hello is plenty." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel="Message options" delayLongPress={300} onLongPress={() => showMessageOptions(item)} style={[styles.bubble, item.sender.id === me?.id && styles.bubbleMine]}>{activeChat.is_group && item.sender.id !== me?.id ? <Text style={styles.groupSender}>{nameOf(item.sender)}</Text> : null}<Text style={[styles.bubbleText, item.sender.id === me?.id && styles.bubbleMineText, item.deleted_for_everyone && styles.bubbleDeletedText]}>{item.deleted_for_everyone ? 'Message deleted' : item.body}</Text>{!item.deleted_for_everyone ? <Text style={[styles.bubbleTime, item.sender.id === me?.id && styles.bubbleMineTime]}>{item.sender.id === me?.id ? 'You · ' : ''}{new Date(item.created_at).toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' })}{item.edited_at ? ' · edited' : ''}</Text> : null}</Pressable>} />{emojiPickerOpen ? <View style={styles.emojiPicker}>{chatEmojis.map(emoji => <Pressable key={emoji} accessibilityRole="button" accessibilityLabel={'Add ' + emoji} style={styles.emojiChoice} onPress={() => { setMessage(current => current + emoji); setEmojiPickerOpen(false); }}><Text style={styles.emojiChoiceText}>{emoji}</Text></Pressable>)}</View> : null}<View style={[styles.composer, glassStyles.toolbar]}><GlassBackdrop native /><View style={styles.composerMark}><Ionicons name="sparkles-outline" size={20} color={colors.accent} /></View><Pressable accessibilityRole="button" accessibilityLabel="Add an emoji" style={styles.emojiTrigger} onPress={() => setEmojiPickerOpen(current => !current)}><Ionicons name="happy-outline" size={22} color={colors.muted} /></Pressable><TextInput numberOfLines={1} style={styles.messageInput} value={message} onChangeText={setMessage} maxLength={2000} accessibilityLabel="Message" placeholder="Message…" placeholderTextColor={colors.muted} multiline /><Pressable accessibilityRole="button" accessibilityLabel="Hide keyboard" style={styles.keyboardDismiss} onPress={Keyboard.dismiss}><Ionicons name="chevron-down" size={20} color={colors.muted} /></Pressable><Pressable accessibilityRole="button" accessibilityLabel="Send message" style={styles.send} onPress={send}><Ionicons name="arrow-up" size={22} color={colors.onPrimary} /></Pressable></View></KeyboardLift></View> : <FlatList data={conversations} CellRendererComponent={ChatCell} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadChats)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>YOUR INBOX</Text><View style={styles.chatIntroTitle}><Text style={styles.title}>Messages</Text><UnreadBadge count={unreadMessageCount} /></View><Text style={styles.copy}>Keep the good energy going after you meet.</Text><Text style={[styles.section, { marginTop: 22 }]}>START A NEW CHAT</Text>{following.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.contacts}>{following.map(person => <Pressable accessibilityRole="button" key={person.id} style={styles.contact} onPress={() => void openChat(person)} onLongPress={() => setSelectedUser(person)}><Avatar user={person} /><Text numberOfLines={1} style={styles.contactName}>{nameOf(person)}</Text></Pressable>)}</ScrollView> : <Text style={styles.chatFollowHint}>Follow someone to start a chat with them.</Text>}<Text style={styles.section}>CONVERSATIONS</Text></View>} ListEmptyComponent={<Empty loading={accountLoading} icon="✉" title="Your conversations will live here." body="Start with someone you met in Explore." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel={'Open chat: ' + item.display_name + (item.unread_count ? ', ' + item.unread_count + ' unread messages' : '')} style={[styles.conversation, item.unread_count > 0 && styles.conversationUnread]} onPress={() => setActiveChat(item)} onLongPress={() => { if (item.is_group) {setActiveChat(item); setChatMembersOpen(true); return;} const person = item.participants.find(person => person.id !== me?.id); if (person) setSelectedUser(person); }}>{item.is_group ? <GroupAvatar /> : <Avatar user={item.participants.find(person => person.id !== me?.id)} />}<View style={styles.conversationCopy}><View style={styles.conversationTop}><Text numberOfLines={1} style={styles.personName}>{item.display_name}</Text><View style={styles.conversationTrailing}><Text style={styles.conversationTime}>{item.latest_message ? dateOf(item.latest_message.created_at) : ''}</Text><UnreadBadge count={item.unread_count || 0} /></View></View><Text numberOfLines={1} style={styles.personMeta}>{item.latest_message?.deleted_for_everyone ? 'Message deleted' : item.latest_message?.body || (item.is_group ? 'Say hello to your event group' : 'Start with a simple hello')}</Text>{item.is_group ? <Text style={styles.personMeta}>{item.participants.length} participants · {item.event ? 'Event group' : 'Group chat'}</Text> : null}{appActive && item.participants.some(person => person.id !== me?.id && person.is_online) ? <Text style={socialStyles.online}>● Online</Text> : null}</View></Pressable>} />;
+  const notificationsView = <FlatList data={notifications} CellRendererComponent={AlertCell} keyExtractor={item => String(item.id)} contentContainerStyle={styles.list} onRefresh={() => void refresh(loadNotifications)} refreshing={refreshing} ListHeaderComponent={<View style={styles.intro}><Text style={styles.eyebrow}>STAY IN THE LOOP</Text><Text style={styles.title}>Your <Text style={styles.serif}>notifications.</Text></Text><Text style={styles.copy}>Comment replies, RSVP activity, and host decisions appear here.</Text><Pressable accessibilityRole="button" style={styles.outline} onPress={() => void markNotificationsRead()}><Text style={styles.outlineText}>Mark all read</Text></Pressable>{notificationPermissionCard}</View>} ListEmptyComponent={<Empty loading={accountLoading} icon="✦" title="Nothing new yet." body="Comment replies and RSVP activity will show up here." />} renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel={(item.is_read ? '' : 'Unread notification: ') + item.text} style={[styles.notificationCard, !item.is_read && styles.notificationUnread]} onPress={() => void openNotification(item)}><View style={[styles.notificationIcon, {backgroundColor: notificationAccent(item.kind).surface}]}><Ionicons name={item.kind === 'COMMENT_REPLY' ? 'chatbubble-ellipses-outline' : 'notifications-outline'} size={21} color={notificationAccent(item.kind).text} /></View><View style={styles.notificationCopy}>{!item.is_read ? <Text style={styles.unreadLabel}>● Unread</Text> : null}<Text style={styles.notificationText}>{item.text}</Text><Text style={styles.personMeta}>{item.event?.name || (item.kind === 'COMMENT_REPLY' ? 'Open replies' : 'SocialQuest')} · {dateOf(item.created_at)}</Text></View></Pressable>} />;
   const ownProfileEvents = [...hostedEvents, ...joinedEvents.filter(event => !hostedEvents.some(hosted => hosted.id === event.id))];
   const visibleProfilePosts = profilePostsOwner === profileUserId ? profilePosts : [];
   const filteredProfilePosts = visibleProfilePosts.filter(post => post.kind === profileSection);
@@ -1188,7 +1312,7 @@ function SocialQuestApp() {
         style={[socialStyles.profileTab, profileSection === section && socialStyles.profileTabActive]} onPress={() => setProfileSection(section)}>
         <GlassBackdrop accent={profileSection === section} />
         <Text style={[socialStyles.profileTabText, profileSection === section && socialStyles.profileTabTextActive]}>{label}</Text>
-        <Text style={socialStyles.profileTabCount}>{section !== 'EVENTS' && (profilePostsLoading || profilePostsError) ? '—' : count}</Text>
+        <Text style={[socialStyles.profileTabCount, profileSection === section && socialStyles.profileTabTextActive]}>{section !== 'EVENTS' && (profilePostsLoading || profilePostsError) ? '—' : count}</Text>
       </Pressable>;
     })}
   </View>;
@@ -1204,10 +1328,10 @@ function SocialQuestApp() {
     keyExtractor={item => ('kind' in item ? 'post-' : 'event-') + item.id}
     contentContainerStyle={[styles.profile, socialStyles.profileList]}
     onRefresh={() => void refresh(async () => { await Promise.all([loadMe(), refreshVisibleProfile()]); })} refreshing={refreshing}
-    ListHeaderComponent={<View><View style={styles.profileTop}><Avatar user={me} large /><View style={styles.profileIdentity}><Text style={styles.eyebrow}>YOUR ADVENTURE LOG</Text><Text style={styles.profileName}>{nameOf(me)}</Text><Text style={styles.personMeta}>@{me?.username} · {me?.city || 'Everywhere'}</Text></View></View><Pressable accessibilityRole="button" style={[styles.secondary, iconLabelRow]} onPress={openProfileEditor}><Ionicons name="create-outline" size={18} color={colors.accent} /><Text style={styles.secondaryText}>Edit profile</Text></Pressable><Text style={styles.profileBio}>{me?.bio || 'Here for the little adventures that turn into real stories.'}</Text><View style={styles.scores}><Score tone="gold" label="XP EARNED" value={String(me?.xp || 0)} /><Score tone="mint" label="KARMA" value={String(me?.karma ?? 0)} /></View><View style={socialStyles.followScores}><Score tone="neutral" label="FOLLOWERS ›" value={String(me?.follower_count || 0)} onPress={() => me && openPeopleList('followers', me)} /><Score tone="neutral" label="FOLLOWING ›" value={String(me?.following_count || 0)} onPress={() => me && openPeopleList('following', me)} /></View><Text style={styles.profileHelp}>XP tracks completed quests. Karma comes from fellow guests after events. Both are public and independent.</Text>{profileTabs(true)}{profileLoadNotice}</View>}
+    ListHeaderComponent={<View><View style={styles.profileTop}><Avatar user={me} large /><View style={styles.profileIdentity}><Text style={styles.eyebrow}>YOUR ADVENTURE LOG</Text><Text style={styles.profileName}>{nameOf(me)}</Text><Text style={styles.personMeta}>@{me?.username} · {me?.city || 'Everywhere'}</Text></View></View><Pressable accessibilityRole="button" style={[styles.secondary, iconLabelRow]} onPress={openProfileEditor}><Ionicons name="create-outline" size={18} color={colors.accent} /><Text style={styles.secondaryText}>Edit profile</Text></Pressable><Text style={styles.profileBio}>{me?.bio || 'Here for the little adventures that turn into real stories.'}</Text><View style={styles.scores}><Score tone="gold" label="XP EARNED" value={String(me?.xp || 0)} /><Score tone="mint" label="KARMA" value={String(me?.karma ?? 0)} /></View><View style={socialStyles.followScores}><Score tone="neutral" label="FOLLOWERS ›" value={String(me?.follower_count || 0)} onPress={() => me && openPeopleList('followers', me)} /><Score tone="neutral" label="FOLLOWING ›" value={String(me?.following_count || 0)} onPress={() => me && openPeopleList('following', me)} /></View><Text style={styles.profileHelp}>XP tracks completed quests. Karma comes from fellow guests after events. Both are public and independent.</Text><AppearanceSettings />{profileTabs(true)}{profileLoadNotice}</View>}
     ListEmptyComponent={profileSection === 'EVENTS' ? <Empty icon="⌖" title="Your quest log is ready." body="Events you host or join will appear here." /> : profileEmpty}
     renderItem={({item}) => 'kind' in item ? renderProfilePost(item) : <Pressable accessibilityRole="button" style={styles.personCard} onPress={() => void openEvent(item.id)}><View style={{flex: 1}}><Text style={styles.personName}>{item.name}</Text><Text style={styles.personMeta}>{item.host.id === me?.id ? 'Hosting' : 'Attending'} · {dateOf(item.starts_at)} · {item.location_name}</Text></View></Pressable>}
-    ListFooterComponent={<View><Pressable style={[styles.secondary, iconLabelRow]} onPress={() => me && void shareResource('A SocialQuest profile', 'Meet ' + nameOf(me) + ' on SocialQuest.', '/?view=profile&profile=' + me.id)}><Ionicons name="share-social-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Share profile</Text></Pressable><Pressable style={[styles.logout, iconLabelRow]} onPress={logout}><Ionicons name="log-out-outline" size={19} color={colors.danger} /><Text style={styles.logoutText}>Log out</Text></Pressable></View>}
+    ListFooterComponent={<View><Pressable accessibilityRole="button" style={[styles.secondary, iconLabelRow]} onPress={() => me && void shareResource('A SocialQuest profile', 'Meet ' + nameOf(me) + ' on SocialQuest.', '/?view=profile&profile=' + me.id)}><Ionicons name="share-social-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Share profile</Text></Pressable><Pressable accessibilityRole="button" style={[styles.logout, iconLabelRow]} onPress={confirmLogout}><Ionicons name="log-out-outline" size={19} color={colors.danger} /><Text style={styles.logoutText}>Log out</Text></Pressable></View>}
   />;
   const unreadCount = notifications.filter(item => !item.is_read).length;
   const mobileTabs: Array<{ tab: Tab; label: string; icon: IoniconName; activeIcon: IoniconName }> = [
@@ -1221,10 +1345,9 @@ function SocialQuestApp() {
   const view = tab === 'Home' ? home : tab === 'Explore' ? explore : tab === 'Chats' ? chats : tab === 'Notifications' ? notificationsView : tab === 'Reels' ? reelsView : profile;
 
   return <View style={styles.app}>
-    <StatusBar style="light" />
-    <View style={[styles.appHeader, { paddingTop: insets.top + 13 }]} onLayout={({ nativeEvent }) => setAppHeaderHeight(current => current === nativeEvent.layout.height ? current : nativeEvent.layout.height)}><Pressable style={styles.brandRow} onPress={() => setTab('Home')}><View style={styles.smallMark}><Text style={styles.smallMarkText}>S</Text></View><Text style={styles.appBrand}>socialquest</Text></Pressable><View style={styles.headerRight}><Pressable accessibilityRole="button" accessibilityLabel="Notifications" style={styles.headerAction} onPress={() => { setTab('Notifications'); void markNotificationsRead(); }}><GlassBackdrop /><Ionicons name="notifications-outline" size={21} color={colors.muted} />{unreadCount ? <Text style={styles.headerNotificationBadge}>{unreadCount > 9 ? '9+' : unreadCount}</Text> : null}</Pressable><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.headerCompose} onPress={() => openComposer(null)}><Ionicons name="add" size={25} color="#fff" /></Pressable></View></View>
+    <View style={[styles.appHeader, { paddingTop: insets.top + 13 }]} onLayout={({ nativeEvent }) => setAppHeaderHeight(current => current === nativeEvent.layout.height ? current : nativeEvent.layout.height)}><Pressable accessibilityRole="button" style={styles.brandRow} onPress={() => setTab('Home')}><View style={styles.smallMark}><Text style={styles.smallMarkText}>S</Text></View><Text style={styles.appBrand}>socialquest</Text></Pressable><View style={styles.headerRight}><Pressable accessibilityRole="button" accessibilityLabel="Notifications" style={styles.headerAction} onPress={() => setTab('Notifications')}><GlassBackdrop /><Ionicons name="notifications-outline" size={21} color={colors.muted} />{unreadCount ? <PulseBadge style={styles.headerNotificationBadge}>{unreadCount > 9 ? '9+' : unreadCount}</PulseBadge> : null}</Pressable><Pressable accessibilityRole="button" accessibilityLabel="Share a moment" style={styles.headerCompose} onPress={() => openComposer(null)}><Ionicons name="add" size={25} color={colors.onPrimary} /></Pressable></View></View>
     <ScreenTransition style={styles.content} transitionKey={tab}>{view}</ScreenTransition>
-    <View style={[styles.nav, glassStyles.toolbar, { paddingBottom: Math.max(insets.bottom - 8, 10) }]}><GlassBackdrop native radius={26} />{mobileTabs.map(item => <Pressable key={item.tab} accessibilityRole="tab" accessibilityLabel={item.label} accessibilityState={{selected: tab === item.tab}} style={[styles.navItem, glassStyles.navItem, tab === item.tab && glassStyles.navSelected]} onPress={() => { setTab(item.tab); if (item.tab !== 'Chats') setActiveChat(null); if (item.tab === 'Profile') void refresh(loadMe); if (item.tab === 'Notifications') void markNotificationsRead(); }}><View><Ionicons name={tab === item.tab ? item.activeIcon : item.icon} size={21} color={tab === item.tab ? colors.sky : colors.muted} />{item.tab === 'Notifications' && unreadCount ? <Text style={styles.navBadge}>{unreadCount > 9 ? '9+' : unreadCount}</Text> : null}</View><Text numberOfLines={1} style={[styles.navLabel, tab === item.tab && styles.navActive]}>{item.label}</Text></Pressable>)}</View>
+    <View style={[styles.nav, glassStyles.toolbar, { marginBottom: Math.max(insets.bottom - 14, 8) }]}><GlassBackdrop native radius={24} />{mobileTabs.map(item => <Pressable key={item.tab} accessibilityRole="tab" accessibilityLabel={item.label + (item.tab === 'Chats' && unreadMessageCount ? ', ' + unreadMessageCount + ' unread messages' : item.tab === 'Notifications' && unreadCount ? ', ' + unreadCount + ' unread notifications' : '')} accessibilityState={{selected: tab === item.tab}} style={[styles.navItem, glassStyles.navItem, tab === item.tab && glassStyles.navSelected]} onPress={() => { setTab(item.tab); if (item.tab !== 'Chats') setActiveChat(null); if (item.tab === 'Profile') void refresh(loadMe);  }}><Pop active={tab === item.tab}><Ionicons name={tab === item.tab ? item.activeIcon : item.icon} size={21} color={tab === item.tab ? colors.accent : colors.muted} />{(item.tab === 'Chats' ? unreadMessageCount : item.tab === 'Notifications' ? unreadCount : 0) > 0 ? <PulseBadge style={styles.navBadge}>{Math.min(99, item.tab === 'Chats' ? unreadMessageCount : unreadCount)}{(item.tab === 'Chats' ? unreadMessageCount : unreadCount) > 99 ? '+' : ''}</PulseBadge> : null}</Pop><Text numberOfLines={1} style={[styles.navLabel, tab === item.tab && styles.navActive]}>{item.label}</Text></Pressable>)}</View>
 
     <Modal visible={chatMembersOpen && !!activeChat} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setChatMembersOpen(false)}>
       <View style={[styles.app, {paddingTop: Math.max(insets.top, 24)}]}><View style={styles.groupHeader}><Text style={[styles.sheetTitle, {flex: 1}]}>Participants</Text><Pressable accessibilityRole="button" accessibilityLabel="Close participants" style={styles.commentsClose} onPress={() => setChatMembersOpen(false)}><Ionicons name="close" size={22} color={colors.text} /></Pressable></View>
@@ -1232,7 +1355,7 @@ function SocialQuestApp() {
       </View>
     </Modal>
     {profileEditorOpen && token && me ? <ProfileEditor key={me.id} user={me} onSave={saveProfile} onClose={() => setProfileEditorOpen(false)} /> : null}
-    <Modal visible={!!eventEditor} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => {if (!busy) {if (eventDateField) setEventDateField(null); else closeEventEditor();}}}>
+    <Modal visible={!!eventEditor} onDismiss={() => setEventEditorClosing(false)} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => {if (!busy) {if (eventDateField) setEventDateField(null); else closeEventEditor();}}}>
       <KeyboardAvoidingView style={styles.app} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         {eventEditor && eventDateField ? <EventDateTimePicker key={eventDateField} label={eventDateField === 'starts_at' ? 'Start time' : 'End time'} value={eventEditor[eventDateField]} minimum={eventDateField === 'ends_at' ? eventEditor.starts_at : undefined} onCancel={() => setEventDateField(null)} onConfirm={value => {
           setEventEditor(current => current && {...current, ...updateEventSchedule(current, eventDateField, value)});
@@ -1243,14 +1366,15 @@ function SocialQuestApp() {
           <Text style={styles.authLabel}>DESCRIPTION</Text><TextInput style={[styles.input, {minHeight:120, textAlignVertical: 'top'}]} accessibilityLabel="Event description" placeholder="What will people do?" placeholderTextColor={colors.muted} maxLength={2000} multiline value={eventEditor?.description || ''} onChangeText={value => setEventEditor(current => current && {...current, description:value})} />
           <Text style={styles.authLabel}>VENUE</Text><Pressable accessibilityRole="button" disabled={busy || eventLocating} style={[styles.outline, iconLabelRow, eventLocating && styles.dim]} onPress={() => void detectEventLocation()}><Ionicons name="locate-outline" size={18} color={colors.accent} /><Text style={styles.outlineText}>{eventLocating ? 'Detecting location…' : 'Detect my location'}</Text></Pressable>{eventLocationStatus ? <Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{eventLocationStatus}</Text> : null}
           <TextInput style={styles.input} accessibilityLabel="Event location" placeholder="Venue or address" placeholderTextColor={colors.muted} maxLength={160} value={eventEditor?.location_name || ''} onChangeText={changeEventLocation} />
+          <PlaceSuggestions query={eventEditor?.location_name || ''} active={eventEditor?.latitude == null && eventEditor?.longitude == null} maxLength={160} onPick={pickEventPlace} />
           <Text style={styles.authLabel}>WHEN</Text>
           <EventDateTimeField label="Starts at" disabled={busy} value={eventEditor?.starts_at || ''} onPress={() => {Keyboard.dismiss(); setEventDateField('starts_at');}} />
           <EventDateTimeField label="Ends at" disabled={busy} value={eventEditor?.ends_at || ''} onPress={() => {Keyboard.dismiss(); setEventDateField('ends_at');}} />
           <Text style={styles.personMeta}>Times are local to your device. If you move the start beyond the end, the end adjusts to keep the same duration.</Text>
           <Text style={styles.authLabel}>CAPACITY</Text><TextInput style={styles.input} accessibilityLabel="Capacity" placeholder="Capacity" placeholderTextColor={colors.muted} keyboardType="number-pad" value={eventEditor?.capacity || ''} onChangeText={value => setEventEditor(current => current && {...current, capacity:value})} />
-          <View style={styles.ratingActions}>{(['PUBLIC', 'PRIVATE'] as const).map(privacy => <Pressable key={privacy} style={[styles.ratingChoice, eventEditor?.privacy === privacy && styles.ratingChoiceSelected]} onPress={() => setEventEditor(current => current && {...current, privacy})}><Text style={[styles.ratingChoiceText, eventEditor?.privacy === privacy && styles.ratingChoiceSelectedText]}>{privacy === 'PUBLIC' ? 'Public event' : 'Invite only'}</Text></Pressable>)}</View>
-          <Pressable disabled={busy || eventLocating} style={[styles.primary, (busy || eventLocating) && styles.dim]} onPress={() => void saveEvent()}><Text style={styles.primaryText}>{busy ? 'Saving…' : eventEditor?.id ? 'Save event' : 'Publish and generate quests'}</Text></Pressable>
-          <Pressable disabled={busy} style={styles.secondary} onPress={closeEventEditor}><Text style={styles.secondaryText}>Cancel</Text></Pressable>
+          <View style={styles.ratingActions}>{(['PUBLIC', 'PRIVATE'] as const).map(privacy => <Pressable accessibilityRole="button" key={privacy} style={[styles.ratingChoice, eventEditor?.privacy === privacy && styles.ratingChoiceSelected]} onPress={() => setEventEditor(current => current && {...current, privacy})}><Text style={[styles.ratingChoiceText, eventEditor?.privacy === privacy && styles.ratingChoiceSelectedText]}>{privacy === 'PUBLIC' ? 'Public event' : 'Invite only'}</Text></Pressable>)}</View>
+          <Pressable accessibilityRole="button" disabled={busy || eventLocating} style={[styles.primary, (busy || eventLocating) && styles.dim]} onPress={() => void saveEvent()}><Text style={styles.primaryText}>{busy ? 'Saving…' : eventEditor?.id ? 'Save event' : 'Publish and generate quests'}</Text></Pressable>
+          <Pressable accessibilityRole="button" disabled={busy} style={styles.secondary} onPress={closeEventEditor}><Text style={styles.secondaryText}>Cancel</Text></Pressable>
         </ScrollView>
       </KeyboardAvoidingView>
     </Modal>
@@ -1282,7 +1406,7 @@ function SocialQuestApp() {
           <Pressable accessibilityRole="button" accessibilityLabel="Use edited photo" disabled={photoEditorBusy} style={[styles.photoEditorHeaderAction, styles.photoEditorDoneButton, photoEditorBusy && styles.dim]} onPress={() => { if (photoEditor) setMomentMedia(photoEditor.working); setPhotoEditor(null); }}><Text style={styles.photoEditorDone}>Done</Text></Pressable>
         </View>
         <View style={styles.photoEditorStage}>
-          {photoEditor ? <Image key={photoEditor.working.uri} style={styles.photoEditorImage} source={{ uri: photoEditor.working.uri }} resizeMode="contain" /> : null}
+          {photoEditor ? <Image accessible accessibilityLabel="Photo being edited" key={photoEditor.working.uri} style={styles.photoEditorImage} source={{ uri: photoEditor.working.uri }} resizeMode="contain" /> : null}
           <View pointerEvents="none" style={styles.cropGrid}><View style={[styles.cropGridLine, styles.cropGridVerticalOne]} /><View style={[styles.cropGridLine, styles.cropGridVerticalTwo]} /><View style={[styles.cropGridLine, styles.cropGridHorizontalOne]} /><View style={[styles.cropGridLine, styles.cropGridHorizontalTwo]} /></View>
           {photoEditorBusy ? <View style={styles.photoEditorLoading}><Text style={styles.photoEditorLoadingText}>APPLYING EDIT…</Text></View> : null}
         </View>
@@ -1290,16 +1414,16 @@ function SocialQuestApp() {
           <Text style={styles.photoEditorHint}>Center-crop for the feed, then rotate or mirror until the frame feels right.</Text>
           <Text style={styles.photoEditorSectionLabel}>ASPECT RATIO</Text>
           <View style={styles.photoEditorRow}>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => setPhotoEditor(current => current ? { ...current, working: current.original } : current)}><Text style={styles.photoEditorControlIcon}>↺</Text><Text style={styles.photoEditorControlText}>Original</Text></Pressable>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(1)}><View style={styles.ratioSquare} /><Text style={styles.photoEditorControlText}>Square</Text></Pressable>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(4 / 5)}><View style={styles.ratioPortrait} /><Text style={styles.photoEditorControlText}>Portrait</Text></Pressable>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(16 / 9)}><View style={styles.ratioLandscape} /><Text style={styles.photoEditorControlText}>Wide</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => setPhotoEditor(current => current ? { ...current, working: current.original } : current)}><Text style={styles.photoEditorControlIcon}>↺</Text><Text style={styles.photoEditorControlText}>Original</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(1)}><View style={styles.ratioSquare} /><Text style={styles.photoEditorControlText}>Square</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(4 / 5)}><View style={styles.ratioPortrait} /><Text style={styles.photoEditorControlText}>Portrait</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => cropPhoto(16 / 9)}><View style={styles.ratioLandscape} /><Text style={styles.photoEditorControlText}>Wide</Text></Pressable>
           </View>
           <Text style={styles.photoEditorSectionLabel}>TRANSFORM</Text>
           <View style={styles.photoEditorRow}>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('rotate-left')}><Text style={styles.photoEditorControlIcon}>↶</Text><Text style={styles.photoEditorControlText}>Left</Text></Pressable>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('rotate-right')}><Text style={styles.photoEditorControlIcon}>↷</Text><Text style={styles.photoEditorControlText}>Right</Text></Pressable>
-            <Pressable disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('mirror')}><Text style={styles.photoEditorControlIcon}>⇆</Text><Text style={styles.photoEditorControlText}>Mirror</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('rotate-left')}><Text style={styles.photoEditorControlIcon}>↶</Text><Text style={styles.photoEditorControlText}>Left</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('rotate-right')}><Text style={styles.photoEditorControlIcon}>↷</Text><Text style={styles.photoEditorControlText}>Right</Text></Pressable>
+            <Pressable accessibilityRole="button" disabled={photoEditorBusy} style={styles.photoEditorControl} onPress={() => transformPhoto('mirror')}><Text style={styles.photoEditorControlIcon}>⇆</Text><Text style={styles.photoEditorControlText}>Mirror</Text></Pressable>
           </View>
         </ScrollView>
       </View>
@@ -1328,9 +1452,9 @@ function SocialQuestApp() {
               <Text style={styles.sheetCopy}>{selectedUser.bio || 'Here to turn small plans into meaningful stories.'}</Text>
               {selectedUser.id !== me?.id ? <>
                 <Pressable accessibilityRole="button" disabled={followBusy} style={[styles.secondary, followBusy && styles.dim]} onPress={() => void toggleFollow(selectedUser)}><Text style={styles.secondaryText}>{followBusy ? 'Updating…' : selectedUser.is_followed_by_me ? 'Following · Unfollow' : 'Follow'}</Text></Pressable>
-                <Pressable accessibilityRole="button" style={styles.primary} onPress={() => void openChat(selectedUser)}><View style={iconLabelRow}><Text style={styles.primaryText}>Send a message</Text><Ionicons name="paper-plane-outline" size={18} color="#fff" /></View></Pressable>
+                <Pressable accessibilityRole="button" style={styles.primary} onPress={() => void openChat(selectedUser)}><View style={iconLabelRow}><Text style={styles.primaryText}>Send a message</Text><Ionicons name="paper-plane-outline" size={18} color={colors.onPrimary} /></View></Pressable>
               </> : <Pressable accessibilityRole="button" style={styles.secondary} onPress={openProfileEditor}><Text style={styles.secondaryText}>Edit profile</Text></Pressable>}
-              <Pressable style={[styles.secondary, iconLabelRow]} onPress={() => void shareResource('A SocialQuest profile', 'Meet ' + nameOf(selectedUser) + ' on SocialQuest.', '/?view=profile&profile=' + selectedUser.id)}><Ionicons name="share-social-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Share profile</Text></Pressable>
+              <Pressable accessibilityRole="button" style={[styles.secondary, iconLabelRow]} onPress={() => void shareResource('A SocialQuest profile', 'Meet ' + nameOf(selectedUser) + ' on SocialQuest.', '/?view=profile&profile=' + selectedUser.id)}><Ionicons name="share-social-outline" size={18} color={colors.text} /><Text style={styles.secondaryText}>Share profile</Text></Pressable>
             {profileTabs(false)}{profileLoadNotice}</View>}
               ListEmptyComponent={profileEmpty} renderItem={({item}) => renderProfilePost(item)}
             /> : peoplePanel ? <>
@@ -1340,61 +1464,56 @@ function SocialQuestApp() {
                 <TextInput accessibilityLabel="Search people" style={styles.searchInput} value={peopleQuery} onChangeText={setPeopleQuery} placeholder="Name or username" placeholderTextColor={colors.muted} maxLength={100} autoCapitalize="none" autoCorrect={false} autoFocus={peoplePanel.kind === 'search'} returnKeyType="search" onSubmitEditing={() => { Keyboard.dismiss(); void loadPeopleList(peoplePanel, peopleQuery); }} />
                 <Pressable accessibilityRole="button" accessibilityLabel="Search" style={[styles.searchButton, {minWidth: 44, minHeight: 44}]} onPress={() => { Keyboard.dismiss(); void loadPeopleList(peoplePanel, peopleQuery); }}><SearchIcon /></Pressable>
               </View>
-              <FlatList style={socialStyles.peopleList} data={peopleLoading ? [] : peopleResults} keyboardShouldPersistTaps="handled" keyExtractor={person => String(person.id)} ListEmptyComponent={<View style={socialStyles.peopleEmpty}><Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{peopleLoading ? 'Loading people…' : peopleError || (peopleQuery.trim() ? 'No matching people. Try another name or username.' : peoplePanel.kind === 'followers' ? 'No followers yet.' : peoplePanel.kind === 'following' ? 'Not following anyone yet.' : 'No other members yet.')}</Text>{peopleError ? <Pressable style={styles.secondary} onPress={() => void loadPeopleList(peoplePanel, peopleQuery)}><Text style={styles.secondaryText}>Try again</Text></Pressable> : null}</View>} renderItem={({item}) => <Pressable accessibilityRole="button" accessibilityLabel={(peoplePanel.kind === 'invite' ? 'Invite ' : 'Open ') + nameOf(item)} style={styles.personCard} onPress={() => { Keyboard.dismiss(); if (peoplePanel.kind === 'invite') void invitePerson(item); else setSelectedUser(item); }}><Avatar user={item} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(item)}</Text><Text style={styles.personMeta}>@{item.username}{item.is_followed_by_me ? ' · Following' : ''}</Text></View><Text style={styles.secondaryText}>{peoplePanel.kind === 'invite' ? 'Invite' : '›'}</Text></Pressable>} />
+              <FlatList style={socialStyles.peopleList} data={peopleLoading ? [] : peopleResults} keyboardShouldPersistTaps="handled" keyExtractor={person => String(person.id)} ListEmptyComponent={<View style={socialStyles.peopleEmpty}><Text accessibilityLiveRegion="polite" style={styles.sheetCopy}>{peopleLoading ? 'Loading people…' : peopleError || (peopleQuery.trim() ? 'No matching people. Try another name or username.' : peoplePanel.kind === 'followers' ? 'No followers yet.' : peoplePanel.kind === 'following' ? 'Not following anyone yet.' : 'No other members yet.')}</Text>{peopleError ? <Pressable accessibilityRole="button" style={styles.secondary} onPress={() => void loadPeopleList(peoplePanel, peopleQuery)}><Text style={styles.secondaryText}>Try again</Text></Pressable> : null}</View>} renderItem={({item}) => <Pressable accessibilityRole="button" accessibilityLabel={(peoplePanel.kind === 'invite' ? 'Invite ' : 'Open ') + nameOf(item)} style={styles.personCard} onPress={() => { Keyboard.dismiss(); if (peoplePanel.kind === 'invite') void invitePerson(item); else setSelectedUser(item); }}><Avatar user={item} /><View style={socialStyles.personCopy}><Text style={styles.personName}>{nameOf(item)}</Text><Text style={styles.personMeta}>@{item.username}{item.is_followed_by_me ? ' · Following' : ''}</Text></View><Text style={styles.secondaryText}>{peoplePanel.kind === 'invite' ? 'Invite' : '›'}</Text></Pressable>} />
             </> : null}
           </Pressable>
         </Pressable>
       </KeyboardAvoidingView>
     </Modal>
-    <Modal visible={!!selectedEvent && !eventEditor && !composeOpen && !selectedUser && !peoplePanel && !commentPost && !editingPost} transparent animationType="slide" onRequestClose={() => setSelectedEvent(null)}>
-      <Pressable feedback="none" style={styles.overlay} onPress={() => setSelectedEvent(null)}>
-        <Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}>
-          {selectedEvent && <ScrollView showsVerticalScrollIndicator={false}>
-            <View style={styles.handle} />
-            <Text style={styles.eyebrow}>{dateOf(selectedEvent.starts_at).toUpperCase()} · {selectedEvent.location_name}</Text>
-            <Text style={styles.sheetTitle}>{selectedEvent.name}</Text>
-            <Text style={styles.sheetCopy}>{selectedEvent.description}</Text>
-            <Pressable style={styles.eventHost} onPress={() => setSelectedUser(selectedEvent.host)}><Avatar user={selectedEvent.host} /><Text style={styles.hostMeta}>Hosted by {nameOf(selectedEvent.host)} · ★ {selectedEvent.host.karma ?? 0}</Text></Pressable>
-            {selectedEvent.host.id === me?.id || selectedEvent.my_attendance_status === 'ACCEPTED' ? <Pressable accessibilityRole="button" accessibilityLabel="Open event group chat" style={[styles.secondary, iconLabelRow]} onPress={() => void openEventChat()}><Ionicons name="people-outline" size={20} color={colors.accent} /><Text style={styles.secondaryText}>Event group chat</Text></Pressable> : null}
-            <View style={styles.questNotice}><Text style={styles.section}>QUEST WINDOW</Text><Text style={styles.questNoticeText}>{selectedEvent.quest_status === 'ACTIVE' ? 'Quests are live! Post a photo or reel to complete a quest and earn XP. ✦' : selectedEvent.is_finished ? 'The quest window has ended. Nicely done everyone! 🎉' : 'Quests unlock when this event starts. Stay ready! ⚔️'}</Text></View>
-            <View style={styles.eventQuestList}>
-              <Text style={styles.section}>THE QUEST LINE · {eventQuests.length}</Text>
-              {eventQuests.length ? eventQuests.map(quest => <View key={quest.id} style={styles.eventQuest}>
-                <Text style={styles.eventQuestKind}>{quest.kind === 'MAIN' ? '✦ MAIN QUEST' : 'SIDE QUEST'} · +{quest.xp_reward} XP</Text>
-                <Text style={styles.eventQuestTitle}>{quest.title}</Text>
-                <Text style={styles.eventQuestCopy}>{quest.instructions}</Text>
-                {quest.my_submission ? <Text style={styles.questProofState}>✓ Completed · +{quest.xp_reward} XP</Text> : selectedEvent.quest_status === 'ACTIVE' && selectedEvent.my_attendance_status === 'ACCEPTED' ? <><Pressable accessibilityRole="button" accessibilityLabel={'Complete quest: ' + quest.title} style={[styles.questProofButton, iconLabelRow]} onPress={() => beginQuestProof(quest)}><Ionicons name="checkmark-circle-outline" size={18} color="#FFFFFF" /><Text style={styles.questProofButtonText}>Complete quest</Text></Pressable><Text style={styles.personMeta}>Share a photo or reel to earn +{quest.xp_reward} XP.</Text></> : <Text style={styles.personMeta}>{selectedEvent.quest_status === 'EXPIRED' ? 'Quest ended' : selectedEvent.my_attendance_status !== 'ACCEPTED' ? 'Join this event to complete quests.' : 'Unlocks when the event begins.'}</Text>}
-              </View>) : <Text style={styles.muted}>{selectedEvent.quest_status === 'SCHEDULED' ? 'Quests unlock when the event starts.' : 'Your quest list will appear here.'}</Text>}
-            </View>
-            <View style={styles.eventMoments}>
-              <Text style={styles.section}>QUEST MOMENTS · {eventPosts.length}</Text>
-              <Text style={styles.sheetCopy}>Snaps from people who actually showed up and did the thing. 🏆</Text>
-              {eventPosts.length ? eventPosts.map(post => <PostCard onLike={post => void toggleLike(post)} key={post.id} post={post} mine={post.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={item => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + item.id + '/')} onComments={item => void openComments(item)} onOpenProfile={setSelectedUser} />) : <Text style={styles.muted}>No snaps yet — be the first to complete a quest! 📸</Text>}
-            </View>
-            {selectedEvent.is_finished && selectedEvent.my_attendance_status === 'ACCEPTED' ? <View style={styles.ratingPanel}>
-              <Text style={styles.ratingTitle}>RATE YOUR FELLOW GUESTS</Text>
-              <Text style={styles.ratingCopy}>Only accepted attendees can be rated. Like adds 1 karma, dislike subtracts 1, and none adds 0.</Text>
-              {ratingTargets.length ? ratingTargets.map(person => {
-                const selectedReaction = eventRatings.find(rating => rating.target.id === person.id)?.reaction;
-                return <View key={person.id} style={styles.ratingPerson}>
-                  <Pressable style={styles.ratingProfile} onPress={() => setSelectedUser(person)}><Avatar user={person} /><View style={styles.ratingPersonCopy}><Text style={styles.personName}>{nameOf(person)}</Text><Text style={styles.personMeta}>{selectedReaction ? 'Your response: ' + reactionLabel(selectedReaction) : 'Choose a response'}</Text></View></Pressable>
-                  <View style={styles.ratingActions}>{(['LIKE', 'DISLIKE', 'NONE'] as Reaction[]).map(reaction => <Pressable key={reaction} style={[styles.ratingChoice, selectedReaction === reaction && styles.ratingChoiceSelected]} onPress={() => void rateAttendee(person.id, reaction)}><Text style={[styles.ratingChoiceText, selectedReaction === reaction && styles.ratingChoiceSelectedText]}>{reactionLabel(reaction)}</Text></Pressable>)}</View>
-                </View>;
-              }) : <Text style={styles.ratingEmpty}>No other accepted attendees are available to rate.</Text>}
-            </View> : null}
-            {selectedEvent.host.id === me?.id ? <View style={styles.eventQuestList}>
-              <Text style={styles.section}>HOST CONSOLE</Text>
-              <View style={styles.ratingActions}><Pressable style={styles.ratingChoice} onPress={() => openInviteList(selectedEvent.id)}><Text style={styles.ratingChoiceText}>Invite people</Text></Pressable><Pressable style={styles.ratingChoice} onPress={() => openEventEditor(selectedEvent)}><Text style={styles.ratingChoiceText}>Edit event</Text></Pressable><Pressable style={styles.ratingChoice} onPress={deleteEvent}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View>
-              {eventRequests.filter(request => request.status === 'PENDING').map(request => <View key={request.id} style={styles.eventQuest}>
-                <Text style={styles.personName}>{nameOf(request.user)}</Text><Text style={styles.personMeta}>{request.user.xp || 0} XP · {request.user.karma ?? 0} karma</Text>
-                {!selectedEvent.is_finished ? <View style={styles.ratingActions}><Pressable style={styles.ratingChoice} onPress={() => void reviewEventItem(request.id, 'DENIED')}><Text style={styles.ratingChoiceText}>Decline</Text></Pressable><Pressable style={styles.ratingChoice} onPress={() => void reviewEventItem(request.id, 'ACCEPTED')}><Text style={styles.ratingChoiceText}>Accept</Text></Pressable></View> : <Text style={styles.muted}>Requests closed</Text>}
-              </View>)}
-            </View> : null}
-            <View style={styles.eventActionRow}><Pressable style={[styles.eventShare, iconLabelRow]} onPress={() => void shareResource('A SocialQuest adventure', 'Join me at ' + selectedEvent.name + ' on SocialQuest.', '/?view=event&event=' + selectedEvent.id)}><Ionicons name="paper-plane-outline" size={17} color="#fff" /><Text style={styles.eventShareText}>Share</Text></Pressable>{selectedEvent.host.id === me?.id ? <View style={styles.hostPill}><Text style={styles.hostPillText}>You are hosting</Text></View> : selectedEvent.is_finished ? <View style={styles.hostPill}><Text style={styles.hostPillText}>Requests closed</Text></View> : selectedEvent.my_attendance_status === 'INVITED' ? <View style={styles.inviteActions}><Pressable style={styles.ratingChoice} onPress={() => void cancelRsvp()}><Text style={styles.ratingChoiceText}>Decline</Text></Pressable><Pressable style={[styles.primary, styles.rowAction]} onPress={join}><Text style={styles.primaryText}>Accept invite</Text></Pressable></View> : selectedEvent.my_attendance_status === 'PENDING' || selectedEvent.my_attendance_status === 'ACCEPTED' ? <Pressable style={styles.hostPill} onPress={() => void cancelRsvp()}><Text style={styles.hostPillText}>{selectedEvent.my_attendance_status.toLowerCase()} · cancel</Text></Pressable> : <Pressable style={[styles.primary, styles.eventJoin]} onPress={join}><Text style={styles.primaryText}>{selectedEvent.my_attendance_status ? 'Request again' : 'Request to join'}</Text></Pressable>}</View>
-          </ScrollView>}
-        </Pressable>
-      </Pressable>
-    </Modal>
+    <EventDetailsSheet visible={!!selectedEvent && !eventEditor && !eventEditorClosing && !composeOpen && !selectedUser && !peoplePanel && !commentPost && !editingPost} eventId={selectedEvent?.id} onClose={() => setSelectedEvent(null)}>
+      {selectedEvent && <>
+        <Text style={styles.eyebrow}>{dateOf(selectedEvent.starts_at).toUpperCase()} · {selectedEvent.location_name}</Text>
+        <Text style={styles.sheetTitle}>{selectedEvent.name}</Text>
+        <Text style={styles.sheetCopy}>{selectedEvent.description}</Text>
+        <Pressable accessibilityRole="button" style={styles.eventHost} onPress={() => setSelectedUser(selectedEvent.host)}><Avatar user={selectedEvent.host} /><Text style={styles.hostMeta}>Hosted by {nameOf(selectedEvent.host)} · ★ {selectedEvent.host.karma ?? 0}</Text></Pressable>
+        {selectedEvent.host.id === me?.id || selectedEvent.my_attendance_status === 'ACCEPTED' ? <Pressable accessibilityRole="button" accessibilityLabel="Open event group chat" style={[styles.secondary, iconLabelRow]} onPress={() => void openEventChat()}><Ionicons name="people-outline" size={20} color={colors.accent} /><Text style={styles.secondaryText}>Event group chat</Text></Pressable> : null}
+        <View style={styles.questNotice}><Text style={styles.section}>QUEST WINDOW</Text><Text style={styles.questNoticeText}>{selectedEvent.quest_status === 'ACTIVE' ? 'Quests are live! Post a photo or reel to complete a quest and earn XP. ✦' : selectedEvent.is_finished ? 'The quest window has ended. Nicely done everyone! 🎉' : 'Quests unlock when this event starts. Stay ready! ⚔️'}</Text></View>
+        <View style={styles.eventQuestList}>
+          <Text style={styles.section}>THE QUEST LINE · {eventQuests.length}</Text>
+          {eventQuests.length ? eventQuests.map(quest => <View key={quest.id} style={styles.eventQuest}>
+            <Text style={styles.eventQuestKind}>{quest.kind === 'MAIN' ? '✦ MAIN QUEST' : 'SIDE QUEST'} · +{quest.xp_reward} XP</Text>
+            <Text style={styles.eventQuestTitle}>{quest.title}</Text>
+            <Text style={styles.eventQuestCopy}>{quest.instructions}</Text>
+            {quest.my_submission ? <Text style={styles.questProofState}>✓ Completed · +{quest.xp_reward} XP</Text> : selectedEvent.quest_status === 'ACTIVE' && selectedEvent.my_attendance_status === 'ACCEPTED' ? <><Pressable accessibilityRole="button" accessibilityLabel={'Complete quest: ' + quest.title} style={[styles.questProofButton, iconLabelRow]} onPress={() => beginQuestProof(quest)}><Ionicons name="checkmark-circle-outline" size={18} color={colors.onPrimary} /><Text style={styles.questProofButtonText}>Complete quest</Text></Pressable><Text style={styles.personMeta}>Share a photo or reel to earn +{quest.xp_reward} XP.</Text></> : <Text style={styles.personMeta}>{selectedEvent.quest_status === 'EXPIRED' ? 'Quest ended' : selectedEvent.my_attendance_status !== 'ACCEPTED' ? 'Join this event to complete quests.' : 'Unlocks when the event begins.'}</Text>}
+          </View>) : <Text style={styles.muted}>{selectedEvent.quest_status === 'SCHEDULED' ? 'Quests unlock when the event starts.' : 'Your quest list will appear here.'}</Text>}
+        </View>
+        <View style={styles.eventMoments}>
+          <Text style={styles.section}>QUEST MOMENTS · {eventPosts.length}</Text>
+          <Text style={styles.sheetCopy}>Snaps from people who actually showed up and did the thing. 🏆</Text>
+          {eventPosts.length ? eventPosts.map(post => <PostCard onLike={post => void toggleLike(post)} key={post.id} post={post} mine={post.author.id === me?.id} onEdit={beginEditPost} onDelete={deletePost} onShare={item => void shareResource('A SocialQuest moment', 'Come see this community moment on SocialQuest.', '/s/post/' + item.id + '/')} onComments={item => void openComments(item)} onOpenProfile={setSelectedUser} />) : <Text style={styles.muted}>No snaps yet — be the first to complete a quest! 📸</Text>}
+        </View>
+        {selectedEvent.is_finished && selectedEvent.my_attendance_status === 'ACCEPTED' ? <View style={styles.ratingPanel}>
+          <Text style={styles.ratingTitle}>RATE YOUR FELLOW GUESTS</Text>
+          <Text style={styles.ratingCopy}>Only accepted attendees can be rated. Like adds 1 karma, dislike subtracts 1, and none adds 0.</Text>
+          {ratingTargets.length ? ratingTargets.map(person => {
+            const selectedReaction = eventRatings.find(rating => rating.target.id === person.id)?.reaction;
+            return <View key={person.id} style={styles.ratingPerson}>
+              <Pressable accessibilityRole="button" style={styles.ratingProfile} onPress={() => setSelectedUser(person)}><Avatar user={person} /><View style={styles.ratingPersonCopy}><Text style={styles.personName}>{nameOf(person)}</Text><Text style={styles.personMeta}>{selectedReaction ? 'Your response: ' + reactionLabel(selectedReaction) : 'Choose a response'}</Text></View></Pressable>
+              <View style={styles.ratingActions}>{(['LIKE', 'DISLIKE', 'NONE'] as Reaction[]).map(reaction => <Pressable accessibilityRole="button" key={reaction} style={[styles.ratingChoice, selectedReaction === reaction && styles.ratingChoiceSelected]} onPress={() => void rateAttendee(person.id, reaction)}><Text style={[styles.ratingChoiceText, selectedReaction === reaction && styles.ratingChoiceSelectedText]}>{reactionLabel(reaction)}</Text></Pressable>)}</View>
+            </View>;
+          }) : <Text style={styles.ratingEmpty}>No other accepted attendees are available to rate.</Text>}
+        </View> : null}
+        {selectedEvent.host.id === me?.id ? <View style={styles.eventQuestList}>
+          <Text style={styles.section}>HOST CONSOLE</Text>
+          <View style={styles.ratingActions}><Pressable accessibilityRole="button" style={styles.ratingChoice} onPress={() => openInviteList(selectedEvent.id)}><Text style={styles.ratingChoiceText}>Invite people</Text></Pressable><Pressable accessibilityRole="button" style={styles.ratingChoice} onPress={() => openEventEditor(selectedEvent)}><Text style={styles.ratingChoiceText}>Edit event</Text></Pressable><Pressable accessibilityRole="button" style={styles.ratingChoice} onPress={deleteEvent}><Text style={styles.postDeleteText}>Delete</Text></Pressable></View>
+          {eventRequests.filter(request => request.status === 'PENDING').map(request => <View key={request.id} style={styles.eventQuest}>
+            <Text style={styles.personName}>{nameOf(request.user)}</Text><Text style={styles.personMeta}>{request.user.xp || 0} XP · {request.user.karma ?? 0} karma</Text>
+            {!selectedEvent.is_finished ? <View style={styles.ratingActions}><Pressable accessibilityRole="button" style={styles.ratingChoice} onPress={() => void reviewEventItem(request.id, 'DENIED')}><Text style={styles.ratingChoiceText}>Decline</Text></Pressable><Pressable accessibilityRole="button" style={styles.ratingChoice} onPress={() => void reviewEventItem(request.id, 'ACCEPTED')}><Text style={styles.ratingChoiceText}>Accept</Text></Pressable></View> : <Text style={styles.muted}>Requests closed</Text>}
+          </View>)}
+        </View> : null}
+        <View style={styles.eventActionRow}><Pressable accessibilityRole="button" style={[styles.eventShare, iconLabelRow]} onPress={() => void shareResource('A SocialQuest adventure', 'Join me at ' + selectedEvent.name + ' on SocialQuest.', '/?view=event&event=' + selectedEvent.id)}><Ionicons name="paper-plane-outline" size={17} color={colors.text} /><Text style={styles.eventShareText}>Share</Text></Pressable>{selectedEvent.host.id === me?.id ? <View style={styles.hostPill}><Text style={styles.hostPillText}>You are hosting</Text></View> : selectedEvent.is_finished ? <View style={styles.hostPill}><Text style={styles.hostPillText}>Requests closed</Text></View> : selectedEvent.my_attendance_status === 'INVITED' ? <View style={styles.inviteActions}><Pressable accessibilityRole="button" style={styles.ratingChoice} onPress={() => void cancelRsvp()}><Text style={styles.ratingChoiceText}>Decline</Text></Pressable><Pressable accessibilityRole="button" style={[styles.primary, styles.rowAction]} onPress={join}><Text style={styles.primaryText}>Accept invite</Text></Pressable></View> : selectedEvent.my_attendance_status === 'PENDING' || selectedEvent.my_attendance_status === 'ACCEPTED' ? <Pressable accessibilityRole="button" style={styles.hostPill} onPress={() => void cancelRsvp()}><Text style={styles.hostPillText}>{selectedEvent.my_attendance_status.toLowerCase()} · cancel</Text></Pressable> : <Pressable accessibilityRole="button" style={[styles.primary, styles.eventJoin]} onPress={join}><Text style={styles.primaryText}>{selectedEvent.my_attendance_status ? 'Request again' : 'Request to join'}</Text></Pressable>}</View>
+      </>}
+    </EventDetailsSheet>
     <Modal visible={!!commentPost} transparent animationType="slide" onRequestClose={closeComments}>
       <KeyboardAvoidingView style={styles.modalKeyboardAvoider} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
         <Pressable feedback="none" style={styles.overlay} onPress={closeComments}>
@@ -1415,32 +1534,36 @@ function SocialQuestApp() {
             {replyingTo ? <View style={styles.commentEditing}><Text numberOfLines={1} style={styles.commentEditingText}>Replying to @{replyingTo.author.username}</Text><Pressable accessibilityRole="button" accessibilityLabel="Stop replying to this comment" onPress={clearReplyTarget}><Ionicons name="close-circle-outline" size={21} color={colors.danger} /></Pressable></View> : null}
             <View style={styles.commentComposer}>
               <Avatar user={me} />
-              <TextInput numberOfLines={3} ref={commentInputRef} style={styles.commentInput} maxLength={500} value={commentBody} onChangeText={setCommentBody} editable={!commentSubmitting} placeholder={editingComment ? 'Edit your reply' : 'Add a reply…'} placeholderTextColor={colors.muted} multiline returnKeyType="default" blurOnSubmit={false} />
-              <Pressable accessibilityRole="button" accessibilityLabel={commentSubmitting ? 'Saving reply' : editingComment ? 'Save reply' : 'Post reply'} disabled={commentSubmitting || !commentBody.trim()} onPress={() => void saveComment()} style={[styles.commentSend, (commentSubmitting || !commentBody.trim()) && styles.commentSendDisabled]}>{commentSubmitting ? <Ionicons name="ellipsis-horizontal" size={20} color="#fff" /> : <Ionicons name={editingComment ? 'checkmark' : 'arrow-up'} size={22} color={(commentSubmitting || !commentBody.trim()) ? '#77849e' : '#fff'} />}</Pressable>
+              <TextInput accessibilityLabel={editingComment ? 'Edit your reply' : 'Write a reply'} numberOfLines={3} ref={commentInputRef} style={styles.commentInput} maxLength={500} value={commentBody} onChangeText={setCommentBody} editable={!commentSubmitting} placeholder={editingComment ? 'Edit your reply' : 'Add a reply…'} placeholderTextColor={colors.muted} multiline returnKeyType="default" blurOnSubmit={false} />
+              <Pressable accessibilityRole="button" accessibilityLabel={commentSubmitting ? 'Saving reply' : editingComment ? 'Save reply' : 'Post reply'} disabled={commentSubmitting || !commentBody.trim()} onPress={() => void saveComment()} style={[styles.commentSend, (commentSubmitting || !commentBody.trim()) && styles.commentSendDisabled]}>{commentSubmitting ? <Ionicons name="ellipsis-horizontal" size={20} color={colors.muted} /> : <Ionicons name={editingComment ? 'checkmark' : 'arrow-up'} size={22} color={(commentSubmitting || !commentBody.trim()) ? colors.muted : colors.onPrimary} />}</Pressable>
             </View>
           </Pressable>
         </Pressable>
       </KeyboardAvoidingView>
     </Modal>
     <Modal visible={!!messageOptions} transparent animationType="slide" onRequestClose={() => setMessageOptions(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setMessageOptions(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><Text style={styles.sheetTitle}>Message options</Text>{messageOptions && <>
-      {messageOptions.sender.id === me?.id ? <Pressable style={styles.secondary} onPress={() => { setChatEditor({ kind: 'message', id: messageOptions.id, value: messageOptions.body }); setMessageOptions(null); }}><Text style={styles.secondaryText}>Edit message</Text></Pressable> : null}
-      <Pressable style={styles.secondary} onPress={() => { void deleteMessage(messageOptions.id, 'me'); setMessageOptions(null); }}><Text style={styles.secondaryText}>Delete for me</Text></Pressable>
-      {messageOptions.sender.id === me?.id ? <Pressable style={styles.secondary} onPress={() => { void deleteMessage(messageOptions.id, 'everyone'); setMessageOptions(null); }}><Text style={styles.postDeleteText}>Delete for everyone</Text></Pressable> : null}
-      <Pressable style={styles.secondary} onPress={() => setMessageOptions(null)}><Text style={styles.secondaryText}>Cancel</Text></Pressable>
+      {messageOptions.sender.id === me?.id ? <Pressable accessibilityRole="button" style={styles.secondary} onPress={() => { setChatEditor({ kind: 'message', id: messageOptions.id, value: messageOptions.body }); setMessageOptions(null); }}><Text style={styles.secondaryText}>Edit message</Text></Pressable> : null}
+      <Pressable accessibilityRole="button" style={styles.secondary} onPress={() => { void deleteMessage(messageOptions.id, 'me'); setMessageOptions(null); }}><Text style={styles.secondaryText}>Delete for me</Text></Pressable>
+      {messageOptions.sender.id === me?.id ? <Pressable accessibilityRole="button" style={styles.secondary} onPress={() => { void deleteMessage(messageOptions.id, 'everyone'); setMessageOptions(null); }}><Text style={styles.postDeleteText}>Delete for everyone</Text></Pressable> : null}
+      <Pressable accessibilityRole="button" style={styles.secondary} onPress={() => setMessageOptions(null)}><Text style={styles.secondaryText}>Cancel</Text></Pressable>
     </>}</Pressable></Pressable></Modal>
-    <Modal visible={!!chatEditor} transparent animationType="slide" onRequestClose={() => setChatEditor(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setChatEditor(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>{chatEditor?.kind === 'conversation' ? 'Name this chat.' : 'Edit your message.'}</Text><Text style={styles.sheetCopy}>{chatEditor?.kind === 'conversation' ? 'This name is visible to everyone in the chat.' : 'Your updated message will be marked as edited.'}</Text><TextInput style={styles.momentInput} maxLength={chatEditor?.kind === 'conversation' ? 100 : 2000} value={chatEditor?.value || ''} onChangeText={value => setChatEditor(current => current ? { ...current, value } : current)} placeholder={chatEditor?.kind === 'conversation' ? 'Chat name (optional)' : 'Write your message'} multiline={chatEditor?.kind === 'message'} autoFocus /><View style={styles.editActions}><Pressable style={styles.cancelEdit} onPress={() => setChatEditor(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable style={[styles.primary, styles.rowAction]} onPress={() => void saveChatEditor()}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
-    <Modal visible={!!editingPost} transparent animationType="slide" onRequestClose={() => setEditingPost(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setEditingPost(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>Edit your moment.</Text><TextInput style={styles.momentInput} maxLength={1200} value={editBody} onChangeText={setEditBody} placeholder="What happened?" multiline /><TextInput style={styles.editLocation} maxLength={120} value={editLocation} onChangeText={setEditLocation} placeholder="Location (optional)" /><View style={styles.editActions}><Pressable style={styles.cancelEdit} onPress={() => setEditingPost(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable style={[styles.primary, styles.rowAction]} onPress={savePostEdit}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
+    <Modal visible={!!chatEditor} transparent animationType="slide" onRequestClose={() => setChatEditor(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setChatEditor(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>{chatEditor?.kind === 'conversation' ? 'Name this chat.' : 'Edit your message.'}</Text><Text style={styles.sheetCopy}>{chatEditor?.kind === 'conversation' ? 'This name is visible to everyone in the chat.' : 'Your updated message will be marked as edited.'}</Text><TextInput accessibilityLabel={chatEditor?.kind === 'conversation' ? 'Chat name' : 'Message text'} style={styles.momentInput} maxLength={chatEditor?.kind === 'conversation' ? 100 : 2000} value={chatEditor?.value || ''} onChangeText={value => setChatEditor(current => current ? { ...current, value } : current)} placeholder={chatEditor?.kind === 'conversation' ? 'Chat name (optional)' : 'Write your message'} multiline={chatEditor?.kind === 'message'} autoFocus /><View style={styles.editActions}><Pressable accessibilityRole="button" style={styles.cancelEdit} onPress={() => setChatEditor(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable accessibilityRole="button" style={[styles.primary, styles.rowAction]} onPress={() => void saveChatEditor()}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
+    <Modal visible={!!editingPost} transparent animationType="slide" onRequestClose={() => setEditingPost(null)}><Pressable feedback="none" style={styles.overlay} onPress={() => setEditingPost(null)}><Pressable feedback="none" style={styles.sheet} onPress={event => event.stopPropagation()}><View style={styles.handle} /><Text style={styles.sheetTitle}>Edit your moment.</Text><TextInput accessibilityLabel="Post caption" style={styles.momentInput} maxLength={1200} value={editBody} onChangeText={setEditBody} placeholder="What happened?" multiline /><TextInput accessibilityLabel="Post location" style={styles.editLocation} maxLength={120} value={editLocation} onChangeText={setEditLocation} placeholder="Location (optional)" /><View style={styles.editActions}><Pressable accessibilityRole="button" style={styles.cancelEdit} onPress={() => setEditingPost(null)}><Text style={styles.cancelEditText}>Cancel</Text></Pressable><Pressable accessibilityRole="button" style={[styles.primary, styles.rowAction]} onPress={savePostEdit}><Text style={styles.primaryText}>Save changes</Text></Pressable></View></Pressable></Pressable></Modal>
   </View>;
 }
 
 function Score({ label, value, onPress, tone = 'purple' }: { label: string; value: string; onPress?: () => void; tone?: Accent }) {
-  const styles = activeStyles;
+  const {theme} = useTheme();
+  const {accents} = theme;
+  const styles = getAppStyles(theme);
   const accent = accents[tone];
-  const cardStyle = styles.score;
+  const cardStyle = [styles.score, {backgroundColor: accent.surface, borderColor: accent.border}];
   const content = <><Text style={[styles.scoreValue, {color: accent.text}]}>{value}</Text><Text style={styles.scoreLabel}>{label}</Text></>;
   return onPress ? <Pressable accessibilityRole="button" accessibilityLabel={value + ' ' + label.replace(' ›', '').toLowerCase()} style={cardStyle} onPress={onPress}>{content}</Pressable> : <View style={cardStyle}>{content}</View>;
 }
 
 function SearchIcon() {
+  const {theme} = useTheme();
+  const {colors} = theme;
   return <Ionicons name="search-outline" size={22} color={colors.text} accessible={false} />;
 }

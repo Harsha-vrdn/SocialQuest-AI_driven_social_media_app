@@ -8,7 +8,7 @@
     "ios": "node scripts/start-expo.cjs --ios",
     "typecheck": "tsc --noEmit",
     "test:startup": "node --test scripts/start-expo.test.cjs scripts/notifications.test.cjs",
-    "test:app": "node --test scripts/app-regressions.test.cjs"
+    "test:app": "node --test scripts/app-regressions.test.cjs scripts/theme.test.cjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.1.1",

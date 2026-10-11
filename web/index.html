@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#050916" />
     <link rel="preload" href="/static/fonts/DepartureMono-Regular.woff2" as="font" type="font/woff2" crossorigin />
     <script>document.documentElement.classList.add('dark')</script>
-    <link rel="stylesheet" href="/static/pixelquest.css?v=20261009-ui-sanity-v2" />
-    <link rel="stylesheet" href="/static/post-studio.css?v=20261009-ui-sanity-v2" />
+    <link rel="stylesheet" href="/static/pixelquest.css?v=20261010-smart-search" />
+    <link rel="stylesheet" href="/static/post-studio.css?v=20261010-smart-search" />
     <title>SocialQuest — Home</title>
   </head>
   <body class="app-body">
@@ -19,7 +19,7 @@
           <button class="nav-link active" data-view="home"><span>⌂</span> Home</button>
           <button class="nav-link" data-view="explore"><span>⌖</span> Explore events</button>
           <button class="nav-link" data-view="reels"><span>◉</span> Reels</button>
-          <button class="nav-link" data-view="chats"><span>✉</span> Chats</button>
+          <button class="nav-link chat-nav" data-view="chats"><span>✉</span> Chats <b class="unread-count" data-chat-count hidden>0</b></button>
           <button class="nav-link notification-nav" data-view="notifications"><span>♢</span> Notifications <b class="notification-count" data-notification-count hidden>0</b></button>
           <button class="nav-link" data-view="profile"><span>♙</span> Profile</button>
         </nav>
@@ -37,10 +37,10 @@
         <section class="side-section"><div class="side-heading"><h3>Up next</h3><button data-view="explore">Explore</button></div><div id="event-mini-list"></div></section>
       </aside>
     </div>
-    <nav class="mobile-nav" aria-label="Mobile navigation"><button class="active" data-view="home">⌂<small>Home</small></button><button data-view="explore">⌖<small>Events</small></button><button data-view="chats">✉<small>Chats</small></button><button data-action="compose" class="plus" aria-label="Share a moment">＋</button><button data-view="notifications">♢<b class="notification-count" data-notification-count hidden>0</b><small>Alerts</small></button><button data-view="reels">◉<small>Reels</small></button><button data-view="profile">♙<small>Profile</small></button></nav>
+    <nav class="mobile-nav" aria-label="Mobile navigation"><button class="active" data-view="home">⌂<small>Home</small></button><button data-view="explore">⌖<small>Events</small></button><button data-view="chats">✉<b class="unread-count" data-chat-count hidden>0</b><small>Chats</small></button><button data-action="compose" class="plus" aria-label="Share a moment">＋</button><button data-view="notifications">♢<b class="notification-count" data-notification-count hidden>0</b><small>Alerts</small></button><button data-view="reels">◉<small>Reels</small></button><button data-view="profile">♙<small>Profile</small></button></nav>
     <dialog id="modal" aria-label="SocialQuest dialog"><button class="modal-close" data-action="close-modal" aria-label="Close">×</button><div id="modal-content"></div></dialog>
     <script src="/static/notifications.js?v=20260915-notifications"></script>
   <script src="/static/post-studio.js?v=20260916-studio-3"></script>
-    <script src="/static/app.js?v=20260917-startup-fix"></script>
+    <script src="/static/app.js?v=20261010-smart-search"></script>
   </body>
 </html>

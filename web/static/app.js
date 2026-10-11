@@ -6,7 +6,7 @@ const view = document.querySelector('#view');
 const modal = document.querySelector('#modal');
 const modalContent = document.querySelector('#modal-content');
 const formHandlers = [];
-const state = { viewVersion: 0, feedFilter: 'for-you', user: null, currentView: 'home', activeConversation: null, chatOpen: false, conversations: [], profileId: null, profileTab: 'moments', eventId: null, eventDetail: null, postId: null, openPostId: null, eventQuests: [], messagePoll: null, notificationPoll: null, notificationUnread: 0, exploreQuery: '', nearby: null, nearbyStatus: '', share: null };
+const state = { viewVersion: 0, feedFilter: 'for-you', user: null, currentView: 'home', activeConversation: null, chatOpen: false, conversations: [], profileId: null, profileTab: 'moments', eventId: null, eventDetail: null, postId: null, openPostId: null, eventQuests: [], messagePoll: null, notificationPoll: null, notificationUnread: 0, exploreQuery: '', exploreKind: 'events', nearby: null, nearbyStatus: '', share: null };
 
 document.documentElement.classList.add('dark');
 document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#050916');
@@ -22,6 +22,64 @@ async function logout() {
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const rows = data => data?.results || data || [];
+let chatRefreshVersion = 0, chatReadVersion = 0, notificationReadVersion = 0;
+const chatReadPending = new Set();
+const chatVisibleThrough = new Map();
+const unreadMessages = () => state.conversations.reduce((sum, chat) => sum + (chat.unread_count || 0), 0);
+const unreadBadge = count => count ? `<b class="unread-count" aria-label="${count} unread messages">${count > 99 ? '99+' : count}</b>` : '';
+function syncChatBadges() {
+  const count = unreadMessages();
+  document.querySelectorAll('[data-chat-count]').forEach(badge => {
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.hidden = !count;
+    badge.setAttribute('aria-label', `${count} unread messages`);
+  });
+  const active = state.conversations.find(chat => chat.id === state.activeConversation);
+  const threadBadge = document.querySelector('[data-thread-unread]');
+  if (threadBadge) threadBadge.innerHTML = unreadBadge(active?.unread_count || 0);
+}
+async function loadConversations(options = {}) {
+  const version = ++chatRefreshVersion, readVersion = chatReadVersion;
+  const credential = localStorage.getItem(TOKEN_KEY);
+  const chats = rows(await api('/conversations/', {...options, background:true}));
+  if (version !== chatRefreshVersion || readVersion !== chatReadVersion || credential !== localStorage.getItem(TOKEN_KEY)) return state.conversations;
+  state.conversations = chats;
+  syncChatBadges();
+  return chats;
+}
+async function markConversationRead(id, messageId) {
+  if (document.hidden || state.currentView !== 'chats' || state.activeConversation !== id || !messageId) return;
+  chatVisibleThrough.set(id, Math.max(chatVisibleThrough.get(id) || 0, messageId));
+  const chat = state.conversations.find(item => item.id === id);
+  if (!chat || messageId <= (chat.read_through_message_id || 0) || chatReadPending.has(id)) return;
+  chatReadPending.add(id); chatReadVersion++;
+  let saved = false;
+  const credential = localStorage.getItem(TOKEN_KEY);
+  try {
+    const result = await api(`/conversations/${id}/mark-read/`, {method:'POST', body:JSON.stringify({message_id:messageId})});
+    if (credential !== localStorage.getItem(TOKEN_KEY)) return;
+    state.conversations = state.conversations.map(item => item.id === id ? {...item, ...result} : item);
+    saved = true;
+    syncChatBadges();
+    if (state.currentView === 'chats') renderConversationList();
+  } catch (_) { /* Leave unread counts intact; visible messages are retried on the next poll. */ }
+  finally { chatReadPending.delete(id); chatReadVersion++; }
+  if (saved) {
+    void loadConversations().then(() => {if (state.currentView === 'chats') renderConversationList();}).catch(() => {});
+    if (chatVisibleThrough.get(id) > messageId) void markConversationRead(id, chatVisibleThrough.get(id));
+  }
+}
+function markVisibleMessagesRead(conversationId, holder) {
+  if (document.hidden || state.currentView !== 'chats' || state.activeConversation !== conversationId || document.querySelector('.messages') !== holder) return;
+  const viewport = holder.getBoundingClientRect();
+  let lastVisible = 0;
+  holder.querySelectorAll('[data-message-id]').forEach(message => {
+    const box = message.getBoundingClientRect();
+    const visibleHeight = Math.min(box.bottom, viewport.bottom) - Math.max(box.top, viewport.top);
+    if (visibleHeight >= Math.min(box.height, viewport.height) / 2) lastVisible = Math.max(lastVisible, Number(message.dataset.messageId));
+  });
+  if (lastVisible) void markConversationRead(conversationId, lastVisible);
+}
 const initials = person => (person?.display_name || person?.username || 'S').trim().slice(0, 1).toUpperCase();
 const avatar = (person, className = '') => `<span class="avatar ${className}" ${person?.avatar ? `style="background-image:url('${escapeHtml(person.avatar)}')"` : ''}>${person?.avatar ? '' : escapeHtml(initials(person))}</span>`;
 const reactionLabel = reaction => ({LIKE:'♥ Like', DISLIKE:'× Dislike', NONE:'— None'})[reaction] || '— None';
@@ -55,16 +113,17 @@ const when = date => { const seconds = Math.max(0, (Date.now() - new Date(date))
 const eventDate = date => new Date(date).toLocaleDateString('en', {weekday:'short', month:'short', day:'numeric'});
 
 async function api(path, options = {}) {
+  const {singlePage = false, background, ...requestOptions} = options;
   const version = state.viewVersion;
   const isRead = !options.method || options.method === 'GET';
   const headers = {Authorization: `Token ${localStorage.getItem(TOKEN_KEY)}`, ...(options.headers || {})};
   if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
-  const response = await fetch(`/api${path}`, {...options, headers});
+  const response = await fetch(`/api${path}`, {...requestOptions, headers});
   if (response.status === 401) { localStorage.removeItem(TOKEN_KEY); window.location.replace('/login/'); throw new Error('Signed out'); }
   const data = response.status === 204 ? null : await response.json().catch(() => ({}));
   if (isRead && version !== state.viewVersion && !options.background) throw new DOMException('Navigation changed', 'AbortError');
   if (!response.ok) throw new Error(data.detail || Object.values(data).flat?.().join(' ') || 'Something went wrong.');
-  if (isRead && Array.isArray(data?.results) && data.next) {
+  if (isRead && Array.isArray(data?.results) && data.next && !singlePage) {
     const next = new URL(data.next, window.location.origin);
     if (next.origin !== window.location.origin || !next.pathname.startsWith('/api/')) throw new Error('Invalid pagination link.');
     const remaining = await api(next.pathname.slice(4) + next.search, options);
@@ -126,31 +185,48 @@ function syncNotificationBadges(count) {
   });
 }
 async function loadNotificationBadge() {
+  const version = notificationReadVersion;
   try {
     const result = await api('/notifications/unread-count/', {background:true});
-    syncNotificationBadges(result.count);
+    if (version === notificationReadVersion) syncNotificationBadges(result.count);
   } catch (_) { /* A failed badge request should never interrupt the app. */ }
 }
 function startNotificationPolling() {
   if (state.notificationPoll) window.clearInterval(state.notificationPoll);
-  state.notificationPoll = window.setInterval(loadNotificationBadge, 15000);
+  state.notificationPoll = window.setInterval(() => {
+    if (document.hidden) return;
+    void loadNotificationBadge();
+    if (state.currentView === 'notifications') void refreshNotificationsList();
+  }, 15000);
 }
 function notificationMarkup(notification) {
   const detail = notification.event ? notification.event.name : notification.kind === 'MESSAGE' ? 'Open chat' : notification.comment_post_id ? 'Open moment' : 'SocialQuest';
-  const action = notification.event ? 'notification-event' : notification.conversation_id ? 'notification-chat' : notification.comment_post_id ? 'notification-post' : '';
+  const action = notification.event ? 'notification-event' : notification.conversation_id ? 'notification-chat' : notification.comment_post_id ? 'notification-post' : 'notification-read';
   const target = notification.event ? ' data-event-id="' + notification.event.id + '"' : notification.conversation_id ? ' data-conversation-id="' + notification.conversation_id + '"' : notification.comment_post_id ? ' data-post-id="' + notification.comment_post_id + '"' : '';
-  return '<button class="notification-row ' + (!notification.is_read ? 'unread' : '') + '" data-action="' + action + '"' + target + '><span class="notification-symbol">' + (notification.kind === 'MESSAGE' ? '✉' : notification.kind === 'COMMENT_REPLY' ? '💬' : '✦') + '</span><span><strong>' + escapeHtml(notification.text) + '</strong><small>' + escapeHtml(detail) + ' · ' + when(notification.created_at) + '</small></span></button>';
+  return '<button class="notification-row ' + (!notification.is_read ? 'unread' : '') + '" data-notification-id="' + notification.id + '" data-action="' + action + '"' + target + '><span class="notification-symbol">' + (notification.kind === 'MESSAGE' ? '✉' : notification.kind === 'COMMENT_REPLY' ? '💬' : '✦') + '</span><span>' + (!notification.is_read ? '<small class="unread-label">● Unread</small>' : '') + '<strong>' + escapeHtml(notification.text) + '</strong><small>' + escapeHtml(detail) + ' · ' + when(notification.created_at) + '</small></span></button>';
 }
 async function renderNotifications() {
   view.innerHTML = header('STAY IN THE LOOP', 'Your <em>notifications.</em>', '<button class="header-action" data-action="mark-notifications-read">Mark all read</button>') + '<aside class="notification-permission" data-notification-settings></aside><section class="notifications-list"><p class="empty">Loading notifications…</p></section>';
+  await refreshNotificationsList();
+}
+async function refreshNotificationsList() {
+  const holder = document.querySelector('.notifications-list');
+  if (!holder) return;
+  const version = notificationReadVersion;
   try {
     const notifications = rows(await api('/notifications/'));
-    const holder = document.querySelector('.notifications-list');
+    if (version !== notificationReadVersion || document.querySelector('.notifications-list') !== holder) return;
     holder.innerHTML = notifications.length ? notifications.map(notificationMarkup).join('') : '<div class="empty">Nothing new yet. Replies and RSVP activity will appear here.</div>';
-    const unreadIds = notifications.filter(notification => !notification.is_read).map(notification => notification.id);
-    if (unreadIds.length) await api('/notifications/mark-read/', {method:'POST', body:JSON.stringify({ids:unreadIds})});
-    syncNotificationBadges(0);
-  } catch (error) { if (error.name === 'AbortError') return; document.querySelector('.notifications-list').innerHTML = '<div class="empty">' + escapeHtml(error.message) + '</div>'; }
+    syncNotificationBadges(notifications.filter(notification => !notification.is_read).length);
+  } catch (error) { if (error.name === 'AbortError' || document.querySelector('.notifications-list') !== holder) return; if (!holder.querySelector('.notification-row')) holder.innerHTML = '<div class="empty">' + escapeHtml(error.message) + '</div>'; }
+}
+async function markNotificationRead(row) {
+  if (!row.classList.contains('unread')) return;
+  notificationReadVersion++;
+  try {
+    await api('/notifications/mark-read/', {method:'POST', body:JSON.stringify({ids:[Number(row.dataset.notificationId)]})});
+    row.classList.remove('unread'); row.querySelector('.unread-label')?.remove();
+  } finally { notificationReadVersion++; void loadNotificationBadge(); }
 }
 function header(kicker, title, action = '') { return `<header class="view-header"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1></div>${action}</header>`; }
 const searchIcon = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>';
@@ -181,14 +257,14 @@ function clearChatPresence() {
   document.querySelectorAll('[data-online-person]').forEach(marker => { marker.hidden = true; });
 }
 async function refreshChatPresence() {
-  if (state.currentView !== 'chats' || document.hidden || presenceStopped || presenceReadPending) return;
+  if (document.hidden || presenceStopped || presenceReadPending) return;
   presenceReadPending = true;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const conversations = rows(await api('/conversations/', {signal: controller.signal}));
+    const conversations = await loadConversations({signal: controller.signal});
     if (state.currentView !== 'chats' || document.hidden) return;
-    state.conversations = conversations;
+    renderConversationList();
     const onlineIds = new Set(conversations.flatMap(chat => chat.participants.filter(person => person.is_online).map(person => person.id)));
     document.querySelectorAll('[data-online-person]').forEach(marker => { marker.hidden = !onlineIds.has(Number(marker.dataset.onlinePerson)); });
   } catch (_) { clearChatPresence(); }
@@ -322,7 +398,7 @@ function homeQuestMarkup(event) {
 }
 async function renderHome() {
   const name = state.user?.display_name || state.user?.username || 'Adventurer';
-  view.innerHTML = header('YOUR NEXT ADVENTURE', `Hello, <em>${escapeHtml(name)}.</em>`, `<div class="header-actions"><button class="header-action people-search-icon" data-action="explore-people" aria-label="Search people" title="Search people">${searchIcon}</button><button class="header-action" data-action="refresh-feed">Refresh ↻</button></div>`) + '<div class="quest-filter-row"><button class="quest-filter active" data-action="refresh-feed">For you</button><button class="quest-filter" data-view="explore">Nearby</button><button class="quest-filter" data-action="following-feed">Following</button><button class="quest-filter" data-view="reels">Reels</button></div><section class="home-quest-section"><div class="home-section-heading"><h2>Recommended quests</h2><button data-view="explore">See all</button></div><div class="home-quest-list"><p class="home-quest-loading">Finding quests for you…</p></div></section>' + '<aside class="notification-permission" data-notification-settings></aside>' + composer() + '<div class="feed"><p class="empty">Loading moments…</p></div>';
+  view.innerHTML = header('YOUR NEXT ADVENTURE', `Hello, <em>${escapeHtml(name)}.</em>`, `<div class="header-actions"><button class="header-action people-search-icon" data-action="open-search" aria-label="Search events or people" title="Search events or people">${searchIcon}</button><button class="header-action" data-action="refresh-feed">Refresh ↻</button></div>`) + '<div class="quest-filter-row"><button class="quest-filter active" data-action="refresh-feed">For you</button><button class="quest-filter" data-view="explore">Nearby</button><button class="quest-filter" data-action="following-feed">Following</button><button class="quest-filter" data-view="reels">Reels</button></div><section class="home-quest-section"><div class="home-section-heading"><h2>Recommended quests</h2><button data-view="explore">See all</button></div><div class="home-quest-list"><p class="home-quest-loading">Finding quests for you…</p></div></section>' + '<aside class="notification-permission" data-notification-settings></aside>' + composer() + '<div class="feed"><p class="empty">Loading moments…</p></div>';
   try {
     const [posts, eventData] = await Promise.all([api(`/posts/${state.feedFilter}/?kind=POST`), api('/events/recommended/')]);
     document.querySelector('[data-action=following-feed]')?.classList.toggle('active', state.feedFilter === 'following');
@@ -341,21 +417,105 @@ async function renderPostDetail() {
   } catch (error) { if (error.name === 'AbortError') return; view.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
 }
 function showFeedError(error) { const feed = document.querySelector('.feed'); if (feed) feed.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
-async function renderExplore() {
-  const query = state.exploreQuery.trim();
-  const exploreActions = `<div class="header-actions"><button class="header-action ${state.nearby ? 'nearby-active' : ''}" data-action="nearby-events">⌖ ${state.nearby ? 'Near me' : 'Nearby'}</button><button class="header-action" data-action="host-event">Host a quest +</button></div>`;
-  view.innerHTML = header('MAKE A PLAN', 'Explore <em>adventures.</em>', exploreActions) + `<p class="nearby-status" data-nearby-status aria-live="polite">${escapeHtml(state.nearbyStatus)}</p><form class="discover-search" id="explore-search"><input name="q" value="${escapeHtml(query)}" maxlength="100" placeholder="Search events or people" aria-label="Search events or people" /><button>Search</button></form><div class="explore-grid"><p class="empty">Finding adventures nearby…</p></div>`;
-  try {
-    const suffix = query ? `?q=${encodeURIComponent(query)}` : '';
-    const nearbySuffix = state.nearby ? `?latitude=${encodeURIComponent(state.nearby.latitude)}&longitude=${encodeURIComponent(state.nearby.longitude)}` : '';
-    const [eventData, peopleData] = await Promise.all([query ? api(`/events/${suffix}`) : api(`/events/recommended/${nearbySuffix}`), query ? api(`/people/${suffix}`) : Promise.resolve([])]);
-    const events = rows(eventData);
-    const people = rows(peopleData);
-    const eventCards = events.length ? events.map(event => `<article class="event-card"><div class="event-top"><div><p class="eyebrow">${eventDate(event.starts_at)}</p><h2><button class="event-title-link" data-action="event-detail" data-id="${event.id}">${escapeHtml(event.name)}</button></h2></div><span class="date-chip">${event.accepted_count}/${event.capacity}</span></div><p>${escapeHtml(event.description)}</p>${event.recommendation_reason ? `<span class="recommendation-tag event-recommendation">For you · ${escapeHtml(event.recommendation_reason)}</span>` : ''}<footer><button class="event-host-link" data-action="open-profile" data-id="${event.host.id}">⌖ ${escapeHtml(event.location_name)} · Hosted by ${escapeHtml(event.host.display_name || event.host.username)} · ★ ${event.host.karma || 'new'}</button>${event.host.id === state.user.id ? '<b>You are hosting</b>' : event.my_attendance_status ? `<b>${event.my_attendance_status.toLowerCase()}</b>` : event.is_finished ? '<b>requests closed</b>' : `<button class="request-button" data-action="join-event" data-id="${event.id}">Request to join</button>`}</footer></article>`).join('') : `<div class="empty">${query ? 'No matching events.' : 'No events yet. Be the person who starts one.'}</div>`;
-    const peopleResults = query ? `<section class="people-results"><div class="detail-heading"><h2>People <span>${people.length}</span></h2><p>Matching “${escapeHtml(query)}”</p></div>${people.length ? people.map(person => `<button class="search-person" data-action="open-profile" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(person.display_name || person.username)}</strong><small>@${escapeHtml(person.username)} · ★ ${person.karma || 'new'} · ${person.xp} XP</small></span></button>`).join('') : '<p class="empty">No matching people.</p>'}</section>` : '';
-    document.querySelector('.explore-grid').innerHTML = peopleResults + eventCards;
-  } catch (error) { if (error.name === 'AbortError') return; document.querySelector('.explore-grid').innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
+const exploreSearch = {version: 0, timer: null, controller: null, items: [], count: 0, page: 0, more: false, loading: false, error: ''};
+function cancelExploreSearch() {
+  clearTimeout(exploreSearch.timer);
+  exploreSearch.controller?.abort();
+  exploreSearch.version += 1;
 }
+function searchEventCard(event) { return `<article class="event-card"><div class="event-top"><div><p class="eyebrow">${eventDate(event.starts_at)}</p><h2><button class="event-title-link" data-action="event-detail" data-id="${event.id}">${escapeHtml(event.name)}</button></h2></div><span class="date-chip">${event.accepted_count}/${event.capacity}</span></div><p>${escapeHtml(event.description)}</p>${event.recommendation_reason ? `<span class="recommendation-tag event-recommendation">For you · ${escapeHtml(event.recommendation_reason)}</span>` : ''}<footer><button class="event-host-link" data-action="open-profile" data-id="${event.host.id}">⌖ ${escapeHtml(event.location_name)} · Hosted by ${escapeHtml(event.host.display_name || event.host.username)} · ★ ${event.host.karma || 'new'}</button>${event.host.id === state.user.id ? '<b>You are hosting</b>' : event.my_attendance_status ? `<b>${event.my_attendance_status.toLowerCase()}</b>` : event.is_finished ? '<b>requests closed</b>' : `<button class="request-button" data-action="join-event" data-id="${event.id}">Request to join</button>`}</footer></article>`; }
+function searchPersonCard(person) {
+  return `<button class="search-person" data-action="open-profile" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(person.display_name || person.username)}</strong><small>@${escapeHtml(person.username)}${person.city ? ` · ${escapeHtml(person.city)}` : ''}</small><small>★ ${person.karma ?? 0} · ${person.xp || 0} XP</small></span><span class="search-person-arrow" aria-hidden="true">›</span></button>`;
+}
+function renderSearchResults() {
+  const panel = view.querySelector('[data-search-results]');
+  if (!panel || state.currentView !== 'explore') return;
+  const query = state.exploreQuery.trim();
+  const kind = state.exploreKind;
+  const {items, count, more, loading, error} = exploreSearch;
+  const summary = view.querySelector('[data-search-summary]');
+  summary.textContent = loading && !items.length ? 'Searching…' : error && !items.length ? 'Search unavailable' : query ? `${count} ${count === 1 ? kind === 'events' ? 'event' : 'person' : kind} · Best matches first` : kind === 'events' ? state.nearby ? 'Events near you' : 'Recommended for you' : 'Meet the community';
+  panel.setAttribute('aria-busy', String(loading));
+  panel.setAttribute('aria-labelledby', 'search-tab-' + kind);
+  panel.classList.toggle('search-people-grid', kind === 'people');
+  view.querySelectorAll('[data-search-kind]').forEach(tab => {
+    const selected = tab.dataset.searchKind === kind;
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+  const clear = view.querySelector('[data-action="clear-search"]');
+  clear.hidden = !state.exploreQuery;
+  if (items.length) panel.innerHTML = items.map(kind === 'events' ? searchEventCard : searchPersonCard).join('');
+  else if (loading) panel.innerHTML = '<div class="search-empty"><span class="search-spinner" aria-hidden="true"></span><p>Finding your next connection…</p></div>';
+  else panel.innerHTML = `<div class="search-empty"><span aria-hidden="true">${error ? '☁' : '⌕'}</span><h2>${error ? 'Could not load results' : query ? `No matching ${kind}` : `No ${kind} yet`}</h2><p>${error ? escapeHtml(error) : kind === 'events' ? 'Try an event name, place, or host.' : 'Try a name, @username, or city.'}</p>${query && !error ? '<button class="header-action" data-action="clear-search">Clear search</button>' : ''}</div>`;
+  const footer = view.querySelector('[data-search-footer]');
+  footer.innerHTML = error ? `<p role="alert">${items.length ? escapeHtml(error) : 'Please try again.'}</p><button data-action="retry-search">Try again</button>` : more ? `<button data-action="more-search" ${loading ? 'disabled' : ''}>${loading ? 'Loading…' : `Load more ${kind}`}</button>` : '';
+}
+async function requestExploreSearch(append = false) {
+  if (state.currentView !== 'explore' || append && exploreSearch.loading) return;
+  cancelExploreSearch();
+  const version = exploreSearch.version;
+  const viewVersion = state.viewVersion;
+  const kind = state.exploreKind;
+  const query = state.exploreQuery.trim();
+  const page = append ? exploreSearch.page + 1 : 1;
+  const isCurrent = () => version === exploreSearch.version && viewVersion === state.viewVersion && state.currentView === 'explore';
+  exploreSearch.controller = new AbortController();
+  exploreSearch.loading = true; exploreSearch.error = '';
+  if (!append) { exploreSearch.items = []; exploreSearch.more = false; exploreSearch.count = 0; exploreSearch.page = 0; }
+  renderSearchResults();
+  try {
+    const suffix = `?q=${encodeURIComponent(query)}&page=${page}`;
+    const nearbySuffix = state.nearby ? `?latitude=${encodeURIComponent(state.nearby.latitude)}&longitude=${encodeURIComponent(state.nearby.longitude)}` : '';
+    const path = kind === 'events' && !query ? '/events/recommended/' + nearbySuffix : '/' + kind + '/' + suffix;
+    const data = await api(path, {singlePage: true, signal: exploreSearch.controller.signal});
+    if (!isCurrent()) return;
+    const found = rows(data);
+    exploreSearch.items = append ? [...exploreSearch.items, ...found] : found;
+    exploreSearch.count = data.count ?? found.length;
+    exploreSearch.more = Boolean(data.next); exploreSearch.page = page;
+  } catch (error) {
+    if (!isCurrent() || error.name === 'AbortError') return;
+    exploreSearch.error = error.message || 'Search is unavailable.';
+  } finally {
+    if (isCurrent()) { exploreSearch.loading = false; renderSearchResults(); }
+  }
+}
+function scheduleExploreSearch() {
+  cancelExploreSearch();
+  exploreSearch.items = []; exploreSearch.more = false; exploreSearch.loading = true; exploreSearch.error = '';
+  renderSearchResults();
+  exploreSearch.timer = setTimeout(() => void requestExploreSearch(), 300);
+}
+function changeExploreQuery(value) {
+  state.exploreQuery = value.slice(0, 100);
+  state.nearby = null; setNearbyStatus('');
+  const nearbyButton = view.querySelector('[data-action="nearby-events"]');
+  nearbyButton?.classList.remove('nearby-active');
+  if (nearbyButton) nearbyButton.textContent = '⌖ Nearby';
+  scheduleExploreSearch();
+}
+function clearExploreSearch() {
+  const input = view.querySelector('#explore-search input');
+  if (!input) return;
+  input.value = ''; changeExploreQuery(''); input.focus();
+}
+async function renderExplore() {
+  const exploreActions = `<div class="header-actions"><button class="header-action ${state.nearby ? 'nearby-active' : ''}" data-action="nearby-events">⌖ ${state.nearby ? 'Near me' : 'Nearby'}</button><button class="header-action" data-action="host-event">Host an event +</button></div>`;
+  view.innerHTML = header('DISCOVER YOUR COMMUNITY', 'Find your <em>people.</em>', exploreActions) + `
+    <section class="search-interface" aria-label="Search">
+      <form class="discover-search" id="explore-search" role="search">
+        <div class="search-input-wrap"><span class="search-field-icon" aria-hidden="true">${searchIcon}</span><input name="q" type="search" value="${escapeHtml(state.exploreQuery)}" maxlength="100" placeholder="Names, places, @people" aria-label="Search events or people" aria-describedby="search-hint" autocomplete="off" spellcheck="false" /><button class="search-clear" type="button" data-action="clear-search" aria-label="Clear search" ${state.exploreQuery ? '' : 'hidden'}>×</button></div><button type="submit">Search</button>
+      </form>
+      <p id="search-hint" class="search-hint">Search by name, place or host. Small typos are okay.</p>
+      <div class="search-tabs" role="tablist" aria-label="Search categories"><button type="button" role="tab" id="search-tab-events" aria-controls="search-results" data-search-kind="events" aria-selected="${state.exploreKind === 'events'}">Events</button><button type="button" role="tab" id="search-tab-people" aria-controls="search-results" data-search-kind="people" aria-selected="${state.exploreKind === 'people'}">People</button></div>
+    </section>
+    <p class="nearby-status" data-nearby-status aria-live="polite">${escapeHtml(state.nearbyStatus)}</p>
+    <p class="search-summary" data-search-summary role="status"></p>
+    <div class="explore-grid search-results" id="search-results" data-search-results role="tabpanel" tabindex="0"></div><div class="search-footer" data-search-footer></div>`;
+  return requestExploreSearch();
+}
+
 async function renderEventDetail() {
   view.innerHTML = header('ADVENTURE DETAILS', 'Loading <em>adventure…</em>', '<button class="header-action" data-view="explore">‹ Back to events</button>') + '<div class="event-detail"><p class="empty">Gathering the details…</p></div>';
   try {
@@ -397,20 +557,53 @@ async function renderReels() {
 }
 async function renderChats() {
   stopMessagePolling();
-  view.innerHTML = header('KEEP THE CONVERSATION GOING', 'Your <em>chats.</em>', '<button class="header-action" data-action="new-chat">New chat +</button>') + '<section class="chats-layout' + (state.chatOpen ? ' chat-open' : '') + '"><aside class="conversation-list"><div class="conversation-list-top"><div><p>YOUR INBOX</p><h2>Messages</h2></div><button class="new-chat" data-action="new-chat" aria-label="Start a new chat">＋</button></div><div id="conversations"><p class="empty">Loading…</p></div></aside><section class="chat-panel" id="chat-panel"><div class="chat-empty"><span>✦</span><strong>Choose a conversation</strong><p>Start with someone who made a good impression.</p></div></section></section>';
+  view.innerHTML = header('KEEP THE CONVERSATION GOING', 'Your <em>chats.</em>', '<button class="header-action" data-action="new-chat">New chat +</button>') + '<section class="chats-layout' + (state.chatOpen ? ' chat-open' : '') + '"><aside class="conversation-list"><div class="conversation-list-top"><div><p>YOUR INBOX</p><h2>Messages <b class="unread-count" data-chat-count hidden>0</b></h2></div><button class="new-chat" data-action="new-chat" aria-label="Start a new chat">＋</button></div><div id="conversations"><p class="empty">Loading…</p></div></aside><section class="chat-panel" id="chat-panel"><div class="chat-empty"><span>✦</span><strong>Choose a conversation</strong><p>Start with someone who made a good impression.</p></div></section></section>';
   try {
-    state.conversations = rows(await api('/conversations/'));
+    await loadConversations();
+    if (state.currentView !== 'chats') return;
     const showingMobileInbox = window.matchMedia?.('(max-width: 720px)').matches && !state.chatOpen;
     if (showingMobileInbox) state.activeConversation = null;
-    else if (!state.activeConversation && state.conversations[0]) state.activeConversation = state.conversations[0].id;
+    // Only opening a conversation should consume its unread messages.
     renderConversationList();
     if (state.activeConversation) await renderMessages();
   } catch (error) { if (error.name === 'AbortError') return; document.querySelector('#conversations').innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`; }
 }
-function renderConversationList() { const holder = document.querySelector('#conversations'); if (!holder) return; holder.innerHTML = state.conversations.length ? `<p class="conversation-count">${state.conversations.length} conversation${state.conversations.length === 1 ? '' : 's'}</p>${state.conversations.map(conversation => { const person = conversation.participants.find(person => person.id !== state.user.id) || state.user; const latest = conversation.latest_message; const preview = latest?.deleted_for_everyone ? 'Message deleted' : latest?.body || 'Start with a simple hello'; return `<button class="conversation ${conversation.id === state.activeConversation ? 'active' : ''}" data-action="open-chat" data-id="${conversation.id}">${avatar(person)}<span class="conversation-copy"><span class="conversation-top"><strong>${escapeHtml(conversation.display_name)}</strong><time>${latest ? escapeHtml(when(latest.created_at)) : ''}</time></span><small>${escapeHtml(preview)}</small>${onlineMarkup(person)}</span>${conversation.id === state.activeConversation ? '<i aria-hidden="true"></i>' : ''}</button>`; }).join('')}` : '<div class="chat-list-empty"><span>✉</span><strong>No conversations yet</strong><p>Start a chat with someone you met.</p><button class="new-chat-inline" data-action="new-chat">Start a chat</button></div>'; }
+function renderConversationList() {
+  const holder = document.querySelector('#conversations');
+  if (!holder) return;
+  holder.innerHTML = state.conversations.length ? `<p class="conversation-count">${state.conversations.length} conversation${state.conversations.length === 1 ? '' : 's'} <span data-chat-count class="unread-count"${unreadMessages() ? '' : ' hidden'}>${unreadMessages() > 99 ? '99+' : unreadMessages()}</span></p>${state.conversations.map(conversationMarkup).join('')}` : '<div class="chat-list-empty"><span>✉</span><strong>No conversations yet</strong><p>Start a chat with someone you met.</p><button class="new-chat-inline" data-action="new-chat">Start a chat</button></div>';
+  syncChatBadges();
+}
+function conversationMarkup(conversation) {
+  const person = conversation.participants.find(person => person.id !== state.user.id) || state.user;
+  const latest = conversation.latest_message;
+  const preview = latest?.deleted_for_everyone ? 'Message deleted' : latest?.body || 'Start with a simple hello';
+  const count = conversation.unread_count || 0;
+  return `<button class="conversation ${conversation.id === state.activeConversation ? 'active' : ''} ${count ? 'unread' : ''}" data-action="open-chat" data-id="${conversation.id}" aria-label="${escapeHtml(conversation.display_name)}${count ? ', ' + count + ' unread messages' : ''}">${avatar(person)}<span class="conversation-copy"><span class="conversation-top"><strong>${escapeHtml(conversation.display_name)}</strong><time>${latest ? escapeHtml(when(latest.created_at)) : ''}</time></span><small>${escapeHtml(preview)}</small>${onlineMarkup(person)}</span>${unreadBadge(count)}</button>`;
+}
 function stopMessagePolling() { if (state.messagePoll) { window.clearInterval(state.messagePoll); state.messagePoll = null; } }
-function messageMarkup(message) { const mine = message.sender.id === state.user.id; const deleted = message.deleted_for_everyone; const controls = !deleted ? `<button class="message-more" data-action="message-options" data-id="${message.id}" data-mine="${mine}" data-body="${escapeHtml(message.body)}" aria-label="Message options">•••</button>` : ''; return `<div class="message ${mine ? 'mine' : ''} ${deleted ? 'deleted' : ''}"><p>${deleted ? 'Message deleted' : escapeHtml(message.body)}</p><small>${mine ? 'You · ' : ''}${when(message.created_at)}${message.edited_at && !deleted ? ' · edited' : ''}</small>${controls}</div>`; }
-async function refreshMessageList(conversationId) { if (state.currentView !== 'chats' || state.activeConversation !== conversationId) return; const holder = document.querySelector('.messages'); if (!holder) return; const shouldFollow = !holder.dataset.loaded || holder.scrollHeight - holder.scrollTop - holder.clientHeight < 90; try { const messages = rows(await api(`/messages/?conversation=${conversationId}`)); holder.innerHTML = messages.length ? messages.map(messageMarkup).join('') : '<div class="chat-empty"><span>✦</span><strong>This is a new conversation.</strong><p>A thoughtful hello is plenty.</p></div>'; holder.dataset.loaded = 'true'; if (shouldFollow) holder.scrollTop = holder.scrollHeight; } catch (error) { if (error.name === 'AbortError') return; holder.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`; } }
+function messageMarkup(message) { const mine = message.sender.id === state.user.id; const deleted = message.deleted_for_everyone; const controls = !deleted ? `<button class="message-more" data-action="message-options" data-id="${message.id}" data-mine="${mine}" data-body="${escapeHtml(message.body)}" aria-label="Message options">•••</button>` : ''; return `<div data-message-id="${message.id}" class="message ${mine ? 'mine' : ''} ${deleted ? 'deleted' : ''}"><p>${deleted ? 'Message deleted' : escapeHtml(message.body)}</p><small>${mine ? 'You · ' : ''}${when(message.created_at)}${message.edited_at && !deleted ? ' · edited' : ''}</small>${controls}</div>`; }
+async function refreshMessageList(conversationId) {
+  if (document.hidden || state.currentView !== 'chats' || state.activeConversation !== conversationId) return;
+  const holder = document.querySelector('.messages');
+  if (!holder) return;
+  const version = Number(holder.dataset.requestVersion || 0) + 1;
+  holder.dataset.requestVersion = String(version);
+  try {
+    const messages = rows(await api(`/messages/?conversation=${conversationId}`));
+    if (version !== Number(holder.dataset.requestVersion) || document.hidden || state.currentView !== 'chats' || state.activeConversation !== conversationId || document.querySelector('.messages') !== holder) return;
+    // Measure after the request: the user may have scrolled up while it was loading.
+    const shouldFollow = !holder.dataset.loaded || holder.scrollHeight - holder.scrollTop - holder.clientHeight < 90;
+    const scrollTop = holder.scrollTop;
+    holder.innerHTML = messages.length ? messages.map(messageMarkup).join('') : '<div class="chat-empty"><span>✦</span><strong>This is a new conversation.</strong><p>A thoughtful hello is plenty.</p></div>';
+    holder.dataset.loaded = 'true';
+    holder.scrollTop = shouldFollow ? holder.scrollHeight : scrollTop;
+    markVisibleMessagesRead(conversationId, holder);
+  } catch (error) {
+    if (error.name === 'AbortError' || document.querySelector('.messages') !== holder) return;
+    if (!holder.dataset.loaded) holder.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`;
+  }
+}
 function startMessagePolling(conversationId) { stopMessagePolling(); state.messagePoll = window.setInterval(() => refreshMessageList(conversationId), 4000); }
 async function renderMessages() {
   const conversation = state.conversations.find(row => row.id === state.activeConversation);
@@ -418,7 +611,9 @@ async function renderMessages() {
   const person = conversation.participants.find(participant => participant.id !== state.user.id) || state.user;
   const panel = document.querySelector('#chat-panel');
   const emojis = ['😊', '😂', '❤️', '👍', '🎉', '✨', '👋', '🙌'];
-  panel.innerHTML = `<header class="chat-thread-header"><button class="chat-list-back" data-action="chat-list" aria-label="Back to conversations">‹</button><button class="chat-thread-person" data-action="open-profile" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(conversation.display_name)}</strong><small>Direct conversation</small></span></button><div class="chat-thread-tools">${onlineMarkup(person)}<button class="chat-manage" data-action="manage-chat" data-id="${conversation.id}" aria-label="Manage chat">•••</button></div></header><div class="messages"><p class="empty">Loading…</p></div><form class="message-form" data-conversation="${conversation.id}"><span class="message-compose-mark">✦</span><span class="message-emoji-wrap"><button type="button" class="emoji-trigger" data-action="toggle-message-emojis" aria-label="Add an emoji" aria-expanded="false">☺</button><span class="message-emoji-picker" hidden>${emojis.map(emoji => `<button type="button" data-action="insert-message-emoji" data-emoji="${emoji}" aria-label="Add ${emoji}">${emoji}</button>`).join('')}</span></span><input aria-label="Message" maxlength="2000" placeholder="Write a thoughtful message…" required /><button aria-label="Send message">Send <span>↑</span></button></form>`;
+  panel.innerHTML = `<header class="chat-thread-header"><button class="chat-list-back" data-action="chat-list" aria-label="Back to conversations">‹</button><button class="chat-thread-person" data-action="open-profile" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(conversation.display_name)}</strong><small>Direct conversation</small></span></button><div class="chat-thread-tools"><span data-thread-unread>${unreadBadge(conversation.unread_count || 0)}</span>${onlineMarkup(person)}<button class="chat-manage" data-action="manage-chat" data-id="${conversation.id}" aria-label="Manage chat">•••</button></div></header><div class="messages"><p class="empty">Loading…</p></div><form class="message-form" data-conversation="${conversation.id}"><span class="message-compose-mark">✦</span><span class="message-emoji-wrap"><button type="button" class="emoji-trigger" data-action="toggle-message-emojis" aria-label="Add an emoji" aria-expanded="false">☺</button><span class="message-emoji-picker" hidden>${emojis.map(emoji => `<button type="button" data-action="insert-message-emoji" data-emoji="${emoji}" aria-label="Add ${emoji}">${emoji}</button>`).join('')}</span></span><input aria-label="Message" maxlength="2000" placeholder="Write a thoughtful message…" required /><button aria-label="Send message">Send <span>↑</span></button></form>`;
+  const messageHolder = panel.querySelector('.messages');
+  messageHolder.addEventListener('scroll', () => markVisibleMessagesRead(conversation.id, messageHolder), {passive:true});
   await refreshMessageList(conversation.id);
   if (state.currentView === 'chats' && state.activeConversation === conversation.id) startMessagePolling(conversation.id);
 }
@@ -512,7 +707,7 @@ function submitQuestModal(quest) {
   }});
 }
 function directConversationFor(personId) { return state.conversations.find(conversation => conversation.participants.some(person => person.id === Number(personId))); }
-async function startOrOpenDirectConversation(personId) { const targetId = Number(personId); if (targetId === state.user.id) return alert('You cannot start a chat with yourself.'); try { const conversation = directConversationFor(targetId) || await api('/conversations/direct/', {method:'POST', body:JSON.stringify({user_id:targetId})}); state.conversations = rows(await api('/conversations/')); state.activeConversation = conversation.id; state.chatOpen = true; if (modal.open) closeModal(); await loadView('chats'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
+async function startOrOpenDirectConversation(personId) { const targetId = Number(personId); if (targetId === state.user.id) return alert('You cannot start a chat with yourself.'); try { const conversation = directConversationFor(targetId) || await api('/conversations/direct/', {method:'POST', body:JSON.stringify({user_id:targetId})}); await loadConversations(); state.activeConversation = conversation.id; state.chatOpen = true; if (modal.open) closeModal(); await loadView('chats'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
 async function openPeoplePicker() { try { const people = rows(await api('/people/following/')); showModal(`<div class="modal-inner"><h2>Start a conversation.</h2><p>Only people you follow appear here. Choose someone you would genuinely like to know better.</p><div class="people-picker">${people.map(person => { const existing = directConversationFor(person.id); return `<button class="picker-person" data-action="${existing ? 'open-chat' : 'start-direct'}" data-id="${existing ? existing.id : person.id}">${avatar(person)}<span><strong>${escapeHtml(person.display_name || person.username)}</strong><br><span>@${escapeHtml(person.username)} · ★ ${person.karma || 'new'}${existing ? ' · chat started' : ''}</span></span></button>`; }).join('') || '<p class="empty">Follow someone first, then they will appear here.</p>'}</div></div>`); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
 let peopleRequestVersion = 0;
 async function openPeopleDirectory(kind = 'search', personId = null) {
@@ -577,7 +772,7 @@ async function requestBrowserLocation(onSuccess, setStatus) {
     if (error?.code === 1) alert(message);
   }, {enableHighAccuracy:false, maximumAge:300000, timeout:10000});
 }
-function requestNearbyEvents() { requestBrowserLocation(position => { state.nearby = {latitude: Number(position.coords.latitude.toFixed(6)), longitude: Number(position.coords.longitude.toFixed(6))}; state.exploreQuery = ''; setNearbyStatus('Showing upcoming and ongoing events near you.'); loadView('explore', {history:false}); }, setNearbyStatus); }
+function requestNearbyEvents() { requestBrowserLocation(position => { state.nearby = {latitude: Number(position.coords.latitude.toFixed(6)), longitude: Number(position.coords.longitude.toFixed(6))}; state.exploreQuery = ''; state.exploreKind = 'events'; setNearbyStatus('Showing upcoming and ongoing events near you.'); loadView('explore', {history:false}); }, setNearbyStatus); }
 function captureEventLocation(button) { const status = button.parentElement?.querySelector('[data-event-location-status]'); const setStatus = message => { if (status) status.textContent = message; }; requestBrowserLocation(position => { const form = button.closest('form'); form.querySelector('[name="latitude"]').value = position.coords.latitude.toFixed(6); form.querySelector('[name="longitude"]').value = position.coords.longitude.toFixed(6); setStatus('Current location attached for nearby discovery.'); }, setStatus); }
 const localDateInput = value => { if (!value) return ''; const date = new Date(value); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
 function hostEventModal(event = null) { showModal(`<div class="modal-inner"><h2>${event ? 'Edit this adventure.' : 'Host a little adventure.'}</h2><p>Attach your approximate location so nearby discovery can surface this event to people close by.</p><form id="event-form" data-event-id="${event?.id || ''}"><label>Event name<input name="name" value="${escapeHtml(event?.name || '')}" required maxlength="120"></label><label>Description<textarea name="description" required maxlength="2000">${escapeHtml(event?.description || '')}</textarea></label><label>Location<input name="location_name" value="${escapeHtml(event?.location_name || '')}" required maxlength="160"></label><button class="location-capture" type="button" data-action="event-use-location">⌖ Use my current location</button><small class="location-capture-status" data-event-location-status>Optional — your coordinates are used only for nearby event matching.</small><input type="hidden" name="latitude" value="${event?.latitude ?? ''}"><input type="hidden" name="longitude" value="${event?.longitude ?? ''}"><label>Starts at<input name="starts_at" type="datetime-local" value="${localDateInput(event?.starts_at)}" required></label><label>Ends at<input name="ends_at" type="datetime-local" value="${localDateInput(event?.ends_at)}" required></label><label>Capacity<input name="capacity" type="number" min="2" value="${event?.capacity || 12}" required></label><label>Who can see it?<select name="privacy"><option value="PUBLIC"${event?.privacy === 'PRIVATE' ? '' : ' selected'}>Public</option><option value="PRIVATE"${event?.privacy === 'PRIVATE' ? ' selected' : ''}>Invite only</option></select></label><button class="submit">${event ? 'Save adventure' : 'Publish adventure'} →</button></form></div>`); }
@@ -590,6 +785,7 @@ async function eventInviteModal(eventId) {
 function cleanFormData(form) { const data = new FormData(form); for (const [key, value] of data) if (value instanceof File && !value.size) data.delete(key); return data; }
 async function submitPost(form) { const data = cleanFormData(form); try { await api('/posts/', {method:'POST', body:data}); clearMediaPreview(form); closeModal(); if (form.id === 'composer') form.reset(); await loadView('home'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
 async function loadView(name, options = {}) {
+  cancelExploreSearch();
   state.viewVersion += 1;
   const nextProfileId = name === 'profile' ? (options.profileId || (state.currentView === 'profile' ? state.profileId : null) || state.user.id) : null;
   const nextEventId = name === 'event' ? (options.eventId || state.eventId) : null;
@@ -614,6 +810,12 @@ async function loadView(name, options = {}) {
 
 document.addEventListener('click', async event => {
   const actionTarget = event.target.closest('[data-action]'); const action = actionTarget?.dataset.action; const button = event.target.closest('button');
+  if (actionTarget?.dataset.notificationId) {
+    const version = state.viewVersion;
+    try { await markNotificationRead(actionTarget); }
+    catch (_) { alert('Could not mark this notification read. Please try again.'); return; }
+    if (state.viewVersion !== version) return;
+  }
   const postCard = event.target.closest('.post[data-post-id]');
   if (!action && postCard && !event.target.closest('button,input,textarea,select,label,form,video,a')) return openPostModal(Number(postCard.dataset.postId));
   const viewName = event.target.closest('[data-view]')?.dataset.view; if (viewName) { if (viewName === 'chats') { state.chatOpen = false; state.activeConversation = null; } return loadView(viewName, viewName === 'profile' ? {profileId:state.user.id} : {}); }
@@ -623,11 +825,17 @@ document.addEventListener('click', async event => {
   if (action === 'logout') return logout();
   if (action === 'nearby-events') return requestNearbyEvents();
   if (action === 'event-use-location') return captureEventLocation(actionTarget);
-  if (action === 'compose') composeModal(); if (action === 'compose-reel') composeModal(true); if (action === 'close-modal') closeModal(); if (action === 'refresh-feed') { state.feedFilter = 'for-you'; loadView('home'); } if (action === 'following-feed') { state.feedFilter = 'following'; loadView('home'); } if (action === 'host-event') hostEventModal(); if (action === 'new-chat') openPeoplePicker(); if (action === 'explore-people') openPeopleDirectory();
+  if (action === 'compose') composeModal(); if (action === 'compose-reel') composeModal(true); if (action === 'close-modal') closeModal(); if (action === 'refresh-feed') { state.feedFilter = 'for-you'; loadView('home'); } if (action === 'following-feed') { state.feedFilter = 'following'; loadView('home'); } if (action === 'host-event') hostEventModal(); if (action === 'new-chat') openPeoplePicker();
   if (action === 'submit-quest') { const quest = state.eventQuests.find(item => item.id === Number(actionTarget.dataset.id)); if (quest) submitQuestModal(quest); }
   if (action === 'event-detail') return loadView('event', {eventId:Number(actionTarget.dataset.id)});
   if (action === 'open-profile') { if (modal.open) closeModal(); return loadView('profile', {profileId:Number(actionTarget.dataset.id)}); }
   if (action === 'show-followers' || action === 'show-following') return openPeopleDirectory(action === 'show-followers' ? 'followers' : 'following', Number(actionTarget.dataset.id));
+  if (action === 'open-search' || action === 'explore-people') { await loadView('explore'); view.querySelector('#explore-search input')?.focus(); return; }
+  if (action === 'clear-search') return clearExploreSearch();
+  if (action === 'more-search') return requestExploreSearch(true);
+  if (action === 'retry-search') return requestExploreSearch(exploreSearch.items.length > 0);
+  const searchKind = event.target.closest('[data-search-kind]')?.dataset.searchKind;
+  if (searchKind && state.exploreKind !== searchKind) { state.exploreKind = searchKind; return requestExploreSearch(); }
   if (action === 'retry-people') return searchPeopleDirectory();
   if (action === 'profile-tab') return selectProfileTab(actionTarget.dataset.profileTab);
   if (action === 'join-event') { try { await api(`/events/${button.dataset.id}/join/`, {method:'POST', body:'{}'}); await loadView(state.currentView === 'event' ? 'event' : 'explore'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
@@ -659,10 +867,18 @@ document.addEventListener('click', async event => {
   if (action === 'delete-comment') { if (window.confirm('Delete this comment and its replies?')) { try { const postId = Number(actionTarget.closest('[data-post-id]')?.dataset.postId); await api('/comments/' + actionTarget.dataset.id + '/', {method:'DELETE'}); if (postId) await refreshPostComments(postId); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
   if (action === 'message-options') return messageOptionsModal(actionTarget);
   if (action === 'edit-message') return editMessageModal(actionTarget);
-  if (action === 'delete-message') { const scope = actionTarget.dataset.scope; const warning = scope === 'everyone' ? 'Delete this message for everyone?' : 'Delete this message from your view?'; if (window.confirm(warning)) { try { await api(`/messages/${actionTarget.dataset.id}/?scope=${scope}`, {method:'DELETE'}); if (modal.open) closeModal(); state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(state.activeConversation); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
+  if (action === 'delete-message') { const scope = actionTarget.dataset.scope; const warning = scope === 'everyone' ? 'Delete this message for everyone?' : 'Delete this message from your view?'; if (window.confirm(warning)) { try { await api(`/messages/${actionTarget.dataset.id}/?scope=${scope}`, {method:'DELETE'}); if (modal.open) closeModal(); await loadConversations(); renderConversationList(); await refreshMessageList(state.activeConversation); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
   if (action === 'manage-chat') { const conversation = state.conversations.find(item => item.id === Number(actionTarget.dataset.id)); if (conversation) manageChatModal(conversation); }
-  if (action === 'delete-conversation') { if (window.confirm('Remove this chat from your inbox? New messages will bring it back.')) { try { await api(`/conversations/${actionTarget.dataset.id}/`, {method:'DELETE'}); if (modal.open) closeModal(); state.conversations = rows(await api('/conversations/')); state.activeConversation = null; state.chatOpen = false; await loadView('chats'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
-  if (action === 'mark-notifications-read') { try { await api('/notifications/mark-read/', {method:'POST', body:'{}'}); await loadView('notifications'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
+  if (action === 'delete-conversation') { if (window.confirm('Remove this chat from your inbox? New messages will bring it back.')) { try { await api(`/conversations/${actionTarget.dataset.id}/`, {method:'DELETE'}); if (modal.open) closeModal(); await loadConversations(); state.activeConversation = null; state.chatOpen = false; await loadView('chats'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } }
+  if (action === 'mark-notifications-read') {
+    notificationReadVersion++;
+    try { await api('/notifications/mark-read/', {method:'POST', body:'{}'}); }
+    catch (error) { alert(error.message); }
+    finally { notificationReadVersion++; }
+    void loadNotificationBadge();
+    if (state.currentView === 'notifications') await refreshNotificationsList();
+    return;
+  }
   if (action === 'notification-event') return loadView('event', {eventId:Number(actionTarget.dataset.eventId)});
   if (action === 'chat-list') { state.chatOpen = false; state.activeConversation = null; stopMessagePolling(); document.querySelector('.chats-layout')?.classList.remove('chat-open'); renderConversationList(); return; }
   if (action === 'notification-chat') { state.activeConversation = Number(actionTarget.dataset.conversationId); state.chatOpen = true; return loadView('chats'); }
@@ -714,8 +930,8 @@ document.addEventListener('change', event => {
   }
 });
 
-onFormSubmit(async event => { const form = event.target; if (form.id === 'explore-search') { event.preventDefault(); state.exploreQuery = String(new FormData(form).get('q') || '').trim(); state.nearby = null; return loadView('explore', {history:false}); } if (form.id === 'composer' || form.id === 'modal-compose') { event.preventDefault(); return submitPost(form); } if (form.matches('.comment-form')) { event.preventDefault(); const input = form.querySelector('textarea'); if (!input.value.trim()) return; try { await api('/comments/', {method:'POST', body:JSON.stringify({post:form.dataset.post, body:input.value.trim()})}); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.matches('.message-form')) { event.preventDefault(); const input = form.querySelector('input'); if (!input.value.trim()) return; try { await api('/messages/', {method:'POST', body:JSON.stringify({conversation:form.dataset.conversation, body:input.value.trim()})}); input.value = ''; state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(Number(form.dataset.conversation)); input.focus(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'profile-form') { event.preventDefault(); try { state.user = await api('/people/me/', {method:'PATCH', body:cleanFormData(form)}); syncUser(); closeModal(); await renderProfile(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'event-form') { event.preventDefault(); try { const raw = Object.fromEntries(new FormData(form)); raw.capacity = Number(raw.capacity); raw.starts_at = new Date(raw.starts_at).toISOString(); raw.ends_at = new Date(raw.ends_at).toISOString(); if (raw.latitude === '') delete raw.latitude; else raw.latitude = Number(raw.latitude); if (raw.longitude === '') delete raw.longitude; else raw.longitude = Number(raw.longitude); const eventId = Number(form.dataset.eventId) || null; const saved = await api(eventId ? `/events/${eventId}/` : '/events/', {method:eventId ? 'PATCH' : 'POST', body:JSON.stringify(raw)}); closeModal(); if (!eventId) { try { await api(`/events/${saved.id}/generate-quests/`, {method:'POST', body:'{}'}); } catch (_) { alert('Your event was published. Quest generation is temporarily unavailable.'); } } await loadView('event', {eventId:saved.id}); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } });
-onFormSubmit(async event => { const form = event.target; if (!['edit-comment-form', 'edit-message-form', 'conversation-form'].includes(form.id)) return; event.preventDefault(); const body = String(new FormData(form).get('body') || '').trim(); try { if (form.id === 'edit-comment-form') { if (!body) return; await api(`/comments/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); if (state.openPostId) await renderPostModal(state.openPostId); else { closeModal(); await loadView(state.currentView); } } if (form.id === 'edit-message-form') { if (!body) return; await api(`/messages/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); closeModal(); state.conversations = rows(await api('/conversations/')); renderConversationList(); await refreshMessageList(state.activeConversation); } if (form.id === 'conversation-form') { const title = String(new FormData(form).get('title') || '').trim(); await api(`/conversations/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({title})}); closeModal(); state.conversations = rows(await api('/conversations/')); await loadView('chats'); } } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } });
+onFormSubmit(async event => { const form = event.target; if (form.id === 'explore-search') { event.preventDefault(); changeExploreQuery(String(new FormData(form).get('q') || '')); return requestExploreSearch(); } if (form.id === 'composer' || form.id === 'modal-compose') { event.preventDefault(); return submitPost(form); } if (form.matches('.comment-form')) { event.preventDefault(); const input = form.querySelector('textarea'); if (!input.value.trim()) return; try { await api('/comments/', {method:'POST', body:JSON.stringify({post:form.dataset.post, body:input.value.trim()})}); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.matches('.message-form')) { event.preventDefault(); const input = form.querySelector('input'); if (!input.value.trim()) return; try { await api('/messages/', {method:'POST', body:JSON.stringify({conversation:form.dataset.conversation, body:input.value.trim()})}); input.value = ''; await loadConversations(); renderConversationList(); await refreshMessageList(Number(form.dataset.conversation)); input.focus(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'profile-form') { event.preventDefault(); try { state.user = await api('/people/me/', {method:'PATCH', body:cleanFormData(form)}); syncUser(); closeModal(); await renderProfile(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'event-form') { event.preventDefault(); try { const raw = Object.fromEntries(new FormData(form)); raw.capacity = Number(raw.capacity); raw.starts_at = new Date(raw.starts_at).toISOString(); raw.ends_at = new Date(raw.ends_at).toISOString(); if (raw.latitude === '') delete raw.latitude; else raw.latitude = Number(raw.latitude); if (raw.longitude === '') delete raw.longitude; else raw.longitude = Number(raw.longitude); const eventId = Number(form.dataset.eventId) || null; const saved = await api(eventId ? `/events/${eventId}/` : '/events/', {method:eventId ? 'PATCH' : 'POST', body:JSON.stringify(raw)}); closeModal(); if (!eventId) { try { await api(`/events/${saved.id}/generate-quests/`, {method:'POST', body:'{}'}); } catch (_) { alert('Your event was published. Quest generation is temporarily unavailable.'); } } await loadView('event', {eventId:saved.id}); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } });
+onFormSubmit(async event => { const form = event.target; if (!['edit-comment-form', 'edit-message-form', 'conversation-form'].includes(form.id)) return; event.preventDefault(); const body = String(new FormData(form).get('body') || '').trim(); try { if (form.id === 'edit-comment-form') { if (!body) return; await api(`/comments/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); if (state.openPostId) await renderPostModal(state.openPostId); else { closeModal(); await loadView(state.currentView); } } if (form.id === 'edit-message-form') { if (!body) return; await api(`/messages/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); closeModal(); await loadConversations(); renderConversationList(); await refreshMessageList(state.activeConversation); } if (form.id === 'conversation-form') { const title = String(new FormData(form).get('title') || '').trim(); await api(`/conversations/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({title})}); closeModal(); await loadConversations(); await loadView('chats'); } } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } });
 
 (async function init() {
   try {
@@ -763,5 +979,27 @@ document.addEventListener('submit', async event => {
     delete form.dataset.submitting;
     form.removeAttribute('aria-busy');
     buttons.forEach(button => button.disabled = false);
+  }
+});
+
+// Preserve the input node while results update, including IME composition.
+document.addEventListener('input', event => {
+  if (event.target.matches('#explore-search input')) {
+    // Invalidate pending work even before composition is committed.
+    if (event.isComposing) { cancelExploreSearch(); return; }
+    changeExploreQuery(event.target.value);
+  }
+});
+document.addEventListener('compositionend', event => {
+  if (event.target.matches('#explore-search input')) changeExploreQuery(event.target.value);
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && event.target.matches('#explore-search input')) { event.preventDefault(); clearExploreSearch(); }
+  const tab = event.target.closest('[data-search-kind]');
+  if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+    event.preventDefault();
+    state.exploreKind = event.key === 'Home' ? 'events' : event.key === 'End' ? 'people' : state.exploreKind === 'events' ? 'people' : 'events';
+    view.querySelector('[data-search-kind="' + state.exploreKind + '"]')?.focus();
+    void requestExploreSearch();
   }
 });

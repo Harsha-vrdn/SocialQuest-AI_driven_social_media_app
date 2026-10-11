@@ -15,6 +15,8 @@
       "softwareKeyboardLayoutMode": "resize"
     },
     "plugins": [
+      "expo-status-bar",
+      "expo-video",
       [
         "expo-image-picker",
         {
@@ -32,16 +34,8 @@
       "expo-secure-store",
       "expo-asset",
       [
-        "expo-status-bar",
-        {
-          "style": "light"
-        }
-      ],
-      "expo-video",
-      [
         "expo-navigation-bar",
         {
-          "style": "light",
           "enforceContrast": false
         }
       ],
@@ -49,7 +43,7 @@
         "expo-notifications",
         {
           "defaultChannel": "activity",
-          "color": "#9a65ff"
+          "color": "#6231AF"
         }
       ]
     ],
