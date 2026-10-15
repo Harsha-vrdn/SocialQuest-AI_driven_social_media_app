@@ -1,4 +1,6 @@
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.db.models import Sum
 from django.utils import timezone
@@ -19,11 +21,22 @@ class AuthSession(models.Model):
 
 
 class Profile(models.Model):
+    class AccountState(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        DEACTIVATED = "DEACTIVATED", "Deactivated"
+        PENDING_DELETION = "PENDING_DELETION", "Pending deletion"
+
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
     display_name = models.CharField(max_length=80, blank=True)
     bio = models.CharField(max_length=280, blank=True)
     avatar = models.ImageField(upload_to="avatars/", blank=True, null=True)
     city = models.CharField(max_length=80, blank=True)
+    location_mode = models.CharField(max_length=7, choices=[("CURRENT", "Current location"), ("SAVED", "Saved city")], default="CURRENT")
+    saved_city = models.CharField(max_length=80, blank=True)
+    saved_latitude = models.FloatField(null=True, blank=True)
+    saved_longitude = models.FloatField(null=True, blank=True)
+    account_state = models.CharField(max_length=16, choices=AccountState.choices, default=AccountState.ACTIVE)
+    deletion_due_at = models.DateTimeField(null=True, blank=True, db_index=True)
     total_xp = models.PositiveIntegerField(default=0)
     @property
     def karma(self):
@@ -31,6 +44,12 @@ class Profile(models.Model):
 
     def __str__(self):
         return self.display_name or self.user.username
+
+
+class PendingUploadDeletion(models.Model):
+    """Durable retries if removing a deleted account's public upload fails."""
+    name = models.CharField(max_length=500, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class UserPresence(models.Model):
@@ -203,6 +222,32 @@ class KarmaRating(models.Model):
         ]
 
 
+class UserBlock(models.Model):
+    blocker = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="blocks")
+    blocked_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="blocked_by")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["blocker", "blocked_user"], name="unique_user_block"),
+            models.CheckConstraint(check=~models.Q(blocker=models.F("blocked_user")), name="no_self_block"),
+        ]
+
+
+class Report(models.Model):
+    reporter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="reports")
+    reported_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="received_reports")
+    content_type = models.ForeignKey(ContentType, on_delete=models.PROTECT)
+    object_id = models.PositiveBigIntegerField()
+    content_object = GenericForeignKey("content_type", "object_id")
+    reason = models.TextField(max_length=2000)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["content_type", "object_id"], name="report_content_idx")]
+
+
 class Post(models.Model):
     class Kind(models.TextChoices):
         POST = "POST", "Post"
@@ -220,6 +265,7 @@ class Post(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["author", "-created_at"], name="post_author_created_idx")]
 
     def save(self, *args, **kwargs):
         if self.event_id:
@@ -265,6 +311,7 @@ class Comment(models.Model):
 
     class Meta:
         ordering = ["created_at"]
+        indexes = [models.Index(fields=["post", "created_at"], name="comment_post_created_idx")]
 
 
 class Conversation(models.Model):
@@ -302,9 +349,43 @@ class Message(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     edited_at = models.DateTimeField(blank=True, null=True)
     deleted_for_everyone = models.BooleanField(default=False)
+    client_id = models.UUIDField(null=True, blank=True, editable=False)
 
     class Meta:
         ordering = ["created_at"]
+        indexes = [models.Index(fields=["conversation", "created_at"], name="message_chat_created_idx")]
+        constraints = [models.UniqueConstraint(fields=["sender", "client_id"], name="unique_message_client_send")]
+
+
+class ChatDevice(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="chat_devices")
+    public_key = models.CharField(max_length=44)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class ChatAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, editable=False)
+    message = models.OneToOneField(Message, on_delete=models.CASCADE, related_name="attachment")
+    sender_device = models.ForeignKey(ChatDevice, on_delete=models.PROTECT)
+    ciphertext_size = models.PositiveIntegerField()
+    ciphertext_sha256 = models.CharField(max_length=64)
+    request_digest = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    removed_at = models.DateTimeField(null=True, blank=True)
+    removal_reason = models.CharField(max_length=12, blank=True)
+
+
+class ChatAttachmentRecipient(models.Model):
+    attachment = models.ForeignKey(ChatAttachment, on_delete=models.CASCADE, related_name="recipients")
+    device = models.ForeignKey(ChatDevice, on_delete=models.PROTECT)
+    # Per-device encrypted key + filename/type; the relay has no decryption key.
+    envelope = models.TextField()
+    saved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["attachment", "device"], name="unique_attachment_device")]
 
 
 class Notification(models.Model):

@@ -12,6 +12,7 @@
     },
     "android": {
       "package": "com.socialquest.app",
+      "predictiveBackGestureEnabled": false,
       "softwareKeyboardLayoutMode": "resize"
     },
     "plugins": [
@@ -20,7 +21,7 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "SocialQuest uses your photos only when you choose one to share in a post.",
+          "photosPermission": "SocialQuest uses your photos only when you choose one to share in a post or chat.",
           "cameraPermission": "SocialQuest uses your camera only when you choose to take a photo for a post."
         }
       ],
@@ -33,6 +34,13 @@
       "expo-font",
       "expo-secure-store",
       "expo-asset",
+      [
+        "./plugins/withAndroidSystemBars.cjs",
+        {
+          "lightBackground": "#FFF7E9",
+          "darkBackground": "#1C1426"
+        }
+      ],
       [
         "expo-navigation-bar",
         {

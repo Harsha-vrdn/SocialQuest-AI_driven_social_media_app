@@ -6,11 +6,12 @@ const view = document.querySelector('#view');
 const modal = document.querySelector('#modal');
 const modalContent = document.querySelector('#modal-content');
 const formHandlers = [];
-const state = { viewVersion: 0, feedFilter: 'for-you', user: null, currentView: 'home', activeConversation: null, chatOpen: false, conversations: [], profileId: null, profileTab: 'moments', eventId: null, eventDetail: null, postId: null, openPostId: null, eventQuests: [], messagePoll: null, notificationPoll: null, notificationUnread: 0, exploreQuery: '', exploreKind: 'events', nearby: null, nearbyStatus: '', share: null };
+const state = { viewVersion: 0, feedFilter: 'for-you', user: null, currentView: 'home', activeConversation: null, chatOpen: false, conversations: [], profileId: null, profileTab: 'moments', eventId: null, eventDetail: null, postId: null, openPostId: null, eventQuests: [], messagePoll: null, notificationPoll: null, notificationUnread: 0, exploreQuery: '', exploreKind: 'events', exploreEventFilter: 'explore', nearby: null, nearbyStatus: '', share: null };
 
 document.documentElement.classList.add('dark');
 document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#050916');
 async function logout() {
+  window.SocialQuestAttachments?.dispose();
   await window.SocialQuestNotifications.logout();
   presenceStopped = true;
   await updatePresence(false);
@@ -337,7 +338,7 @@ function setPostLikeUI(postId, liked, likeCount) {
     likeButton.dataset.liked = String(liked);
     likeButton.classList.toggle('liked', liked);
     likeButton.setAttribute('aria-pressed', String(liked));
-    likeButton.setAttribute('aria-label', `${liked ? 'Unlike' : 'Like'} this post`);
+    likeButton.setAttribute('aria-label', `${liked ? 'Unlike' : 'Like'} this ${likeButton.dataset.kind === 'reel' ? 'reel' : 'post'}`);
     likeButton.textContent = `♥ ${likeCount}`;
   });
 }
@@ -423,7 +424,16 @@ function cancelExploreSearch() {
   exploreSearch.controller?.abort();
   exploreSearch.version += 1;
 }
-function searchEventCard(event) { return `<article class="event-card"><div class="event-top"><div><p class="eyebrow">${eventDate(event.starts_at)}</p><h2><button class="event-title-link" data-action="event-detail" data-id="${event.id}">${escapeHtml(event.name)}</button></h2></div><span class="date-chip">${event.accepted_count}/${event.capacity}</span></div><p>${escapeHtml(event.description)}</p>${event.recommendation_reason ? `<span class="recommendation-tag event-recommendation">For you · ${escapeHtml(event.recommendation_reason)}</span>` : ''}<footer><button class="event-host-link" data-action="open-profile" data-id="${event.host.id}">⌖ ${escapeHtml(event.location_name)} · Hosted by ${escapeHtml(event.host.display_name || event.host.username)} · ★ ${event.host.karma || 'new'}</button>${event.host.id === state.user.id ? '<b>You are hosting</b>' : event.my_attendance_status ? `<b>${event.my_attendance_status.toLowerCase()}</b>` : event.is_finished ? '<b>requests closed</b>' : `<button class="request-button" data-action="join-event" data-id="${event.id}">Request to join</button>`}</footer></article>`; }
+function searchEventCard(event) {
+  const going = event.my_attendance_status === 'ACCEPTED';
+  const status = going ? '✓ Going' : event.my_attendance_status === 'PENDING' ? '⏳ Requested' : event.my_attendance_status === 'INVITED' ? '✉ Invited' : '';
+  return `<article class="event-card${going ? ' event-going' : ''}">
+    <div class="event-top"><div>${status ? `<span class="event-attendance-badge">${status}</span>` : ''}<p class="eyebrow">${eventDate(event.starts_at)}</p><h2><button class="event-title-link" data-action="event-detail" data-id="${event.id}">${escapeHtml(event.name)}</button></h2></div><span class="date-chip">${event.accepted_count}/${event.capacity}</span></div>
+    <p>${escapeHtml(event.description)}</p>
+    ${event.recommendation_reason ? `<span class="recommendation-tag event-recommendation">For you · ${escapeHtml(event.recommendation_reason)}</span>` : ''}
+    <footer><button class="event-host-link" data-action="open-profile" data-id="${event.host.id}">⌖ ${escapeHtml(event.location_name)} · Hosted by ${escapeHtml(event.host.display_name || event.host.username)} · ★ ${event.host.karma || 'new'}</button>${event.host.id === state.user.id ? '<b>You are hosting</b>' : event.is_finished ? '<b>requests closed</b>' : status ? '' : `<button class="request-button" data-action="join-event" data-id="${event.id}">Request to join</button>`}</footer>
+  </article>`;
+}
 function searchPersonCard(person) {
   return `<button class="search-person" data-action="open-profile" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(person.display_name || person.username)}</strong><small>@${escapeHtml(person.username)}${person.city ? ` · ${escapeHtml(person.city)}` : ''}</small><small>★ ${person.karma ?? 0} · ${person.xp || 0} XP</small></span><span class="search-person-arrow" aria-hidden="true">›</span></button>`;
 }
@@ -432,22 +442,29 @@ function renderSearchResults() {
   if (!panel || state.currentView !== 'explore') return;
   const query = state.exploreQuery.trim();
   const kind = state.exploreKind;
+  const myEvents = kind === 'events' && state.exploreEventFilter === 'mine';
   const {items, count, more, loading, error} = exploreSearch;
   const summary = view.querySelector('[data-search-summary]');
-  summary.textContent = loading && !items.length ? 'Searching…' : error && !items.length ? 'Search unavailable' : query ? `${count} ${count === 1 ? kind === 'events' ? 'event' : 'person' : kind} · Best matches first` : kind === 'events' ? state.nearby ? 'Events near you' : 'Recommended for you' : 'Meet the community';
+  summary.textContent = loading && !items.length ? 'Searching…' : error && !items.length ? 'Search unavailable' : myEvents ? `${count} ${count === 1 ? 'event' : 'events'} · Soonest first` : query ? `${count} ${count === 1 ? kind === 'events' ? 'event' : 'person' : kind} · Best matches first` : kind === 'events' ? state.nearby ? 'Events near you' : 'Recommended for you' : 'Meet the community';
   panel.setAttribute('aria-busy', String(loading));
-  panel.setAttribute('aria-labelledby', 'search-tab-' + kind);
+  panel.setAttribute('aria-labelledby', 'search-tab-' + kind + (kind === 'events' ? ' event-filter-' + (myEvents ? 'mine' : 'explore') : ''));
   panel.classList.toggle('search-people-grid', kind === 'people');
   view.querySelectorAll('[data-search-kind]').forEach(tab => {
     const selected = tab.dataset.searchKind === kind;
     tab.setAttribute('aria-selected', String(selected));
     tab.tabIndex = selected ? 0 : -1;
   });
+  view.querySelector('[data-event-filters]').hidden = kind !== 'events';
+  view.querySelectorAll('[data-event-filter]').forEach(tab => {
+    const selected = tab.dataset.eventFilter === (myEvents ? 'mine' : 'explore');
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
   const clear = view.querySelector('[data-action="clear-search"]');
   clear.hidden = !state.exploreQuery;
   if (items.length) panel.innerHTML = items.map(kind === 'events' ? searchEventCard : searchPersonCard).join('');
-  else if (loading) panel.innerHTML = '<div class="search-empty"><span class="search-spinner" aria-hidden="true"></span><p>Finding your next connection…</p></div>';
-  else panel.innerHTML = `<div class="search-empty"><span aria-hidden="true">${error ? '☁' : '⌕'}</span><h2>${error ? 'Could not load results' : query ? `No matching ${kind}` : `No ${kind} yet`}</h2><p>${error ? escapeHtml(error) : kind === 'events' ? 'Try an event name, place, or host.' : 'Try a name, @username, or city.'}</p>${query && !error ? '<button class="header-action" data-action="clear-search">Clear search</button>' : ''}</div>`;
+  else if (loading) panel.innerHTML = `<div class="search-empty"><span class="search-spinner" aria-hidden="true"></span><p>${myEvents ? 'Finding your upcoming events…' : 'Finding your next connection…'}</p></div>`;
+  else panel.innerHTML = `<div class="search-empty"><span aria-hidden="true">${error ? '☁' : '⌕'}</span><h2>${error ? 'Could not load results' : query ? `No matching ${kind}` : myEvents ? 'No upcoming events yet' : `No ${kind} yet`}</h2><p>${error ? escapeHtml(error) : myEvents && !query ? 'Events you request, accept, or are invited to will appear here.' : kind === 'events' ? 'Try an event name, place, or host.' : 'Try a name, @username, or city.'}</p>${query && !error ? '<button class="header-action" data-action="clear-search">Clear search</button>' : ''}${myEvents && !error ? '<button class="header-action" data-action="explore-events">Explore events</button>' : ''}</div>`;
   const footer = view.querySelector('[data-search-footer]');
   footer.innerHTML = error ? `<p role="alert">${items.length ? escapeHtml(error) : 'Please try again.'}</p><button data-action="retry-search">Try again</button>` : more ? `<button data-action="more-search" ${loading ? 'disabled' : ''}>${loading ? 'Loading…' : `Load more ${kind}`}</button>` : '';
 }
@@ -457,6 +474,7 @@ async function requestExploreSearch(append = false) {
   const version = exploreSearch.version;
   const viewVersion = state.viewVersion;
   const kind = state.exploreKind;
+  const myEvents = kind === 'events' && state.exploreEventFilter === 'mine';
   const query = state.exploreQuery.trim();
   const page = append ? exploreSearch.page + 1 : 1;
   const isCurrent = () => version === exploreSearch.version && viewVersion === state.viewVersion && state.currentView === 'explore';
@@ -467,7 +485,7 @@ async function requestExploreSearch(append = false) {
   try {
     const suffix = `?q=${encodeURIComponent(query)}&page=${page}`;
     const nearbySuffix = state.nearby ? `?latitude=${encodeURIComponent(state.nearby.latitude)}&longitude=${encodeURIComponent(state.nearby.longitude)}` : '';
-    const path = kind === 'events' && !query ? '/events/recommended/' + nearbySuffix : '/' + kind + '/' + suffix;
+    const path = myEvents ? '/events/' + suffix + '&attending=true' : kind === 'events' && !query ? '/events/recommended/' + nearbySuffix : '/' + kind + '/' + suffix;
     const data = await api(path, {singlePage: true, signal: exploreSearch.controller.signal});
     if (!isCurrent()) return;
     const found = rows(data);
@@ -500,6 +518,22 @@ function clearExploreSearch() {
   if (!input) return;
   input.value = ''; changeExploreQuery(''); input.focus();
 }
+function selectEventFilter(filter, resetSearch = false) {
+  if (!['explore', 'mine'].includes(filter)) return;
+  state.exploreKind = 'events';
+  state.exploreEventFilter = filter;
+  state.nearby = null; setNearbyStatus('');
+  const nearbyButton = view.querySelector('[data-action="nearby-events"]');
+  nearbyButton?.classList.remove('nearby-active');
+  if (nearbyButton) nearbyButton.textContent = '⌖ Nearby';
+  if (resetSearch) {
+    state.exploreQuery = '';
+    const input = view.querySelector('#explore-search input');
+    if (input) input.value = '';
+    view.querySelector('[data-event-filter="' + filter + '"]')?.focus();
+  }
+  return requestExploreSearch();
+}
 async function renderExplore() {
   const exploreActions = `<div class="header-actions"><button class="header-action ${state.nearby ? 'nearby-active' : ''}" data-action="nearby-events">⌖ ${state.nearby ? 'Near me' : 'Nearby'}</button><button class="header-action" data-action="host-event">Host an event +</button></div>`;
   view.innerHTML = header('DISCOVER YOUR COMMUNITY', 'Find your <em>people.</em>', exploreActions) + `
@@ -509,11 +543,39 @@ async function renderExplore() {
       </form>
       <p id="search-hint" class="search-hint">Search by name, place or host. Small typos are okay.</p>
       <div class="search-tabs" role="tablist" aria-label="Search categories"><button type="button" role="tab" id="search-tab-events" aria-controls="search-results" data-search-kind="events" aria-selected="${state.exploreKind === 'events'}">Events</button><button type="button" role="tab" id="search-tab-people" aria-controls="search-results" data-search-kind="people" aria-selected="${state.exploreKind === 'people'}">People</button></div>
+      <div class="event-filters" data-event-filters role="tablist" aria-label="Event filters" ${state.exploreKind === 'events' ? '' : 'hidden'}><button type="button" role="tab" id="event-filter-explore" data-event-filter="explore" aria-controls="search-results" aria-selected="${state.exploreEventFilter !== 'mine'}" tabindex="${state.exploreEventFilter !== 'mine' ? 0 : -1}">Explore</button><button type="button" role="tab" id="event-filter-mine" data-event-filter="mine" aria-controls="search-results" aria-selected="${state.exploreEventFilter === 'mine'}" tabindex="${state.exploreEventFilter === 'mine' ? 0 : -1}">My Events</button></div>
     </section>
     <p class="nearby-status" data-nearby-status aria-live="polite">${escapeHtml(state.nearbyStatus)}</p>
     <p class="search-summary" data-search-summary role="status"></p>
     <div class="explore-grid search-results" id="search-results" data-search-results role="tabpanel" tabindex="0"></div><div class="search-footer" data-search-footer></div>`;
   return requestExploreSearch();
+}
+
+const eventRsvpPending = new Set();
+async function updateEventRsvp(id, cancel = false) {
+  const eventId = Number(id);
+  if (!Number.isInteger(eventId) || eventId <= 0 || eventRsvpPending.has(eventId)) return;
+  const version = state.viewVersion;
+  const credential = localStorage.getItem(TOKEN_KEY);
+  const leavingPrivateEvent = cancel && state.currentView === 'event' && state.eventDetail?.id === eventId && state.eventDetail.privacy === 'PRIVATE';
+  eventRsvpPending.add(eventId);
+  try {
+    await api(`/events/${eventId}/${cancel ? 'cancel-rsvp' : 'join'}/`, {method:'POST', body:'{}'});
+    if (credential !== localStorage.getItem(TOKEN_KEY)) return;
+    // Refresh the currently selected scope even if the user changed filters while saving.
+    if (state.currentView === 'explore') { await requestExploreSearch(); return; }
+    if (version !== state.viewVersion) return;
+    if (leavingPrivateEvent) {
+      state.eventDetail = null;
+      await loadView('explore');
+    } else {
+      await loadView(state.currentView === 'event' ? 'event' : 'explore');
+    }
+  } catch (error) {
+    if (error.name !== 'AbortError' && version === state.viewVersion && credential === localStorage.getItem(TOKEN_KEY)) alert(error.message);
+  } finally {
+    eventRsvpPending.delete(eventId);
+  }
 }
 
 async function renderEventDetail() {
@@ -551,9 +613,12 @@ async function renderEventDetail() {
     view.innerHTML = `<header class="event-hero"><button class="back-link" data-view="explore">‹ All events</button><p class="eyebrow">${eventDate(event.starts_at)} · ${escapeHtml(event.location_name)}</p><h1>${escapeHtml(event.name)}</h1><p>${escapeHtml(event.description)}</p><div class="event-hero-footer"><button class="event-host" data-action="open-profile" data-id="${event.host.id}">${avatar(event.host)}<span>Hosted by <strong>${escapeHtml(event.host.display_name || event.host.username)}</strong><small>★ ${event.host.karma || 'new'} karma · ${event.host.xp} XP</small></span></button><div class="event-hero-actions">${shareButton}${join}</div></div></header><div class="event-detail"><section class="detail-section"><div class="detail-heading"><h2>The quest line</h2><span>${quests.length} quests</span></div>${questList}${questGeneration}</section>${eventMoments}<section class="detail-section"><div class="detail-heading"><h2>Going <span>${event.accepted_count}/${event.capacity}</span></h2><p>Meet the people who are already in.</p></div><div class="attendee-list">${attendeeList}</div></section>${ratingPanel}${hostControls}</div>`;
   } catch (error) { if (error.name === 'AbortError') return; view.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
 }
+function reelMarkup(reel) {
+  return `<article class="reel" data-post-id="${reel.id}">${reel.media ? `<video class="reel-player" src="${escapeHtml(reel.media)}" muted loop controls playsinline></video>` : '<div class="reel-fallback">◉</div>'}<div class="reel-content"><button class="reel-person" data-action="open-profile" data-id="${reel.author.id}">${escapeHtml(reel.author.display_name || reel.author.username)}</button><p class="reel-body">${escapeHtml(reel.body || 'A moment worth keeping.')}</p><div class="post-actions reel-actions"><button class="${reel.liked_by_me ? 'liked' : ''}" data-action="like" data-kind="reel" data-id="${reel.id}" data-liked="${!!reel.liked_by_me}" aria-pressed="${!!reel.liked_by_me}" aria-label="${reel.liked_by_me ? 'Unlike' : 'Like'} this reel">♥ ${reel.like_count}</button><button data-action="focus-comment" data-kind="reel" data-id="${reel.id}">◌ ${reel.comment_count} comments</button><button data-action="share-post" data-id="${reel.id}">↗ Share</button></div></div></article>`;
+}
 async function renderReels() {
   view.innerHTML = header('SMALL MOMENTS, ON REPEAT', 'Quest <em>reels.</em>', '<button class="header-action" data-action="compose-reel">Share a reel +</button>') + '<div class="reel-grid"><p class="empty">Loading reels…</p></div>';
-  try { const reels = rows(await api('/posts/?kind=REEL')); const grid = document.querySelector('.reel-grid'); grid.innerHTML = reels.length ? reels.map(reel => `<article class="reel">${reel.media ? `<video src="${escapeHtml(reel.media)}" muted loop controls playsinline></video>` : '<div class="reel-fallback">◉</div>'}<div class="reel-overlay"><button class="reel-person" data-action="open-profile" data-id="${reel.author.id}">${escapeHtml(reel.author.display_name || reel.author.username)}</button><p>${escapeHtml(reel.body || 'A moment worth keeping.')}</p><span>♥ ${reel.like_count}</span><button class="reel-share" data-action="share-post" data-id="${reel.id}">↗ Share</button></div></article>`).join('') : '<div class="empty">No reels yet. Share a 30-second piece of a good day.</div>'; } catch (error) { if (error.name === 'AbortError') return; document.querySelector('.reel-grid').innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
+  try { const reels = rows(await api('/posts/?kind=REEL')); const grid = document.querySelector('.reel-grid'); if (!grid) return; grid.innerHTML = reels.length ? reels.map(reelMarkup).join('') : '<div class="empty">No reels yet. Share a 30-second piece of a good day.</div>'; } catch (error) { if (error.name === 'AbortError') return; const grid = document.querySelector('.reel-grid'); if (grid) grid.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`; }
 }
 async function renderChats() {
   stopMessagePolling();
@@ -571,13 +636,13 @@ async function renderChats() {
 function renderConversationList() {
   const holder = document.querySelector('#conversations');
   if (!holder) return;
-  holder.innerHTML = state.conversations.length ? `<p class="conversation-count">${state.conversations.length} conversation${state.conversations.length === 1 ? '' : 's'} <span data-chat-count class="unread-count"${unreadMessages() ? '' : ' hidden'}>${unreadMessages() > 99 ? '99+' : unreadMessages()}</span></p>${state.conversations.map(conversationMarkup).join('')}` : '<div class="chat-list-empty"><span>✉</span><strong>No conversations yet</strong><p>Start a chat with someone you met.</p><button class="new-chat-inline" data-action="new-chat">Start a chat</button></div>';
+  holder.innerHTML = state.conversations.length ? `<p class="conversation-count">${state.conversations.length} conversation${state.conversations.length === 1 ? '' : 's'}</p>${state.conversations.map(conversationMarkup).join('')}` : '<div class="chat-list-empty"><span>✉</span><strong>No conversations yet</strong><p>Start a chat with someone you met.</p><button class="new-chat-inline" data-action="new-chat">Start a chat</button></div>';
   syncChatBadges();
 }
 function conversationMarkup(conversation) {
   const person = conversation.participants.find(person => person.id !== state.user.id) || state.user;
   const latest = conversation.latest_message;
-  const preview = latest?.deleted_for_everyone ? 'Message deleted' : latest?.body || 'Start with a simple hello';
+  const preview = latest?.deleted_for_everyone ? 'Message deleted' : latest?.body || (latest?.attachment ? 'Encrypted attachment' : 'Start with a simple hello');
   const count = conversation.unread_count || 0;
   return `<button class="conversation ${conversation.id === state.activeConversation ? 'active' : ''} ${count ? 'unread' : ''}" data-action="open-chat" data-id="${conversation.id}" aria-label="${escapeHtml(conversation.display_name)}${count ? ', ' + count + ' unread messages' : ''}">${avatar(person)}<span class="conversation-copy"><span class="conversation-top"><strong>${escapeHtml(conversation.display_name)}</strong><time>${latest ? escapeHtml(when(latest.created_at)) : ''}</time></span><small>${escapeHtml(preview)}</small>${onlineMarkup(person)}</span>${unreadBadge(count)}</button>`;
 }
@@ -595,7 +660,12 @@ async function refreshMessageList(conversationId) {
     // Measure after the request: the user may have scrolled up while it was loading.
     const shouldFollow = !holder.dataset.loaded || holder.scrollHeight - holder.scrollTop - holder.clientHeight < 90;
     const scrollTop = holder.scrollTop;
-    holder.innerHTML = messages.length ? messages.map(messageMarkup).join('') : '<div class="chat-empty"><span>✦</span><strong>This is a new conversation.</strong><p>A thoughtful hello is plenty.</p></div>';
+    const fingerprint = JSON.stringify(messages);
+    if (holder.dataset.messages !== fingerprint) {
+      holder.innerHTML = messages.length ? messages.map(messageMarkup).join('') : '<div class="chat-empty"><span>✦</span><strong>This is a new conversation.</strong><p>A thoughtful hello is plenty.</p></div>';
+      holder.dataset.messages = fingerprint;
+    }
+    globalThis.SocialQuestAttachments?.hydrate(holder, messages, conversationId);
     holder.dataset.loaded = 'true';
     holder.scrollTop = shouldFollow ? holder.scrollHeight : scrollTop;
     markVisibleMessagesRead(conversationId, holder);
@@ -613,6 +683,7 @@ async function renderMessages() {
   const emojis = ['😊', '😂', '❤️', '👍', '🎉', '✨', '👋', '🙌'];
   panel.innerHTML = `<header class="chat-thread-header"><button class="chat-list-back" data-action="chat-list" aria-label="Back to conversations">‹</button><button class="chat-thread-person" data-action="open-profile" data-id="${person.id}">${avatar(person)}<span><strong>${escapeHtml(conversation.display_name)}</strong><small>Direct conversation</small></span></button><div class="chat-thread-tools"><span data-thread-unread>${unreadBadge(conversation.unread_count || 0)}</span>${onlineMarkup(person)}<button class="chat-manage" data-action="manage-chat" data-id="${conversation.id}" aria-label="Manage chat">•••</button></div></header><div class="messages"><p class="empty">Loading…</p></div><form class="message-form" data-conversation="${conversation.id}"><span class="message-compose-mark">✦</span><span class="message-emoji-wrap"><button type="button" class="emoji-trigger" data-action="toggle-message-emojis" aria-label="Add an emoji" aria-expanded="false">☺</button><span class="message-emoji-picker" hidden>${emojis.map(emoji => `<button type="button" data-action="insert-message-emoji" data-emoji="${emoji}" aria-label="Add ${emoji}">${emoji}</button>`).join('')}</span></span><input aria-label="Message" maxlength="2000" placeholder="Write a thoughtful message…" required /><button aria-label="Send message">Send <span>↑</span></button></form>`;
   const messageHolder = panel.querySelector('.messages');
+  window.SocialQuestAttachments?.bind(panel.querySelector('.message-form'));
   messageHolder.addEventListener('scroll', () => markVisibleMessagesRead(conversation.id, messageHolder), {passive:true});
   await refreshMessageList(conversation.id);
   if (state.currentView === 'chats' && state.activeConversation === conversation.id) startMessagePolling(conversation.id);
@@ -685,7 +756,7 @@ async function refreshPostComments(postId) {
   if (!document.querySelector(`[data-post-id="${postId}"]`)) return;
   const {post, comments} = await fetchPostDetail(postId);
   document.querySelectorAll(`button[data-id="${postId}"][data-action="focus-comment"], button[data-id="${postId}"][data-action="focus-detail-comment"]`).forEach(button => {
-    button.textContent = `◌ ${post.comment_count} replies`;
+    button.textContent = `◌ ${post.comment_count} ${button.dataset?.kind === 'reel' ? 'comments' : 'replies'}`;
   });
   document.querySelectorAll(`[data-post-id="${postId}"] .post-detail-replies`).forEach(replies => {
     replies.innerHTML = '<h3>Replies</h3>' + postDetailCommentsMarkup(comments);
@@ -772,7 +843,7 @@ async function requestBrowserLocation(onSuccess, setStatus) {
     if (error?.code === 1) alert(message);
   }, {enableHighAccuracy:false, maximumAge:300000, timeout:10000});
 }
-function requestNearbyEvents() { requestBrowserLocation(position => { state.nearby = {latitude: Number(position.coords.latitude.toFixed(6)), longitude: Number(position.coords.longitude.toFixed(6))}; state.exploreQuery = ''; state.exploreKind = 'events'; setNearbyStatus('Showing upcoming and ongoing events near you.'); loadView('explore', {history:false}); }, setNearbyStatus); }
+function requestNearbyEvents() { requestBrowserLocation(position => { state.nearby = {latitude: Number(position.coords.latitude.toFixed(6)), longitude: Number(position.coords.longitude.toFixed(6))}; state.exploreQuery = ''; state.exploreKind = 'events'; state.exploreEventFilter = 'explore'; setNearbyStatus('Showing upcoming and ongoing events near you.'); loadView('explore', {history:false}); }, setNearbyStatus); }
 function captureEventLocation(button) { const status = button.parentElement?.querySelector('[data-event-location-status]'); const setStatus = message => { if (status) status.textContent = message; }; requestBrowserLocation(position => { const form = button.closest('form'); form.querySelector('[name="latitude"]').value = position.coords.latitude.toFixed(6); form.querySelector('[name="longitude"]').value = position.coords.longitude.toFixed(6); setStatus('Current location attached for nearby discovery.'); }, setStatus); }
 const localDateInput = value => { if (!value) return ''; const date = new Date(value); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
 function hostEventModal(event = null) { showModal(`<div class="modal-inner"><h2>${event ? 'Edit this adventure.' : 'Host a little adventure.'}</h2><p>Attach your approximate location so nearby discovery can surface this event to people close by.</p><form id="event-form" data-event-id="${event?.id || ''}"><label>Event name<input name="name" value="${escapeHtml(event?.name || '')}" required maxlength="120"></label><label>Description<textarea name="description" required maxlength="2000">${escapeHtml(event?.description || '')}</textarea></label><label>Location<input name="location_name" value="${escapeHtml(event?.location_name || '')}" required maxlength="160"></label><button class="location-capture" type="button" data-action="event-use-location">⌖ Use my current location</button><small class="location-capture-status" data-event-location-status>Optional — your coordinates are used only for nearby event matching.</small><input type="hidden" name="latitude" value="${event?.latitude ?? ''}"><input type="hidden" name="longitude" value="${event?.longitude ?? ''}"><label>Starts at<input name="starts_at" type="datetime-local" value="${localDateInput(event?.starts_at)}" required></label><label>Ends at<input name="ends_at" type="datetime-local" value="${localDateInput(event?.ends_at)}" required></label><label>Capacity<input name="capacity" type="number" min="2" value="${event?.capacity || 12}" required></label><label>Who can see it?<select name="privacy"><option value="PUBLIC"${event?.privacy === 'PRIVATE' ? '' : ' selected'}>Public</option><option value="PRIVATE"${event?.privacy === 'PRIVATE' ? ' selected' : ''}>Invite only</option></select></label><button class="submit">${event ? 'Save adventure' : 'Publish adventure'} →</button></form></div>`); }
@@ -832,14 +903,17 @@ document.addEventListener('click', async event => {
   if (action === 'show-followers' || action === 'show-following') return openPeopleDirectory(action === 'show-followers' ? 'followers' : 'following', Number(actionTarget.dataset.id));
   if (action === 'open-search' || action === 'explore-people') { await loadView('explore'); view.querySelector('#explore-search input')?.focus(); return; }
   if (action === 'clear-search') return clearExploreSearch();
+  if (action === 'explore-events') return selectEventFilter('explore', true);
   if (action === 'more-search') return requestExploreSearch(true);
   if (action === 'retry-search') return requestExploreSearch(exploreSearch.items.length > 0);
   const searchKind = event.target.closest('[data-search-kind]')?.dataset.searchKind;
   if (searchKind && state.exploreKind !== searchKind) { state.exploreKind = searchKind; return requestExploreSearch(); }
+  const eventFilter = event.target.closest('[data-event-filter]')?.dataset.eventFilter;
+  if (eventFilter) return selectEventFilter(eventFilter);
   if (action === 'retry-people') return searchPeopleDirectory();
   if (action === 'profile-tab') return selectProfileTab(actionTarget.dataset.profileTab);
-  if (action === 'join-event') { try { await api(`/events/${button.dataset.id}/join/`, {method:'POST', body:'{}'}); await loadView(state.currentView === 'event' ? 'event' : 'explore'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
-  if (action === 'cancel-rsvp') { try { await api(`/events/${actionTarget.dataset.id}/cancel-rsvp/`, {method:'POST', body:'{}'}); await loadView(state.currentView === 'event' ? 'event' : 'explore'); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } }
+  if (action === 'join-event') return updateEventRsvp(actionTarget.dataset.id);
+  if (action === 'cancel-rsvp') return updateEventRsvp(actionTarget.dataset.id, true);
   if (action === 'invite-event') return eventInviteModal(Number(actionTarget.dataset.id));
   if (action === 'invite-person') { try { await api(`/events/${actionTarget.dataset.eventId}/invite/`, {method:'POST', body:JSON.stringify({user_id:Number(actionTarget.dataset.id)})}); actionTarget.disabled = true; actionTarget.querySelector('strong').textContent += ' · invited'; } catch (error) { alert(error.message); } return; }
   if (action === 'edit-event') return hostEventModal(state.eventDetail);
@@ -930,12 +1004,32 @@ document.addEventListener('change', event => {
   }
 });
 
-onFormSubmit(async event => { const form = event.target; if (form.id === 'explore-search') { event.preventDefault(); changeExploreQuery(String(new FormData(form).get('q') || '')); return requestExploreSearch(); } if (form.id === 'composer' || form.id === 'modal-compose') { event.preventDefault(); return submitPost(form); } if (form.matches('.comment-form')) { event.preventDefault(); const input = form.querySelector('textarea'); if (!input.value.trim()) return; try { await api('/comments/', {method:'POST', body:JSON.stringify({post:form.dataset.post, body:input.value.trim()})}); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.matches('.message-form')) { event.preventDefault(); const input = form.querySelector('input'); if (!input.value.trim()) return; try { await api('/messages/', {method:'POST', body:JSON.stringify({conversation:form.dataset.conversation, body:input.value.trim()})}); input.value = ''; await loadConversations(); renderConversationList(); await refreshMessageList(Number(form.dataset.conversation)); input.focus(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'profile-form') { event.preventDefault(); try { state.user = await api('/people/me/', {method:'PATCH', body:cleanFormData(form)}); syncUser(); closeModal(); await renderProfile(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'event-form') { event.preventDefault(); try { const raw = Object.fromEntries(new FormData(form)); raw.capacity = Number(raw.capacity); raw.starts_at = new Date(raw.starts_at).toISOString(); raw.ends_at = new Date(raw.ends_at).toISOString(); if (raw.latitude === '') delete raw.latitude; else raw.latitude = Number(raw.latitude); if (raw.longitude === '') delete raw.longitude; else raw.longitude = Number(raw.longitude); const eventId = Number(form.dataset.eventId) || null; const saved = await api(eventId ? `/events/${eventId}/` : '/events/', {method:eventId ? 'PATCH' : 'POST', body:JSON.stringify(raw)}); closeModal(); if (!eventId) { try { await api(`/events/${saved.id}/generate-quests/`, {method:'POST', body:'{}'}); } catch (_) { alert('Your event was published. Quest generation is temporarily unavailable.'); } } await loadView('event', {eventId:saved.id}); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } });
+onFormSubmit(async event => { const form = event.target; if (form.id === 'explore-search') { event.preventDefault(); changeExploreQuery(String(new FormData(form).get('q') || '')); return requestExploreSearch(); } if (form.id === 'composer' || form.id === 'modal-compose') { event.preventDefault(); return submitPost(form); } if (form.matches('.comment-form')) { event.preventDefault(); const input = form.querySelector('textarea'); if (!input.value.trim()) return; try { await api('/comments/', {method:'POST', body:JSON.stringify({post:form.dataset.post, body:input.value.trim()})}); await loadView(state.currentView); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.matches('.message-form')) {
+    event.preventDefault();
+    if (form.dataset.sending) return;
+    const input = form.querySelector('input');
+    const hasAttachment = window.SocialQuestAttachments?.hasDraft(form);
+    if (!hasAttachment && !input.value.trim()) return;
+    form.dataset.sending = 'true';
+    try {
+      if (hasAttachment) {
+        if (!await window.SocialQuestAttachments.send(form)) return;
+      } else {
+        await api('/messages/', {method:'POST', body:JSON.stringify({conversation:form.dataset.conversation, body:input.value.trim()})});
+        input.value = '';
+      }
+      // Sending succeeded; a later refresh failure must not offer a duplicate.
+      await Promise.allSettled([loadConversations().then(renderConversationList), refreshMessageList(Number(form.dataset.conversation))]);
+      if (form.isConnected) input.focus();
+    } catch (error) {if (error.name !== 'AbortError') alert(error.message);}
+    finally {delete form.dataset.sending;}
+  } if (form.id === 'profile-form') { event.preventDefault(); try { state.user = await api('/people/me/', {method:'PATCH', body:cleanFormData(form)}); syncUser(); closeModal(); await renderProfile(); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } if (form.id === 'event-form') { event.preventDefault(); try { const raw = Object.fromEntries(new FormData(form)); raw.capacity = Number(raw.capacity); raw.starts_at = new Date(raw.starts_at).toISOString(); raw.ends_at = new Date(raw.ends_at).toISOString(); if (raw.latitude === '') delete raw.latitude; else raw.latitude = Number(raw.latitude); if (raw.longitude === '') delete raw.longitude; else raw.longitude = Number(raw.longitude); const eventId = Number(form.dataset.eventId) || null; const saved = await api(eventId ? `/events/${eventId}/` : '/events/', {method:eventId ? 'PATCH' : 'POST', body:JSON.stringify(raw)}); closeModal(); if (!eventId) { try { await api(`/events/${saved.id}/generate-quests/`, {method:'POST', body:'{}'}); } catch (_) { alert('Your event was published. Quest generation is temporarily unavailable.'); } } await loadView('event', {eventId:saved.id}); } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } } });
 onFormSubmit(async event => { const form = event.target; if (!['edit-comment-form', 'edit-message-form', 'conversation-form'].includes(form.id)) return; event.preventDefault(); const body = String(new FormData(form).get('body') || '').trim(); try { if (form.id === 'edit-comment-form') { if (!body) return; await api(`/comments/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); if (state.openPostId) await renderPostModal(state.openPostId); else { closeModal(); await loadView(state.currentView); } } if (form.id === 'edit-message-form') { if (!body) return; await api(`/messages/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({body})}); closeModal(); await loadConversations(); renderConversationList(); await refreshMessageList(state.activeConversation); } if (form.id === 'conversation-form') { const title = String(new FormData(form).get('title') || '').trim(); await api(`/conversations/${form.dataset.id}/`, {method:'PATCH', body:JSON.stringify({title})}); closeModal(); await loadConversations(); await loadView('chats'); } } catch (error) { if (error.name === 'AbortError') return; alert(error.message); } });
 
 (async function init() {
   try {
     state.user = await api('/people/me/');
+    window.SocialQuestAttachments?.init({api, userId: state.user.id, token});
     syncUser();
     const route = routeFromLocation();
     const conversationId = Number(new URLSearchParams(location.search).get('conversation'));
@@ -995,6 +1089,14 @@ document.addEventListener('compositionend', event => {
 });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && event.target.matches('#explore-search input')) { event.preventDefault(); clearExploreSearch(); }
+  const eventFilter = event.target.closest('[data-event-filter]');
+  if (eventFilter && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+    event.preventDefault();
+    const filter = event.key === 'Home' ? 'explore' : event.key === 'End' ? 'mine' : eventFilter.dataset.eventFilter === 'mine' ? 'explore' : 'mine';
+    void selectEventFilter(filter);
+    view.querySelector('[data-event-filter="' + filter + '"]')?.focus();
+    return;
+  }
   const tab = event.target.closest('[data-search-kind]');
   if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
     event.preventDefault();

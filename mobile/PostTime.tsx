@@ -1,6 +1,6 @@
 import {createContext, useContext, useEffect, useState, type PropsWithChildren} from 'react';
-import {AppState, Text} from 'react-native';
-import {relativeTime} from './relativeTime';
+import {AppState, Text, type StyleProp, type TextStyle} from 'react-native';
+import {compactRelativeTime, relativeTime} from './relativeTime';
 import {getAppStyles} from './appStyles';
 import {useTheme} from './ThemeProvider';
 
@@ -22,10 +22,11 @@ export function RelativeTimeProvider({children}: PropsWithChildren) {
   return <Now.Provider value={now}>{children}</Now.Provider>;
 }
 
-export function RelativeTime({value}: {value: string}) {
+export function RelativeTime({value, style, compact = false, prefix = ''}: {value: string; style?: StyleProp<TextStyle>; compact?: boolean; prefix?: string}) {
   const {theme} = useTheme();
   const styles = getAppStyles(theme);
-  const label = relativeTime(value, useContext(Now));
+  const now = useContext(Now);
+  const label = compact ? compactRelativeTime(value, now) : relativeTime(value, now);
   if (!label) return null;
-  return <Text style={styles.personMeta} accessibilityLabel={`Posted ${new Date(value).toLocaleString()}`}>{label}</Text>;
+  return <Text style={[styles.personMeta, style]} accessibilityLabel={`Posted ${new Date(value).toLocaleString()}`}>{prefix + label}</Text>;
 }

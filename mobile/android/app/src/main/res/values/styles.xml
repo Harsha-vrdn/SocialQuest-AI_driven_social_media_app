@@ -4,8 +4,12 @@
     <item name="colorPrimary">@color/colorPrimary</item>
     <item name="colorAccent">@color/colorAccent</item>
     <item name="android:forceDarkAllowed" tools:targetApi="29">false</item>
+    <item name="android:windowBackground">@color/app_background</item>
+    <item name="android:colorBackground">@color/app_background</item>
     <item name="android:statusBarColor">@android:color/transparent</item>
+    <item name="android:enforceStatusBarContrast" tools:targetApi="29">false</item>
     <item name="android:navigationBarColor">@android:color/transparent</item>
+    <item name="android:navigationBarDividerColor">@android:color/transparent</item>
     <item name="android:windowLightNavigationBar">?attr/isLightTheme</item>
     <item name="android:enforceNavigationBarContrast" tools:targetApi="29">false</item>
     <item name="expoEnforceNavigationBarContrast">false</item>

@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
-from .models import Attendance, Event, Notification, Post, Profile, QuestSubmission
+from .models import Attendance, Event, Notification, PendingUploadDeletion, Post, Profile, QuestSubmission
 
 
 @receiver(post_save, sender=Event)
@@ -37,17 +37,9 @@ def _remove_file_when_unused(storage, name):
     if not name:
         return
 
-    def cleanup():
-        still_used = (
-            Profile.objects.filter(avatar=name).exists()
-            or Event.objects.filter(cover_image=name).exists()
-            or Post.objects.filter(media=name).exists()
-            or QuestSubmission.objects.filter(media=name).exists()
-        )
-        if not still_used:
-            storage.delete(name)
-
-    transaction.on_commit(cleanup)
+    from .upload_cleanup import cleanup_upload
+    PendingUploadDeletion.objects.get_or_create(name=name)
+    transaction.on_commit(lambda: cleanup_upload(name, storage))
 
 
 def _remember_replaced_file(instance, field_name):
@@ -97,4 +89,16 @@ def remove_replaced_post_media(sender, instance, **kwargs):
 @receiver(post_delete, sender=Post)
 def remove_deleted_post_media(sender, instance, **kwargs):
     if instance.media and instance.media.name:
+        _remove_file_when_unused(instance.media.storage, instance.media.name)
+
+
+@receiver(post_delete, sender=Event)
+def remove_deleted_event_cover(sender, instance, **kwargs):
+    if instance.cover_image:
+        _remove_file_when_unused(instance.cover_image.storage, instance.cover_image.name)
+
+
+@receiver(post_delete, sender=QuestSubmission)
+def remove_deleted_quest_proof(sender, instance, **kwargs):
+    if instance.media:
         _remove_file_when_unused(instance.media.storage, instance.media.name)

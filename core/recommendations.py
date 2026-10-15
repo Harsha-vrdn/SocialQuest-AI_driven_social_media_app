@@ -11,6 +11,7 @@ from django.db.models import Count, Q
 from django.utils import timezone
 
 from .models import Attendance, Event, Follow, Post
+from .moderation import blocked_user_ids
 
 
 MAX_CANDIDATES = 300
@@ -41,8 +42,8 @@ def rank_posts(user, queryset):
     )
     now = timezone.now()
     candidates = list(
-        queryset.select_related("author", "author__profile", "event", "quest")
-        .annotate(recommendation_likes=Count("likes", distinct=True), recommendation_comments=Count("comments", distinct=True))
+        queryset.select_related("event", "quest")
+        .annotate(recommendation_likes=Count("likes", distinct=True), recommendation_comments=Count("comments", filter=~Q(comments__author_id__in=blocked_user_ids(user)), distinct=True))
         .order_by("-created_at")[:MAX_CANDIDATES]
     )
     ranked = []
@@ -80,14 +81,19 @@ def rank_events(user, latitude=None, longitude=None):
     )
     existing_event_ids = set(Attendance.objects.filter(user=user).values_list("event_id", flat=True))
     candidates = list(
-        Event.objects.filter(ends_at__gt=now, privacy=Event.Privacy.PUBLIC)
+        Event.objects.filter(ends_at__gt=now, privacy=Event.Privacy.PUBLIC, host__is_active=True)
         .exclude(host=user)
+        .exclude(host_id__in=blocked_user_ids(user))
         .exclude(id__in=existing_event_ids)
         .select_related("host", "host__profile")
         .annotate(recommendation_going=Count("attendances", filter=Q(attendances__status=Attendance.Status.ACCEPTED)))
         .order_by("starts_at")[:MAX_CANDIDATES]
     )
-    city = getattr(user.profile, "city", "")
+    profile = user.profile
+    saved = profile.location_mode == "SAVED"
+    city = profile.saved_city.split(",")[0].strip() if saved else profile.city
+    if saved and latitude is None and longitude is None:
+        latitude, longitude = profile.saved_latitude, profile.saved_longitude
     ranked = []
     for event in candidates:
         score = 0
@@ -109,7 +115,7 @@ def rank_events(user, latitude=None, longitude=None):
                 reasons.insert(0, "Very close to you")
             elif distance <= 25:
                 score += 46
-                reasons.insert(0, "Near your current location")
+                reasons.insert(0, "Near your saved city" if saved else "Near your current location")
             elif distance <= 80:
                 score += 22
                 reasons.insert(0, "Within reach today")

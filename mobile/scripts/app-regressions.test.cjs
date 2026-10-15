@@ -6,7 +6,7 @@ const {test} = require('node:test');
 const ts = require('typescript');
 
 const root = path.resolve(__dirname, '../..');
-const native = ts.createSourceFile('App.tsx', fs.readFileSync(path.join(root, 'mobile/App.tsx'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const native = ts.createSourceFile('App.tsx', require('./native-source.cjs').nativeAppSource(root), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const web = ts.createSourceFile('app.js', fs.readFileSync(path.join(root, 'web/static/app.js'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 
 // Exercise the actual async handlers with controlled request completion order.
@@ -56,6 +56,95 @@ function profileContext(overrides = {}) {
   };
   return {state, context};
 }
+
+test('multipart encoding failures are distinguished from unreachable-server failures', async () => {
+  for (const message of ['Unsupported FormDataPart implementation', 'Unsupported FormData implementation', 'Network request failed']) {
+    const context = {token: 'session', API_URL: 'https://example.test/api', FormData,
+      fetch: async () => {throw new Error(message);}};
+    const api = nativeFunction('api', context);
+    await assert.rejects(api('/chat-attachments/', {method: 'POST', body: new FormData()}), error => {
+      if (message === 'Network request failed') assert.match(error.message, /Could not reach https:\/\/example.test\/api/);
+      else {assert.match(error.message, /could not prepare this file for upload/); assert.doesNotMatch(error.message, /Could not reach|Start Django/);}
+      return true;
+    });
+  }
+});
+
+test('reel actions show live counts, like state and working controls in both themes', () => {
+  const theme = pureModule('theme.ts');
+  const styles = pureModule('appStyles.ts', {'./themedStyles': {createThemedStyles: fn => fn}, './theme': theme});
+  const code = ts.transpileModule(fs.readFileSync(path.join(root, 'mobile/ReelActions.tsx'), 'utf8'), {
+    compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX},
+  }).outputText;
+  for (const scheme of ['light', 'dark']) for (const liked of [false, true]) {
+    const jsx = (type, props) => ({type, props}), calls = [];
+    const imports = {'react/jsx-runtime': {jsx, jsxs: jsx}, 'react-native': {Text: 'Text', View: 'View'}, '@expo/vector-icons': {Ionicons: 'Icon'},
+      './Motion': {SoftPressable: 'Pressable', Pop: 'Pop'}, './ThemeProvider': {useTheme: () => ({theme: theme.themes[scheme]})}, './appStyles': styles};
+    const context = {exports: {}, require: name => {assert.ok(name in imports); return imports[name];}};
+    vm.runInNewContext(code, context);
+    const tree = context.exports.ReelActions({liked, likes: 5, comments: 1, onLike: () => calls.push('like'), onComments: () => calls.push('comments'), onShare: () => calls.push('share')});
+    const buttons = tree.props.children;
+    assert.equal(buttons.length, 3);
+    assert.equal(buttons[0].props.accessibilityLabel, liked ? 'Unlike reel' : 'Like reel');
+    assert.equal(buttons[0].props.accessibilityState.selected, liked);
+    assert.equal(buttons[0].props.accessibilityValue.text, '5 likes');
+    assert.equal(buttons[1].props.accessibilityValue.text, '1 comment');
+    for (const button of buttons) {assert.ok(button.props.style.minHeight >= 44); assert.ok(button.props.style.minWidth >= 44); button.props.onPress();}
+    assert.deepEqual(calls, ['like', 'comments', 'share']);
+  }
+  const reel = find(native, node => ts.isJsxSelfClosingElement(node) && node.tagName.getText(native) === 'ReelActions');
+  const item = {id: 15}, called = [];
+  for (const name of ['onLike', 'onComments']) {
+    const expression = reel.attributes.properties.find(prop => prop.name?.getText(native) === name).initializer.expression.getText(native);
+    vm.runInNewContext('(' + expression + ')()', {item, toggleLike: post => called.push(['like', post]), openComments: post => called.push(['comments', post])});
+  }
+  assert.deepEqual(called, [['like', item], ['comments', item]]);
+});
+
+test('reel likes and comment counts stay synchronized across native feed, reels, events and profiles', async () => {
+  const reel = {id: 15, kind: 'REEL', liked_by_me: false, like_count: 2, comment_count: 0};
+  const collections = Object.fromEntries(['Posts', 'Reels', 'EventPosts', 'ProfilePosts'].map(key => [key, [{...reel}]]));
+  const requests = [], pending = deferred(), context = {likeInFlight: {current: new Set()}, Alert: {alert: assert.fail},
+    api: (url, options) => {requests.push({url, ...options}); return pending.promise;}, setCommentPost: fn => fn({...reel})};
+  for (const key of Object.keys(collections)) context['set' + key] = fn => {collections[key] = fn(collections[key]);};
+  const toggle = nativeFunction('toggleLike', context), task = toggle(reel);
+  await toggle(reel); assert.equal(requests.length, 1);
+  pending.resolve({liked: true, like_count: 3}); await task;
+  nativeFunction('updateCommentCount', context)(reel.id, 1);
+  for (const rows of Object.values(collections)) {assert.equal(rows[0].liked_by_me, true); assert.equal(rows[0].like_count, 3); assert.equal(rows[0].comment_count, 1);}
+  context.api = async (url, options) => {assert.equal(options.method, 'DELETE'); return {liked: false, like_count: 2};};
+  await nativeFunction('toggleLike', context)(collections.Reels[0]);
+  nativeFunction('updateCommentCount', context)(reel.id, -1);
+  for (const rows of Object.values(collections)) {assert.equal(rows[0].liked_by_me, false); assert.equal(rows[0].comment_count, 0);}
+});
+
+test('web reels expose the shared like, comment and share actions without covering video controls', () => {
+  const escapeHtml = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+  const markup = webFunction('reelMarkup', {escapeHtml});
+  const html = markup({id: 15, media: '/media/reel.mp4', author: {id: 2, display_name: '<unsafe>'}, body: '<script>alert(1)</script>', liked_by_me: true, like_count: 8, comment_count: 3});
+  assert.match(html, /data-post-id="15"/); assert.match(html, /controls playsinline/);
+  assert.doesNotMatch(html, /reel-overlay|<script>|<unsafe>/);
+  assert.match(html, /aria-pressed="true" aria-label="Unlike this reel"/);
+  for (const action of ['like', 'focus-comment', 'share-post']) assert.ok(html.includes('data-action="' + action + '"'));
+  assert.match(html, /♥ 8/); assert.match(html, /◌ 3 comments/);
+  const css = fs.readFileSync(path.join(root, 'web/static/pixelquest.css'), 'utf8');
+  // More specific than the shared .post-actions button rule, which uses 36px.
+  assert.match(css, /\.post-actions\.reel-actions button\s*\{[^}]*min-height:\s*44px;[^}]*min-width:\s*44px;/);
+});
+
+test('web reel likes use server counts, prevent duplicate taps and update their accessible state', async () => {
+  const makeButton = kind => ({dataset: {id: '15', kind, liked: 'false'}, textContent: '♥ 8', disabled: false, attributes: {},
+    classList: {toggle() {}}, setAttribute(name, value) {this.attributes[name] = value;}});
+  const reel = makeButton('reel'), detail = makeButton('post'), pending = deferred(), requests = [];
+  const context = {document: {querySelectorAll: () => [reel, detail]}, alert: assert.fail,
+    api: (url, options) => {requests.push({url, ...options}); return pending.promise;}};
+  context.setPostLikeUI = webFunction('setPostLikeUI', context);
+  const toggle = webFunction('togglePostLike', context), task = toggle(reel);
+  await toggle(reel); assert.equal(requests.length, 1); assert.equal(reel.disabled, true);
+  pending.resolve({liked: true, like_count: 12}); await task;
+  assert.equal(reel.textContent, '♥ 12'); assert.equal(detail.textContent, '♥ 12'); assert.equal(reel.disabled, false);
+  assert.equal(reel.attributes['aria-label'], 'Unlike this reel'); assert.equal(reel.attributes['aria-pressed'], 'true');
+});
 
 test('profile loads every author page, including posts absent from the recommended feed', async () => {
   const requested = [];
@@ -254,7 +343,7 @@ test('reply refresh failures do not restore an already saved reply', async () =>
 function messageContext(overrides = {}) {
   const state = {draft: 'Hello', messages: [], alerts: []};
   const context = {
-    activeChat: {id: 7}, activeChatId: {current: 7}, message: 'Hello', sendInFlight: {current: false},
+    activeChat: {id: 7}, activeChatId: {current: 7}, message: 'Hello',
     token: 'session', sessionToken: {current: 'session'},
     setMessage: value => {state.draft = typeof value === 'function' ? value(state.draft) : value;},
     setMessages: update => {state.messages = update(state.messages);}, setEmojiPickerOpen: noop,
@@ -264,31 +353,51 @@ function messageContext(overrides = {}) {
   return {state, context};
 }
 
-test('acknowledged messages stay sent when the follow-up refresh fails', async () => {
-  let writes = 0;
-  const {state, context} = messageContext({
-    api: async () => {writes++; return {id: 99, body: 'Hello'};},
-    loadMessages: async () => {throw new Error('Refresh failed');},
-  });
-  await nativeFunction('send', context)();
-  assert.equal(writes, 1); assert.equal(state.draft, ''); assert.equal(state.alerts.length, 0);
-  assert.equal(state.messages[0].id, 99); assert.equal(context.sendInFlight.current, false);
+test('sending clears the composer only after the outbox accepts the draft', () => {
+  const calls = [], {state, context} = messageContext({outbox: {enqueue: (...args) => {calls.push(args); return true;}}});
+  nativeFunction('send', context)();
+  assert.deepEqual(calls, [[7, 'Hello']]); assert.equal(state.draft, '');
 });
 
-test('failed message writes restore the original draft for retry', async () => {
-  const {state, context} = messageContext({api: async () => {throw new Error('Offline');}});
-  await nativeFunction('send', context)();
-  assert.equal(state.draft, 'Hello'); assert.equal(state.alerts[0][0], 'Message not sent');
-  assert.equal(context.sendInFlight.current, false);
+test('a busy outbox leaves the composer draft untouched', () => {
+  const {state, context} = messageContext({outbox: {enqueue: () => false}});
+  nativeFunction('send', context)(); assert.equal(state.draft, 'Hello');
 });
 
-test('a failed send does not inject its text into a different chat', async () => {
-  const write = deferred();
-  const {state, context} = messageContext({api: () => write.promise});
-  const sending = nativeFunction('send', context)();
-  context.activeChatId.current = 8; state.draft = 'Draft for someone else';
-  write.reject(new Error('Offline')); await sending;
-  assert.equal(state.draft, 'Draft for someone else');
+test('unsent bubble options retry the same ID or remove only the local draft', () => {
+  let choices; const calls = [];
+  const show = nativeFunction('showFailedMessage', {Alert: {alert: (_title, _body, actions) => {choices = actions;}},
+    outbox: {retry: id => calls.push(['retry', id]), discard: id => calls.push(['discard', id])}});
+  show({client_id: 'same-id', delivery_status: 'failed'});
+  choices[0].onPress(); choices[1].onPress();
+  assert.deepEqual(calls, [['retry', 'same-id'], ['discard', 'same-id']]);
+});
+
+test('chat drafts survive back navigation without appearing in another conversation', () => {
+  let drafts = {};
+  const context = {activeChatId: {current: 7}, setChatDrafts: update => {drafts = update(drafts);}};
+  const setMessage = nativeFunction('setMessage', context);
+  setMessage('Draft for Maya'); context.activeChatId.current = 8; setMessage('Draft for the group');
+  context.activeChatId.current = 7; setMessage(value => value + ' 👋');
+  assert.equal(drafts[7], 'Draft for Maya 👋'); assert.equal(drafts[8], 'Draft for the group');
+  context.activeChatId.current = null; setMessage('No active chat'); assert.equal(Object.keys(drafts).length, 2);
+});
+
+test('the minimal chat composer leaves room for text and keeps attachment and send targets accessible', () => {
+  const theme = pureModule('theme.ts');
+  const styles = pureModule('appStyles.ts', {'./themedStyles': {createThemedStyles: fn => fn}, './theme': theme});
+  for (const scheme of ['light', 'dark']) {
+    const s = styles.getAppStyles(theme.themes[scheme]);
+    assert.equal(s.messageInput.borderWidth, 0); assert.equal(s.messageInput.backgroundColor, 'transparent');
+    assert.equal(s.messageInput.flex, 1); assert.ok(s.messageInput.maxHeight >= 100);
+    assert.ok(s.send.width >= 44); assert.ok(s.send.height >= 44);
+  }
+  const chat = find(native, node => ts.isVariableDeclaration(node) && node.name.getText(native) === 'chats' && ts.isConditionalExpression(node.initializer)).getText(native)
+    + fs.readFileSync(path.join(root, 'mobile/components/ChatComposer.tsx'), 'utf8');
+  assert.ok(chat.includes('ChatAttachmentButton')); assert.ok(chat.includes('accessibilityLabel="Send message"'));
+  assert.ok(chat.includes('disabled={!message.trim() || chatSending}'));
+  assert.ok(chat.includes('preview={inbox}')); assert.ok(chat.includes('onGestureActiveChange={setChatBackPreview}'));
+  assert.doesNotMatch(chat, /accessibilityLabel="(Hide keyboard|Add an emoji)"/);
 });
 
 test('a comment POST finishing after navigation does not render or fetch post/null', async () => {
@@ -316,6 +425,7 @@ test('a comment POST finishing after navigation does not render or fetch post/nu
 test('web thread refresh removes cascaded replies, corrects counts, and keeps drafts', async () => {
   const detail = {innerHTML: 'parent and child'};
   const counter = {textContent: '3 replies'};
+  const reelCounter = {dataset: {kind: 'reel'}, textContent: '3 comments'};
   const feed = {
     remaining: [1, 2, 3], draft: 'Still writing', inserted: '',
     querySelectorAll() {return this.remaining.map(id => ({remove: () => {this.remaining = this.remaining.filter(item => item !== id);}}));},
@@ -324,7 +434,7 @@ test('web thread refresh removes cascaded replies, corrects counts, and keeps dr
   const context = {
     document: {
       querySelector: () => detail,
-      querySelectorAll: selector => selector.startsWith('button') ? [counter] : selector.endsWith('.post-detail-replies') ? [detail] : [feed],
+      querySelectorAll: selector => selector.startsWith('button') ? [counter, reelCounter] : selector.endsWith('.post-detail-replies') ? [detail] : [feed],
     },
     fetchPostDetail: async () => ({post: {id: 10, comment_count: 1, recent_comments: [{id: 3}]}, comments: [{id: 3}]}),
     postDetailCommentsMarkup: comments => comments.map(item => 'comment:' + item.id).join(','),
@@ -332,6 +442,7 @@ test('web thread refresh removes cascaded replies, corrects counts, and keeps dr
   };
   await webFunction('refreshPostComments', context)(10);
   assert.equal(counter.textContent, '◌ 1 replies');
+  assert.equal(reelCounter.textContent, '◌ 1 comments');
   assert.equal(detail.innerHTML, '<h3>Replies</h3>comment:3');
   assert.equal(feed.inserted, 'comment:3'); assert.deepEqual(feed.remaining, []);
   assert.equal(feed.draft, 'Still writing');
@@ -542,11 +653,11 @@ test('complete quest opens only for eligible attendees and carries its event con
   assert.equal(opened.length, 1);
 });
 
-function pureModule(file) {
+function pureModule(file, imports = {}) {
   const code = ts.transpileModule(fs.readFileSync(path.join(root, 'mobile', file), 'utf8'), {
     compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS},
   }).outputText;
-  const context = {exports: {}};
+  const context = {exports: {}, require: name => {if (name in imports) return imports[name]; throw Error('Unexpected import: ' + name);}};
   vm.runInNewContext(code, context);
   return context.exports;
 }
@@ -604,6 +715,36 @@ test('opening the event group reuses its returned chat and prevents duplicate ta
   const pending = open(); await open(); response.resolve({id: 9, is_group: true, event: 7}); await pending;
   assert.equal(calls, 1); assert.equal(state.conversations.length, 1);
   assert.equal(state.active.id, 9); assert.equal(state.event, null); assert.equal(state.tab, 'Chats');
+});
+
+test('RSVP cancellation invalidates discovery and closes private details after access is lost', async () => {
+  for (const privacy of ['PUBLIC', 'PRIVATE']) {
+    const opened = [], requests = [], alerts = [];
+    let selected = {id: 7, privacy}, revision = 0, refreshed = 0;
+    const cancel = nativeFunction('cancelRsvp', {
+      selectedEvent: selected, api: async route => {requests.push(route); return {status: 'CANCELLED'};},
+      setEventAttendanceRevision: update => {revision = update(revision);},
+      setSelectedEvent: value => {selected = value;}, openEvent: async id => opened.push(id), loadDiscover: async () => refreshed++,
+      Alert: {alert: (...args) => alerts.push(args)},
+    });
+    await cancel(); assert.equal(revision, 1); assert.equal(refreshed, 1); assert.equal(alerts.length, 0);
+    assert.deepEqual(requests, ['/events/7/cancel-rsvp/']);
+    assert.deepEqual(opened, privacy === 'PRIVATE' ? [] : [7]);
+    assert.equal(selected === null, privacy === 'PRIVATE');
+  }
+});
+
+test('joining an event invalidates discovery only after a successful RSVP', async () => {
+  for (const failure of [false, true]) {
+    let revision = 0;
+    const join = nativeFunction('join', {
+      selectedEvent: {id: 7, my_attendance_status: 'INVITED'},
+      api: async route => {assert.equal(route, '/events/7/join/'); if (failure) throw Error('Offline'); return {status: 'ACCEPTED'};},
+      setEventAttendanceRevision: update => {revision = update(revision);},
+      Alert: {alert() {}}, openEvent: async () => {}, loadDiscover: async () => {},
+    });
+    await join(); assert.equal(revision, failure ? 0 : 1);
+  }
 });
 
 test('chat refresh removes an open event chat when the member loses access', async () => {
@@ -703,18 +844,30 @@ test('fullscreen photos request real pixels for Retina zoom without changing the
   assert.equal(imageRenderLayout({width: 1920, height: 1280}, {width: 0, height: 0}, 3), null);
 });
 
-function imageViewerHarness() {
+function gestureAnimations() {
+  const completions = [];
+  return {completions, Animated: {
+    View: 'Animated.View', Value: class {constructor(value) {this.value = value;} setValue(value) {this.value = value;} stopAnimation() {}},
+    multiply: (value, factor) => ({value, factor}), add: (a, b) => ({a, b}),
+    spring: (value, options) => ({start: callback => {value.setValue(options.toValue); if (callback) completions.push(() => callback({finished: true}));}}),
+    timing: (value, options) => ({start: callback => completions.push(() => {value.setValue(options.toValue); callback?.({finished: true});})}),
+  }};
+}
+
+function imageViewerHarness({reduced = false} = {}) {
   const tree = ts.createSourceFile('ImageViewer.tsx', fs.readFileSync(path.join(root, 'mobile/ImageViewer.tsx'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const node = find(tree, node => ts.isFunctionDeclaration(node) && node.name?.text === 'ImageViewer');
   const source = ts.transpileModule('(' + node.getText(tree).replace(/^export\s+/, '') + ')', {
     compilerOptions: {target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React},
   }).outputText;
-  let cursor = 0, pending = [], rendered;
+  let cursor = 0, pending = [], rendered, closes = 0, now = 1000;
+  const animations = gestureAnimations();
   const slots = [], requests = [];
   const useSlot = initial => { const index = cursor++; if (!(index in slots)) slots[index] = initial(); return index; };
   const Image = Object.assign(function Image() {}, {getSize: (uri, success, failure) => requests.push({uri, success, failure})});
   const component = vm.runInNewContext(source, {
-    ...pureModule('imageZoom.ts'), initial: {scale: 1, x: 0, y: 0},
+    ...pureModule('imageZoom.ts'), ...pureModule('dismissGestures.ts'), initial: {scale: 1, x: 0, y: 0},
+    useReducedMotion: () => reduced, Date: class extends Date {static now() {return now;}},
     React: {createElement: (type, props, ...children) => ({type, props: props || {}, children})},
     useState: initial => {const index = useSlot(() => typeof initial === 'function' ? initial() : initial); return [slots[index], value => {slots[index] = typeof value === 'function' ? value(slots[index]) : value;}];},
     useRef: initial => slots[useSlot(() => ({current: initial}))],
@@ -725,8 +878,8 @@ function imageViewerHarness() {
       }
     },
     useSafeAreaInsets: () => ({top: 0, bottom: 0}), PixelRatio: {get: () => 3},
-    Animated: {View: 'Animated.View', Value: class {setValue() {}}, multiply: (value, factor) => ({value, factor})},
-    PanResponder: {create: () => ({panHandlers: {}})},
+    Animated: animations.Animated,
+    PanResponder: {create: callbacks => ({panHandlers: {gestureHandlers: callbacks}})},
     Image, MotionModal: 'Modal', View: 'View', Text: 'Text', Pressable: 'Pressable', Ionicons: 'Icon',
     useTheme: () => ({theme: {colors: {}}}), getStyles: () => ({}),
   });
@@ -735,11 +888,286 @@ function imageViewerHarness() {
     if (Array.isArray(node)) return node.flatMap(child => all(child, predicate));
     return [...(predicate(node) ? [node] : []), ...all(node.children, predicate)];
   }
-  const render = () => {cursor = 0; rendered = component({uri: 'https://example.test/photo.jpg', onClose: noop}); const effects = pending; pending = []; effects.forEach(effect => effect()); return rendered;};
+  const render = () => {cursor = 0; rendered = component({uri: 'https://example.test/photo.jpg', onClose: () => closes++}); const effects = pending; pending = []; effects.forEach(effect => effect()); return rendered;};
   return {render, requests, images: () => all(rendered, node => node.type === Image),
+    handlers: () => all(rendered, node => node.props?.gestureHandlers)[0].props.gestureHandlers,
+    advance: ms => {now += ms;}, closes: () => closes,
+    finishAnimations: () => animations.completions.splice(0).forEach(finish => finish()),
     byLabel: label => all(rendered, node => node.props?.accessibilityLabel === label)[0],
     measure: () => all(rendered, node => !!node.props?.onLayout)[0].props.onLayout({nativeEvent: {layout: {width: 390, height: 620, x: 0, y: 0}}})};
 }
+
+const touchEvent = (...points) => ({nativeEvent: {touches: points.map(([pageX, pageY]) => ({pageX, pageY}))}});
+const swipeState = (dx, dy, vx = 0, vy = 0, start = 16) => ({dx, dy, vx, vy, moveX: start + dx, x0: start, numberActiveTouches: 1});
+
+function swipeDismissHarness(options = {}) {
+  const code = ts.transpileModule(fs.readFileSync(path.join(root, 'mobile/useSwipeDismiss.ts'), 'utf8'), {
+    compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS},
+  }).outputText;
+  const animations = gestureAnimations(), slots = [], effects = [];
+  let cursor = 0, closes = 0, starts = 0, rendered;
+  let props = {axis: 'x', distance: 390, edgeWidth: 28, enabled: true, resetKey: 1, onDismiss: () => closes++, onStart: () => starts++, ...options};
+  const context = {exports: {}, require: name => {
+    if (name === 'react') return {
+      useRef: initial => {const index = cursor++; return slots[index] ||= {current: initial};},
+      useEffect: (effect, deps) => {
+        const index = cursor++, previous = slots[index];
+        if (!previous || deps.some((value, i) => value !== previous.deps[i])) {
+          previous?.cleanup?.(); slots[index] = {deps}; effects.push(() => {slots[index].cleanup = effect();});
+        }
+      },
+    };
+    if (name === 'react-native') return {Animated: animations.Animated, PanResponder: {create: callbacks => ({panHandlers: callbacks})}};
+    if (name === './Motion') return {useReducedMotion: () => !!options.reduced};
+    if (name === './dismissGestures') return pureModule('dismissGestures.ts');
+    throw Error('Unexpected import: ' + name);
+  }};
+  vm.runInNewContext(code, context);
+  const render = (updates = {}) => {props = {...props, ...updates}; cursor = 0; rendered = context.exports.useSwipeDismiss(props); effects.splice(0).forEach(effect => effect()); return rendered.panHandlers;};
+  render();
+  return {render, handlers: () => rendered.panHandlers, offset: () => rendered.offset.value, closes: () => closes, starts: () => starts,
+    finishAnimations: () => animations.completions.splice(0).forEach(finish => finish()),
+    unmount: () => slots.forEach(slot => slot?.cleanup?.()),
+  };
+}
+
+test('dismissal thresholds distinguish deliberate swipes from taps, diagonal drags, and reversals', () => {
+  const {swipeIntent, shouldDismissSwipe} = pureModule('dismissGestures.ts');
+  assert.equal(swipeIntent(5, 5, 'x'), 'pending');
+  assert.equal(swipeIntent(40, 3, 'x'), 'accept');
+  assert.equal(swipeIntent(3, 40, 'y'), 'accept');
+  for (const [dx, dy] of [[-40, 0], [20, 25], [0, 30]]) assert.equal(swipeIntent(dx, dy, 'x'), 'reject');
+  assert.equal(shouldDismissSwipe(120, 3, 0), true);
+  assert.equal(shouldDismissSwipe(40, 3, 0.8), true);
+  for (const [distance, cross, velocity] of [[15, 0, 2], [70, 0, 0], [120, 110, 0], [120, 0, -0.4], [-120, 0, 1]]) {
+    assert.equal(shouldDismissSwipe(distance, cross, velocity), false);
+  }
+});
+
+test('chat edge swipes leave scrolling, typing, and multi-touch gestures alone', () => {
+  const hook = swipeDismissHarness(), handlers = hook.handlers(), finger = touchEvent([16, 200]);
+  assert.equal(handlers.onStartShouldSetPanResponderCapture(finger), false);
+  assert.equal(handlers.onMoveShouldSetPanResponderCapture(finger, swipeState(4, 4)), false);
+  assert.equal(handlers.onMoveShouldSetPanResponderCapture(finger, swipeState(1, 30)), false);
+  assert.equal(handlers.onMoveShouldSetPanResponderCapture(finger, swipeState(120, 30)), false, 'A vertical scroll cannot later turn into Back');
+  handlers.onStartShouldSetPanResponderCapture(finger);
+  assert.equal(handlers.onMoveShouldSetPanResponderCapture(finger, swipeState(40, 0, 0, 0, 140)), false, 'Typing and middle-of-screen drags are not navigation');
+  handlers.onStartShouldSetPanResponderCapture(finger);
+  assert.equal(handlers.onMoveShouldSetPanResponderCapture(finger, swipeState(24, 1)), true);
+  handlers.onPanResponderGrant(); assert.equal(hook.starts(), 1);
+  handlers.onPanResponderMove(finger, swipeState(80, 1)); assert.equal(hook.offset(), 80);
+  handlers.onPanResponderStart(touchEvent([16, 200], [100, 200]));
+  handlers.onPanResponderRelease(finger, swipeState(150, 1)); hook.finishAnimations();
+  assert.equal(hook.offset(), 0); assert.equal(hook.closes(), 0);
+});
+
+test('swipe dismissal animates a committed gesture, springs back a short drag, and uses the latest callback', () => {
+  const hook = swipeDismissHarness(), finger = touchEvent([16, 200]), handlers = hook.handlers();
+  handlers.onPanResponderGrant(); handlers.onPanResponderMove(finger, swipeState(50, 1));
+  handlers.onPanResponderRelease(finger, swipeState(50, 1));
+  assert.equal(hook.offset(), 0); assert.equal(hook.closes(), 0);
+  let latest = 0; hook.render({onDismiss: () => latest++});
+  handlers.onPanResponderGrant(); handlers.onPanResponderMove(finger, swipeState(130, 1));
+  handlers.onPanResponderRelease(finger, swipeState(130, 1));
+  assert.equal(latest, 0); hook.finishAnimations(); assert.equal(latest, 1);
+  assert.equal(hook.offset(), 390);
+});
+
+test('back-preview read suppression lasts through cancellation and ignores an interrupted return animation', () => {
+  const states = [], hook = swipeDismissHarness({onActiveChange: active => states.push(active)}), handlers = hook.handlers(), finger = touchEvent([16, 200]);
+  handlers.onPanResponderGrant(); assert.equal(states.at(-1), true);
+  handlers.onPanResponderMove(finger, swipeState(50, 1)); handlers.onPanResponderRelease(finger, swipeState(50, 1));
+  assert.equal(states.at(-1), true); hook.finishAnimations(); assert.equal(states.at(-1), false);
+  handlers.onPanResponderGrant(); handlers.onPanResponderRelease(finger, swipeState(50, 1));
+  handlers.onPanResponderGrant(); hook.finishAnimations(); assert.equal(states.at(-1), true);
+  handlers.onPanResponderTerminate(); hook.finishAnimations(); assert.equal(states.at(-1), false); assert.equal(hook.closes(), 0);
+  hook.unmount();
+});
+
+test('interrupted, hidden, or replaced sheets cannot complete an old dismiss animation', () => {
+  for (const interrupt of ['cancel', 'hidden', 'new-page', 'unmount']) {
+    const hook = swipeDismissHarness({axis: 'y', distance: 844, edgeWidth: undefined}), handlers = hook.handlers();
+    const finger = touchEvent([150, 40]);
+    handlers.onPanResponderGrant(); handlers.onPanResponderMove(finger, swipeState(1, 140));
+    handlers.onPanResponderRelease(finger, swipeState(1, 140));
+    if (interrupt === 'cancel') handlers.onPanResponderTerminate();
+    if (interrupt === 'hidden') hook.render({enabled: false});
+    if (interrupt === 'new-page') hook.render({resetKey: 2});
+    if (interrupt === 'unmount') hook.unmount();
+    hook.finishAnimations(); assert.equal(hook.closes(), 0, interrupt);
+  }
+  const reduced = swipeDismissHarness({reduced: true});
+  reduced.handlers().onPanResponderRelease(touchEvent(), swipeState(140, 1));
+  assert.equal(reduced.closes(), 1, 'Reduced motion does not wait for an exit animation');
+});
+
+function readyPhoto(options) {
+  const viewer = imageViewerHarness(options); viewer.render(); viewer.measure();
+  viewer.requests[0].success(1800, 2400); viewer.render(); viewer.images()[0].props.onLoad(); viewer.render();
+  return viewer;
+}
+
+test('fullscreen photos swipe down to dismiss but cancel short, diagonal, and interrupted drags', () => {
+  for (const [dx, dy, cancel, expected] of [[3, 140, false, 1], [3, 45, false, 0], [110, 140, false, 0], [3, 140, true, 0]]) {
+    const viewer = readyPhoto(), handlers = viewer.handlers();
+    handlers.onPanResponderGrant(touchEvent([120, 200]));
+    handlers.onPanResponderMove(touchEvent([120 + dx, 200 + dy]));
+    if (cancel) handlers.onPanResponderTerminate();
+    else handlers.onPanResponderRelease(touchEvent(), swipeState(dx, dy));
+    viewer.finishAnimations(); assert.equal(viewer.closes(), expected);
+  }
+});
+
+test('photo double-tap zoom and panning never trigger swipe dismissal while zoomed', () => {
+  const viewer = readyPhoto(), handlers = viewer.handlers(), finger = touchEvent([120, 200]);
+  for (let tap = 0; tap < 2; tap++) {
+    handlers.onPanResponderGrant(finger); viewer.advance(60);
+    handlers.onPanResponderRelease(touchEvent(), swipeState(0, 0)); viewer.advance(60);
+  }
+  viewer.render(); assert.equal(viewer.byLabel('Zoom out').props.disabled, false);
+  handlers.onPanResponderGrant(finger); handlers.onPanResponderMove(touchEvent([120, 360]));
+  handlers.onPanResponderRelease(touchEvent(), swipeState(0, 160)); viewer.finishAnimations();
+  assert.equal(viewer.closes(), 0);
+  viewer.byLabel('Reset photo zoom').props.onPress(); viewer.render();
+  assert.equal(viewer.byLabel('Zoom out').props.disabled, true);
+});
+
+test('pinching or adding a second finger cancels photo dismissal until the next gesture', () => {
+  const viewer = readyPhoto(), handlers = viewer.handlers();
+  handlers.onPanResponderGrant(touchEvent([120, 200]));
+  handlers.onPanResponderMove(touchEvent([120, 240]));
+  handlers.onPanResponderStart(touchEvent([120, 240], [220, 240]));
+  handlers.onPanResponderMove(touchEvent([120, 240], [220, 240]));
+  handlers.onPanResponderMove(touchEvent([70, 240], [270, 240]));
+  handlers.onPanResponderMove(touchEvent([70, 380]));
+  handlers.onPanResponderRelease(touchEvent(), swipeState(0, 180)); viewer.finishAnimations(); viewer.render();
+  assert.equal(viewer.closes(), 0); assert.equal(viewer.byLabel('Zoom out').props.disabled, false);
+});
+
+function chatNavigationHarness(tab, activeChat, bottom = 34, top = 59, nativeGlass = false, platform = 'ios') {
+  const context = {tab, activeChat, nativeGlass, navBottom: Math.max(bottom, 12), setNavHeight() {}, insets: {top, bottom}, styles: {nav: {}, floatingNav: {position: 'absolute'}, content: {flex: 1}}, glassStyles: {toolbar: {}}, mobileTabs: [],
+    Platform: {OS: platform}, colors: {surface: '#2C2039'}, unreadCount: 3, View: 'View', Text: 'Text', Pressable: 'Pressable', Ionicons: 'Ionicons', PulseBadge: 'PulseBadge',
+    GlassBackdrop: 'GlassBackdrop', SlidingTabs: 'SlidingTabs', React: {createElement: (type, props, ...children) => ({type, props: {...props, children}})}};
+  context.isChatOpen = nativeFunction('isChatOpen', context);
+  const renderBar = styleName => {
+    const bar = find(native, node => ts.isJsxElement(node) && node.openingElement.attributes.properties.some(prop =>
+      prop.name?.getText(native) === 'style' && prop.initializer?.expression?.getText(native).startsWith('[styles.' + styleName + ',')));
+    assert.ok(ts.isBinaryExpression(bar.parent), styleName + ' is conditionally rendered, not just visually hidden');
+    const source = ts.transpileModule('(' + bar.parent.getText(native) + ');', {
+      compilerOptions: {target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React},
+    }).outputText;
+    return vm.runInNewContext(source, context);
+  };
+  const screen = find(native, node => ts.isJsxOpeningElement(node) && node.tagName.getText(native) === 'ScreenTransition');
+  const style = screen.attributes.properties.find(prop => prop.name?.getText(native) === 'style').initializer.expression.getText(native);
+  return {nav: renderBar('nav'), header: renderBar('appHeader'), contentStyle: vm.runInNewContext(style, context)};
+}
+
+test('mobile app bars hide only inside a direct or group chat and preserve both safe areas', () => {
+  for (const [top, bottom] of [[0, 0], [24, 24], [44, 34], [59, 34]]) {
+    for (const tab of ['Home', 'Explore', 'Chats', 'Notifications', 'Reels', 'Profile', 'Settings']) {
+      for (const activeChat of [null, {id: 1, is_group: false}, {id: 2, is_group: true}]) {
+        const open = tab === 'Chats' && !!activeChat;
+        const result = chatNavigationHarness(tab, activeChat, bottom, top);
+        assert.equal(result.nav === false, open);
+        assert.equal(result.header === false, open);
+        assert.equal(result.contentStyle[0].flex, 1, 'The chat fills the space freed by navigation');
+        assert.equal(result.contentStyle[1]?.paddingTop, open ? top : undefined);
+        assert.equal(result.contentStyle[1]?.paddingBottom, open ? bottom : undefined);
+        if (!open) assert.equal(result.header.props.style[1].paddingTop, top + 13);
+      }
+    }
+  }
+});
+
+test('native glass navigation floats over the full content viewport with measured bottom clearance', () => {
+  const styles = pureModule('appStyles.ts', {'./themedStyles': {createThemedStyles: fn => fn}, './theme': pureModule('theme.ts')}).getAppStyles(pureModule('theme.ts').themes.dark);
+  assert.equal(styles.floatingNav.position, 'absolute');
+  for (const bottom of [0, 24, 34]) for (const navHeight of [66, 90, 120]) for (const nativeGlass of [false, true]) {
+    const navBottom = nativeFunction('navBottom', {insets: {bottom}});
+    const bottomContentInset = nativeFunction('bottomContentInset', {nativeGlass, navHeight, navBottom});
+    const contentStyle = nativeFunction('mainListContentStyle', {styles, bottomContentInset});
+    assert.equal(contentStyle[1].paddingBottom, styles.list.paddingBottom + (nativeGlass ? navHeight + Math.max(bottom, 12) : 0));
+    const result = chatNavigationHarness('Home', null, bottom, 59, nativeGlass);
+    assert.equal(result.nav.props.style[2]?.position, nativeGlass ? 'absolute' : undefined);
+    assert.equal(result.contentStyle.some(style => style?.paddingBottom), false, 'Padding must be inside the scrollable list, not outside its viewport');
+    assert.equal(chatNavigationHarness('Chats', {id: 1}, bottom, 59, nativeGlass).nav, false);
+  }
+});
+
+test('Android bottom navigation fills the system safe area with one continuous opaque surface', () => {
+  for (const bottom of [0, 16, 24, 34, 48]) {
+    const result = chatNavigationHarness('Home', null, bottom, 24, false, 'android');
+    const style = Object.assign({}, ...result.nav.props.style.filter(Boolean));
+    assert.equal(style.marginBottom, 0, 'There is no gap between the dock and the system controls');
+    assert.equal(style.marginHorizontal, 0);
+    assert.equal(style.borderRadius, 0);
+    assert.equal(style.paddingBottom, bottom + 8, 'Keep every tab above the full gesture/button inset');
+    assert.equal(style.backgroundColor, '#2C2039');
+    assert.equal(result.nav.props.children[0], false, 'Rounded glass must not expose a different background at the corners');
+  }
+  assert.equal(chatNavigationHarness('Chats', {id: 1}, 48, 24, false, 'android').nav, false);
+});
+
+test('floating chat insets follow measured controls, keyboard lift and native availability', () => {
+  const list = find(native, node => ts.isJsxSelfClosingElement(node) && node.tagName.getText(native) === 'MessageList');
+  const evaluate = (name, context) => {
+    const prop = list.attributes.properties.find(prop => prop.name?.getText(native) === name);
+    return vm.runInNewContext('(' + prop.initializer.expression.getText(native) + ')', context);
+  };
+  for (const nativeGlass of [true, false]) for (const chatHeaderHeight of [68, 120]) for (const chatComposerHeight of [72, 180]) for (const chatKeyboardOverlap of [0, 300]) {
+    const context = {nativeGlass, chatHeaderHeight, chatComposerHeight, chatKeyboardOverlap, styles: {messageList: {padding: 16}}};
+    assert.equal(evaluate('occludedTop', context), nativeGlass ? chatHeaderHeight + 8 + chatKeyboardOverlap : 0);
+    assert.equal(evaluate('occludedBottom', context), nativeGlass ? chatComposerHeight + 8 : 0);
+    const content = evaluate('contentContainerStyle', context);
+    assert.equal(content[1]?.paddingBottom, nativeGlass ? chatComposerHeight + 24 : undefined);
+    assert.equal(content[1]?.paddingTop, nativeGlass ? chatHeaderHeight + 24 : undefined);
+  }
+});
+
+test('the chat back button restores the mobile conversation list and both app bars', () => {
+  const back = find(native, node => ts.isJsxOpeningElement(node) && node.attributes.properties.some(prop =>
+    prop.name?.getText(native) === 'accessibilityLabel' && prop.initializer?.text === 'Back to conversations'));
+  const onPress = back.attributes.properties.find(prop => prop.name?.getText(native) === 'onPress').initializer.expression.getText(native);
+  const hint = back.attributes.properties.find(prop => prop.name?.getText(native) === 'accessibilityHint').initializer.expression.getText(native);
+  assert.doesNotMatch(vm.runInNewContext(hint, {Platform: {OS: 'android'}}), /swipe/i);
+  assert.match(vm.runInNewContext(hint, {Platform: {OS: 'ios'}}), /swipe right/);
+  const swipe = find(native, node => ts.isJsxOpeningElement(node) && node.tagName.getText(native) === 'SwipeBackView');
+  assert.equal(swipe.attributes.properties.find(prop => prop.name?.getText(native) === 'onBack').initializer.expression.getText(native), onPress);
+  assert.equal(swipe.attributes.properties.find(prop => prop.name?.getText(native) === 'key').initializer.expression.getText(native), 'activeChat.id');
+  let activeChat = {id: 1}, dismissed = false;
+  assert.equal(chatNavigationHarness('Chats', activeChat).nav, false);
+  assert.equal(chatNavigationHarness('Chats', activeChat).header, false);
+  const context = {
+    setActiveChat: value => {activeChat = value;},
+    Keyboard: {dismiss: () => {dismissed = true;}},
+  };
+  context.closeChat = nativeFunction('closeChat', context);
+  vm.runInNewContext('(' + onPress + ')()', context);
+  assert.equal(activeChat, null); assert.equal(dismissed, true);
+  assert.equal(chatNavigationHarness('Chats', activeChat).nav.type, 'View');
+  assert.equal(chatNavigationHarness('Chats', activeChat).header.type, 'View');
+});
+
+test('ordinary Android Back closes a conversation, restores Profile from Settings, and otherwise returns Home', () => {
+  const effect = find(native, node => ts.isCallExpression(node) && node.expression.getText(native) === 'useEffect'
+    && node.arguments[0]?.getText(native).includes("BackHandler.addEventListener('hardwareBackPress'"));
+  const source = ts.transpileModule('(' + effect.arguments[0].getText(native) + ')', {compilerOptions: {target: ts.ScriptTarget.ES2022}}).outputText;
+  for (const [tab, activeChat, expectedTab, closedChat, handled] of [
+    ['Chats', {id: 7}, 'Chats', true, true], ['Settings', null, 'Profile', false, true],
+    ['Explore', null, 'Home', false, true], ['Home', null, 'Home', false, false],
+  ]) {
+    let listener, nextTab = tab, chat = activeChat, keyboard = 0, removed = 0;
+    const cleanup = vm.runInNewContext(source, {
+      Platform: {OS: 'android'}, token: 'session', tab, activeChat,
+      BackHandler: {addEventListener: (name, callback) => {assert.equal(name, 'hardwareBackPress'); listener = callback; return {remove: () => removed++};}},
+      Keyboard: {dismiss: () => keyboard++}, setTab: value => {nextTab = value;}, setActiveChat: value => {chat = value;},
+    })();
+    assert.equal(listener(), handled); assert.equal(nextTab, expectedTab);
+    assert.equal(chat, closedChat ? null : activeChat); assert.equal(keyboard, tab === 'Settings' || closedChat ? 1 : 0);
+    cleanup(); assert.equal(removed, 1);
+  }
+});
 
 test('native unread chat refresh ignores snapshots predating a read or a newer refresh', async () => {
   const first = deferred(), latest = deferred(); let calls = 0, chats = [];
@@ -758,12 +1186,15 @@ test('native unread chat refresh ignores snapshots predating a read or a newer r
 
 test('native read receipts are foreground-only, scoped, and retryable after failure', async () => {
   let chats=[{id:2,unread_count:3}], writes=0, fail=true;
-  const context = {activeChatId:{current:2},currentTab:{current:'Chats'},AppState:{currentState:'background'},
+  const context = {chatBackActive:{current:false},activeChatId:{current:2},currentTab:{current:'Chats'},AppState:{currentState:'background'},
     visibleChatMessage:{current:{chatId:0,messageId:0}},chatReadCursors:{current:new Map()},chatReadRequests:{current:new Set()},chatReadVersion:{current:0},
     api:async (url,options)=>{writes++; assert.equal(url,'/conversations/2/mark-read/'); assert.equal(JSON.parse(options.body).message_id,9); if(fail)throw Error('Offline'); return {unread_count:1,read_through_message_id:9};},
     setConversations:update=>{chats=update(chats);},setActiveChat:noop,loadChats:async()=>{}};
   context.markChatRead=nativeFunction('markChatRead',context);
   await context.markChatRead(2,9); assert.equal(writes,0);
+  context.AppState.currentState='active'; context.chatBackActive.current=true;
+  await context.markChatRead(2,9); assert.equal(writes,0);
+  context.chatBackActive.current=false; await context.markChatRead(2,-1); assert.equal(writes,0);
   context.AppState.currentState='active'; await context.markChatRead(3,9); assert.equal(writes,0);
   await context.markChatRead(2,9); assert.equal(chats[0].unread_count,3); assert.equal(context.chatReadRequests.current.size,0);
   fail=false; await context.markChatRead(2,9); assert.equal(chats[0].unread_count,1);
@@ -1043,7 +1474,7 @@ function nativeSearchContext() {
   const code = ts.transpileModule('(' + node.initializer.getText(tree) + ')', {compilerOptions: {target: ts.ScriptTarget.ES2022}}).outputText;
   const state = {loading: false, error: '', results: {key: '', items: [], page: 0}};
   const context = {apiRef: {current: null}, controller: {current: null}, requestVersion: {current: 1}, inFlight: {current: false},
-    kind: 'events', term: 'coffee', key: 'coffee-events', nearby: false, nearbyEvents: null, AbortController,
+    kind: 'events', myEvents: false, term: 'coffee', key: 'coffee-events', nearby: false, nearbyEvents: null, AbortController,
     setLoading: value => {state.loading = value;}, setError: value => {state.error = value;},
     setResults: update => {state.results = update(state.results);}};
   return {state, context, request: vm.runInNewContext(code, context)};
@@ -1088,22 +1519,33 @@ test('native and web search requests fetch one page while other callers still fo
 });
 
 
-function eventSheetHarness({height = 844, top = 44, bottom = 34, eventId = 5} = {}) {
+function eventSheetHarness({height = 844, top = 44, bottom = 34, eventId = 5, platform = 'android', scheme = 'light'} = {}) {
   const code = ts.transpileModule(fs.readFileSync(path.join(root, 'mobile/EventDetailsSheet.tsx'), 'utf8'), {
     compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX},
   }).outputText;
-  let closes = 0;
-  const jsx = (type, props, key) => ({type, props, key});
+  let closes = 0, keyboardDismisses = 0, swipeOptions;
+  const jsx = (type, props, key) => typeof type === 'function' ? type(props) : ({type, props, key});
   const context = {exports: {}, require: name => {
     if (name === 'react/jsx-runtime') return {jsx, jsxs: jsx};
-    if (name === 'react-native') return {ScrollView: 'ScrollView', View: 'View', Text: 'Text',
+    if (name === 'react-native') return {Animated: {View: 'Animated.View'}, ScrollView: 'ScrollView', View: 'View', Text: 'Text',
+      Platform: {OS: platform}, KeyboardAvoidingView: 'KeyboardAvoidingView', Keyboard: {dismiss: () => keyboardDismisses++},
       useWindowDimensions: () => ({width: 390, height}), StyleSheet: {create: value => value, absoluteFill: {position: 'absolute', top: 0, bottom: 0, left: 0, right: 0}}};
     if (name === 'react-native-safe-area-context') return {useSafeAreaInsets: () => ({top, bottom, left: 0, right: 0})};
     if (name === '@expo/vector-icons') return {Ionicons: 'Icon'};
     if (name === './Motion') return {MotionModal: 'Modal', SoftPressable: 'Pressable'};
-    if (name === './ThemeProvider') return {useTheme: () => ({theme: pureModule('theme.ts').themes.light})};
+    if (name === './GlassBackdrop') return {GlassBackdrop: 'GlassBackdrop'};
+    if (name === './useSwipeDismiss') return {useSwipeDismiss: options => {swipeOptions = options; return {offset: 0, panHandlers: {gestureOptions: options}};}};
+    if (name === './ThemeProvider') return {useTheme: () => ({theme: pureModule('theme.ts').themes[scheme]})};
     if (name === './themedStyles') return {createThemedStyles: factory => factory};
     if (name === './theme') return pureModule('theme.ts');
+    if (name === './DetailSheet') {
+      const sheetCode = ts.transpileModule(fs.readFileSync(path.join(root, 'mobile/DetailSheet.tsx'), 'utf8'), {
+        compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX},
+      }).outputText;
+      const sheetContext = {exports: {}, require: context.require};
+      vm.runInNewContext(sheetCode, sheetContext);
+      return sheetContext.exports;
+    }
     throw Error('Unexpected import: ' + name);
   }};
   vm.runInNewContext(code, context);
@@ -1116,7 +1558,7 @@ function eventSheetHarness({height = 844, top = 44, bottom = 34, eventId = 5} = 
     nodes.push({node, ancestors}); visit(node.props?.children, [...ancestors, node]);
   }
   visit(tree);
-  return {tree, content, nodes, closes: () => closes};
+  return {tree, content, nodes, swipeOptions, closes: () => closes, keyboardDismisses: () => keyboardDismisses};
 }
 
 test('long event details have a bounded scroll view without pressable gesture ancestors', () => {
@@ -1128,11 +1570,12 @@ test('long event details have a bounded scroll view without pressable gesture an
     assert.equal(scroll.props.style.minHeight, 0);
     assert.equal(scroll.props.nestedScrollEnabled, true);
     assert.equal(ancestors.some(node => node.type === 'Pressable' || node.props?.onPress), false);
-    const surface = ancestors.at(-1);
+    const surface = ancestors.find(node => node.props?.accessibilityViewIsModal);
     const styles = Object.assign({}, ...surface.props.style);
     assert.ok(styles.height > 0 && styles.height <= height - 44 - 8);
-    const contentStyle = Object.assign({}, ...scroll.props.contentContainerStyle);
-    assert.ok(contentStyle.paddingBottom >= 34);
+    const contentStyle = Object.assign({}, ...[].concat(scroll.props.contentContainerStyle));
+    const bodyStyle = Object.assign({}, ...ancestors.at(-1).props.style);
+    assert.ok(contentStyle.paddingBottom + bodyStyle.paddingBottom >= 34);
     assert.equal(contentStyle.flex, undefined, 'Long content must be allowed to exceed the viewport');
   }
 });
@@ -1150,6 +1593,63 @@ test('event close controls remain outside the scrolling content and all dismiss 
 test('event scroll identity resets between events and stays stable when the current event refreshes', () => {
   const scrollKey = id => eventSheetHarness({eventId: id}).nodes.find(item => item.node.type === 'ScrollView').node.key;
   assert.equal(scrollKey(5), scrollKey(5)); assert.notEqual(scrollKey(5), scrollKey(6));
+});
+
+test('Android event swipe dismissal stays on the header and never captures the scrollable page', () => {
+  const sheet = eventSheetHarness();
+  const handle = sheet.nodes.find(item => item.node.props?.gestureOptions);
+  const scroll = sheet.nodes.find(item => item.node.type === 'ScrollView');
+  assert.equal(scroll.ancestors.includes(handle.node), false);
+  assert.equal(scroll.node.props.directionalLockEnabled, true);
+  assert.equal(handle.node.props.gestureOptions.axis, 'y');
+  handle.node.props.gestureOptions.onDismiss();
+  assert.equal(sheet.closes(), 1);
+  const surface = sheet.nodes.find(item => item.node.props?.onAccessibilityEscape);
+  surface.node.props.onAccessibilityEscape();
+  assert.equal(sheet.closes(), 2);
+});
+
+test('iPhone events use a natively dismissible page sheet with no competing JS gesture or refresh control', () => {
+  for (const scheme of ['light', 'dark']) {
+    const sheet = eventSheetHarness({platform: 'ios', scheme});
+    assert.equal(sheet.tree.props.presentationStyle, 'pageSheet');
+    assert.equal(sheet.tree.props.transparent, false);
+    assert.equal(sheet.tree.props.allowSwipeDismissal, true);
+    assert.equal(sheet.swipeOptions.enabled, false);
+    assert.equal(sheet.nodes.some(item => item.node.props?.gestureOptions), false);
+    assert.equal(sheet.nodes.some(item => item.node.type === 'Pressable' && item.node.props.accessible === false), false);
+    const {node: scroll, ancestors} = sheet.nodes.find(item => item.node.type === 'ScrollView');
+    assert.equal(scroll.props.alwaysBounceVertical, true, 'Short events can still be pulled down');
+    assert.equal(scroll.props.onRefresh, undefined);
+    assert.equal(scroll.props.refreshControl, undefined);
+    const surface = ancestors.find(node => node.props?.accessibilityViewIsModal);
+    const style = Object.assign({}, ...surface.props.style);
+    assert.equal(style.flex, 1); assert.equal(style.height, undefined);
+    assert.equal(style.backgroundColor, pureModule('theme.ts').themes[scheme].colors.surface);
+    sheet.tree.props.onRequestClose();
+    assert.equal(sheet.closes(), 1); assert.equal(sheet.keyboardDismisses(), 1);
+  }
+});
+
+test('profile popups use the shared native sheet and refresh from a button, not the dismiss gesture', () => {
+  const opening = find(native, node => ts.isJsxOpeningElement(node) && node.tagName.getText(native) === 'DetailSheet');
+  const close = opening.attributes.properties.find(prop => prop.name?.getText(native) === 'onClose').initializer.expression.getText(native);
+  assert.equal(close, 'closePeople');
+  const list = find(opening.parent, node => ts.isJsxSelfClosingElement(node) && node.tagName.getText(native) === 'FlatList'
+    && node.attributes.properties.some(prop => prop.name?.getText(native) === 'key' && prop.initializer?.expression?.getText(native).includes("'profile-'")));
+  assert.ok(list.attributes.properties.some(prop => prop.name?.getText(native) === 'alwaysBounceVertical'));
+  assert.equal(list.attributes.properties.some(prop => ['onRefresh', 'refreshing', 'refreshControl'].includes(prop.name?.getText(native))), false);
+  const button = find(opening, node => ts.isJsxOpeningElement(node) && node.attributes.properties.some(prop =>
+    prop.name?.getText(native) === 'accessibilityLabel' && prop.initializer?.text === 'Refresh profile'));
+  const press = button.attributes.properties.find(prop => prop.name?.getText(native) === 'onPress').initializer.expression.getText(native);
+  let refreshes = 0;
+  vm.runInNewContext('(' + press + ')()', {refresh: task => task(), refreshVisibleProfile: () => refreshes++});
+  assert.equal(refreshes, 1);
+  let person = {id: 7}, panel = {kind: 'followers'}, keyboardDismissed = false;
+  const version = {current: 2};
+  nativeFunction(close, {peopleRequestVersion: version, setPeoplePanel: value => {panel = value;},
+    setSelectedUser: value => {person = value;}, Keyboard: {dismiss: () => {keyboardDismissed = true;}}})();
+  assert.equal(person, null); assert.equal(panel, null); assert.equal(version.current, 3); assert.equal(keyboardDismissed, true);
 });
 
 test('iOS publishing waits for editor dismissal before exposing the saved event sheet', () => {

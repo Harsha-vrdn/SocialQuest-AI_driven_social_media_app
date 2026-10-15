@@ -4,7 +4,8 @@ import {useEffect, useRef, useState} from 'react';
 import {Animated, Image, PanResponder, PixelRatio, Text, View, type GestureResponderEvent} from 'react-native';
 import {Ionicons} from '@expo/vector-icons';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
-import {MotionModal, SoftPressable as Pressable} from './Motion';
+import {MotionModal, SoftPressable as Pressable, useReducedMotion} from './Motion';
+import {shouldDismissSwipe, swipeIntent} from './dismissGestures';
 import {fonts} from './theme';
 import {boundTransform, imageRenderLayout, focalZoom, type Point, type Transform} from './imageZoom';
 
@@ -29,6 +30,16 @@ export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) 
   const y = useRef(new Animated.Value(0)).current;
   const gesture = useRef({start: {...initial}, point: {x: 0, y: 0}, distance: 1, count: 0, moved: false, multi: false, time: 0});
   const lastTap = useRef<{time: number; point: Point} | null>(null);
+  const dismissY = useRef(new Animated.Value(0)).current;
+  const dismiss = useRef({active: false, rejected: false, closing: false, version: 0});
+  const reduced = useReducedMotion();
+  const actions = useRef({onClose, reduced}); actions.current = {onClose, reduced};
+  const cancelDismiss = () => {
+    dismiss.current.version++; dismiss.current.active = false; dismiss.current.closing = false;
+    dismissY.stopAnimation();
+    if (actions.current.reduced) dismissY.setValue(0);
+    else Animated.spring(dismissY, {toValue: 0, speed: 24, bounciness: 0, useNativeDriver: true}).start();
+  };
 
   const apply = (next: Transform, announce = false) => {
     const bounded = boundTransform(next, imageSize.current, viewport.current);
@@ -39,18 +50,21 @@ export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) 
   const fit = () => {
     const next = imageRenderLayout(sourceSize.current, viewport.current, PixelRatio.get());
     if (!next) return;
+    cancelDismiss();
     imageSize.current = next.fitted; setLayout(next); apply({...initial}, true); lastTap.current = null;
   };
   useEffect(() => {
     let mounted = true;
     sourceSize.current = {width: 0, height: 0};
+    dismiss.current.version++; dismiss.current.active = false; dismiss.current.closing = false;
+    dismissY.stopAnimation(); dismissY.setValue(0);
     setLayout(null); setFailed(false); setLoading(true);
     Image.getSize(uri, (width, height) => {
       if (!mounted) return;
       if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {setFailed(true); setLoading(false); return;}
       sourceSize.current = {width, height}; fit();
     }, () => { if (mounted) {setFailed(true); setLoading(false);} });
-    return () => { mounted = false; };
+    return () => { mounted = false; dismiss.current.version++; dismissY.stopAnimation(); };
   }, [uri, attempt]);
   const points = (event: GestureResponderEvent) => {
     const touches = event.nativeEvent.touches;
@@ -66,27 +80,55 @@ export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) 
     lastTap.current = null;
   };
   const responder = useRef(PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
-    onMoveShouldSetPanResponder: () => true,
+    onStartShouldSetPanResponder: () => !dismiss.current.closing,
+    onMoveShouldSetPanResponder: () => !dismiss.current.closing,
     onPanResponderGrant: event => {
       const next = points(event); if (!next) return;
+      cancelDismiss(); dismissY.setValue(0); dismiss.current.rejected = false;
       gesture.current = {...next, start: {...value.current}, moved: false, multi: next.count > 1, time: Date.now()};
+    },
+    onPanResponderStart: event => {
+      if (event.nativeEvent.touches.length > 1) {
+        gesture.current.multi = true; dismiss.current.rejected = true; cancelDismiss(); lastTap.current = null;
+      }
     },
     onPanResponderMove: event => {
       const next = points(event); if (!next) return;
       const start = gesture.current;
       if (next.count !== start.count) {
+        dismiss.current.rejected = true; cancelDismiss();
         gesture.current = {...start, ...next, start: {...value.current}, moved: true, multi: true};
         return;
       }
       if (Math.hypot(next.point.x - start.point.x, next.point.y - start.point.y) > 8 || next.count > 1) start.moved = true;
+      if (next.count === 1 && !start.multi && start.start.scale === 1 && !dismiss.current.rejected) {
+        const dx = next.point.x - start.point.x, dy = next.point.y - start.point.y;
+        const intent = swipeIntent(dx, dy, 'y');
+        if (intent === 'reject' && !dismiss.current.active) dismiss.current.rejected = true;
+        if (intent === 'accept' || dismiss.current.active) {
+          dismiss.current.active = true; dismissY.stopAnimation();
+          dismissY.setValue(Math.max(0, Math.min(dy, viewport.current.height)));
+          return;
+        }
+      }
       const target = next.count > 1
         ? focalZoom(start.start, start.start.scale * next.distance / start.distance, start.point, next.point)
         : {...start.start, x: start.start.x + next.point.x - start.point.x, y: start.start.y + next.point.y - start.point.y};
       apply(target);
     },
-    onPanResponderRelease: () => {
+    onPanResponderRelease: (_event, state) => {
       const current = gesture.current, now = Date.now();
+      if (dismiss.current.active) {
+        lastTap.current = null;
+        if (!current.multi && shouldDismissSwipe(state.dy, state.dx, state.vy)) {
+          dismiss.current.closing = true;
+          const version = ++dismiss.current.version;
+          const finish = () => {if (version === dismiss.current.version) actions.current.onClose();};
+          if (actions.current.reduced) finish();
+          else Animated.timing(dismissY, {toValue: viewport.current.height, duration: 170, useNativeDriver: true}).start(({finished}) => {if (finished) finish();});
+        } else cancelDismiss();
+        return;
+      }
       if (!current.moved && !current.multi && now - current.time < 300) {
         const previous = lastTap.current;
         if (previous && now - previous.time < 300 && Math.hypot(previous.point.x - current.point.x, previous.point.y - current.point.y) < 40) {
@@ -96,24 +138,24 @@ export function ImageViewer({uri, onClose}: {uri: string; onClose: () => void}) 
       setPercent(Math.round(value.current.scale * 100));
     },
     onPanResponderTerminationRequest: () => false,
-    onPanResponderTerminate: () => {lastTap.current = null; setPercent(Math.round(value.current.scale * 100));},
+    onPanResponderTerminate: () => {cancelDismiss(); lastTap.current = null; setPercent(Math.round(value.current.scale * 100));},
   })).current;
 
   return <MotionModal visible animationType="fade" presentationStyle="fullScreen" onRequestClose={onClose}>
-    <View style={[s.screen, {paddingTop: insets.top, paddingBottom: insets.bottom}]}>
+    <View style={[s.screen, {paddingTop: insets.top, paddingBottom: insets.bottom}]} onAccessibilityEscape={onClose}>
       <View style={s.header}><Text style={s.title}>Photo</Text><Pressable accessibilityRole="button" accessibilityLabel="Close photo viewer" style={s.button} onPress={onClose}><Ionicons name="close" size={24} color={colors.text} /></Pressable></View>
       <View ref={frame} style={s.viewport} onLayout={event => {
         viewport.current = {...viewport.current, ...event.nativeEvent.layout};
         frame.current?.measureInWindow((pageX, pageY) => {viewport.current = {...viewport.current, pageX, pageY};});
         fit();
       }} {...responder.panHandlers}>
-        {layout ? <Animated.View style={{width: layout.raster.width, height: layout.raster.height, transform: [{translateX: x}, {translateY: y}, {scale: Animated.multiply(scale, layout.displayScale)}]}}>
+        {layout ? <Animated.View style={{width: layout.raster.width, height: layout.raster.height, transform: [{translateX: x}, {translateY: Animated.add(y, dismissY)}, {scale: Animated.multiply(scale, layout.displayScale)}]}}>
           <Image key={uri + ':' + attempt} source={{uri, width: sourceSize.current.width, height: sourceSize.current.height, scale: 1}} style={s.image} resizeMode="contain" resizeMethod="resize" accessibilityLabel="Expanded photo"
             onLoad={() => {setLoading(false); setFailed(false);}} onError={() => {setLoading(false); setFailed(true);}} />
         </Animated.View> : null}
         {loading || failed ? <View pointerEvents="none" style={s.status}><Text style={[s.hint, {color: colors.onMedia}]}>{failed ? 'This photo could not be loaded.' : 'Loading photo…'}</Text></View> : null}
       </View>
-      <View style={s.footer}>{failed ? <Pressable accessibilityRole="button" accessibilityLabel="Retry loading photo" style={s.reset} onPress={() => setAttempt(current => current + 1)}><Text style={s.label}>Try again</Text></Pressable> : null}<Text style={s.hint}>Pinch or double-tap to zoom · Drag to explore</Text><View style={s.controls}>
+      <View style={s.footer}>{failed ? <Pressable accessibilityRole="button" accessibilityLabel="Retry loading photo" style={s.reset} onPress={() => setAttempt(current => current + 1)}><Text style={s.label}>Try again</Text></Pressable> : null}<Text style={s.hint}>{percent > 100 ? 'Pinch or double-tap to zoom · Drag to explore' : 'Pinch or double-tap to zoom · Swipe down to close'}</Text><View style={s.controls}>
         <Pressable accessibilityRole="button" accessibilityLabel="Zoom out" disabled={percent <= 100 || loading || failed} style={[s.button, percent <= 100 && s.dim]} onPress={() => zoom(value.current.scale / 1.5)}><Ionicons name="remove" size={23} color={colors.text} /></Pressable>
         <Pressable accessibilityRole="button" accessibilityLabel="Reset photo zoom" style={s.reset} onPress={() => zoom(1)}><Text style={s.label}>{percent}% · Reset</Text></Pressable>
         <Pressable accessibilityRole="button" accessibilityLabel="Zoom in" disabled={percent >= 400 || loading || failed} style={[s.button, percent >= 400 && s.dim]} onPress={() => zoom(value.current.scale * 1.5)}><Ionicons name="add" size={23} color={colors.text} /></Pressable>

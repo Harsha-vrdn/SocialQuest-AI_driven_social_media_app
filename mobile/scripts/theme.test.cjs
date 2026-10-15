@@ -240,3 +240,66 @@ test('native projects allow system appearance and do not lock system bars to lig
   const ios = fs.readFileSync(path.join(root, 'ios/SocialQuest/Info.plist'), 'utf8');
   assert.match(ios, /<key>UIUserInterfaceStyle<\/key>\s*<string>Automatic<\/string>/);
 });
+
+test('system bars and the full root use the selected palette while fonts are still loading', () => {
+  const source = ts.createSourceFile('App.tsx', fs.readFileSync(path.join(root, 'App.tsx'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const app = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'ThemedApp');
+  assert.ok(app);
+  const compiled = ts.transpileModule('(' + app.getText(source) + ')', {
+    compilerOptions: {target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React},
+  }).outputText;
+  const nodes = tree => tree && typeof tree === 'object' ? [tree, ...tree.children.flatMap(nodes)] : [];
+  for (const scheme of ['light', 'dark']) for (const fontState of [[false, null], [true, null], [false, Error('Font unavailable')]]) {
+    const render = vm.runInNewContext(compiled, {
+      useTheme: () => ({theme: themes[scheme]}), useFonts: () => fontState, require: () => 1,
+      SafeAreaProvider: 'SafeArea', RelativeTimeProvider: 'Time', MotionProvider: 'Motion', GlassPreferenceProvider: 'Glass',
+      StatusBar: 'StatusBar', NavigationBar: 'NavigationBar', SocialQuestApp: 'App', View: 'View',
+      React: {createElement: (type, props, ...children) => ({type, props, children})},
+    });
+    const tree = render(), children = nodes(tree);
+    assert.equal(tree.props.style.flex, 1);
+    assert.equal(tree.props.style.backgroundColor, themes[scheme].colors.background);
+    for (const type of ['StatusBar', 'NavigationBar']) {
+      assert.equal(children.find(node => node.type === type).props.style, scheme === 'dark' ? 'light' : 'dark');
+    }
+    assert.equal(children.some(node => node.type === 'App'), !!fontState[0] || !!fontState[1]);
+  }
+  const {GestureRoot} = load('GestureRoot.android.tsx', {
+    'react-native-gesture-handler': {GestureHandlerRootView: 'Root'},
+    './ThemeProvider': {useTheme: () => ({theme: themes.dark})},
+  });
+  assert.equal(GestureRoot({children: 'app'}).props.style.backgroundColor, themes.dark.colors.background);
+});
+
+test('Android system bar defaults survive repeated Expo prebuilds without white backgrounds or duplicate settings', async () => {
+  const {XML} = require('expo/config-plugins');
+  const config = JSON.parse(fs.readFileSync(path.join(root, 'app.json'), 'utf8')).expo;
+  const [pluginPath, options] = config.plugins.find(plugin => Array.isArray(plugin) && plugin[0].includes('withAndroidSystemBars'));
+  const plugin = require(path.join(root, pluginPath));
+  assert.equal(options.lightBackground, themes.light.colors.background);
+  assert.equal(options.darkBackground, themes.dark.colors.background);
+  const modConfig = plugin(plugin({name: 'SocialQuest', slug: 'socialquest'}, options), options);
+  const mod = async (name, modResults) => (await modConfig.mods.android[name]({
+    ...modConfig, modResults, modRequest: {platform: 'android', modName: name, projectRoot: root, platformProjectRoot: path.join(root, 'android')},
+  })).modResults;
+  for (const [name, directory, color] of [['colors', 'values', themes.light.colors.background], ['colorsNight', 'values-night', themes.dark.colors.background]]) {
+    const file = await XML.parseXMLAsync(fs.readFileSync(path.join(root, 'android/app/src/main/res', directory, 'colors.xml'), 'utf8'));
+    const result = await mod(name, file);
+    const entries = result.resources.color.filter(item => item.$.name === 'app_background');
+    assert.equal(entries.length, 1); assert.equal(entries[0]._, color);
+  }
+  const native = await XML.parseXMLAsync(fs.readFileSync(path.join(root, 'android/app/src/main/res/values/styles.xml'), 'utf8'));
+  const result = await mod('styles', native);
+  const items = result.resources.style.find(style => style.$.name === 'AppTheme').item;
+  for (const [name, expected] of Object.entries({
+    'android:windowBackground': '@color/app_background', 'android:colorBackground': '@color/app_background',
+    'android:navigationBarColor': '@android:color/transparent', 'android:navigationBarDividerColor': '@android:color/transparent',
+    'android:enforceNavigationBarContrast': 'false', expoEnforceNavigationBarContrast: 'false',
+    'android:windowLightNavigationBar': '?attr/isLightTheme', 'android:windowLightStatusBar': '?attr/isLightTheme',
+  })) {
+    const entries = items.filter(item => item.$.name === name);
+    assert.equal(entries.length, 1, name); assert.equal(entries[0]._, expected, name);
+  }
+  const properties = await mod('gradleProperties', [{type: 'property', key: 'edgeToEdgeEnabled', value: 'false'}]);
+  assert.deepEqual(properties, [{type: 'property', key: 'edgeToEdgeEnabled', value: 'true'}]);
+});

@@ -14,6 +14,7 @@ from rest_framework.exceptions import ValidationError
 
 from .models import Attendance, Notification, NotificationDelivery, NotificationDevice, UserPresence
 from .serializers import NotificationSerializer
+from .moderation import blocked_user_ids, users_are_blocked
 
 
 def chats_are_open(user_id):
@@ -25,6 +26,8 @@ def suppress_chat_deliveries(user_id):
 
 
 def queue_notification(notification):
+    if notification.actor_id and users_are_blocked(notification.actor_id, notification.recipient_id):
+        return
     data = NotificationSerializer(notification).data
     payload = {
         'title': 'SocialQuest', 'body': data['text'][:240], 'kind': notification.kind,
@@ -40,12 +43,12 @@ def queue_notification(notification):
 
 
 def queue_message(message):
-    for recipient in message.conversation.participants.exclude(id=message.sender_id):
+    for recipient in message.conversation.participants.filter(is_active=True).exclude(id=message.sender_id).exclude(pk__in=blocked_user_ids(message.sender)):
         if chats_are_open(recipient.id):
             continue
         payload = {
             'title': message.sender.profile.display_name or message.sender.username,
-            'body': message.body[:240], 'kind': 'MESSAGE', 'conversation_id': message.conversation_id,
+            'body': message.body[:240] or 'Encrypted attachment', 'kind': 'MESSAGE', 'conversation_id': message.conversation_id,
             'message_id': message.id, 'recipient_id': recipient.id,
         }
         for device in NotificationDevice.objects.filter(user=recipient, enabled=True):
@@ -119,10 +122,11 @@ def should_suppress(delivery):
         return True
     if delivery.message_id:
         message = delivery.message
-        return (message.deleted_for_everyone or message.hidden_for.filter(id=delivery.device.user_id).exists()
+        return (users_are_blocked(message.sender_id, delivery.device.user_id) or message.deleted_for_everyone or message.hidden_for.filter(id=delivery.device.user_id).exists()
                 or not message.conversation.participants.filter(id=delivery.device.user_id).exists()
                 or chats_are_open(delivery.device.user_id))
-    return bool(delivery.notification and delivery.notification.read_at)
+    return bool(delivery.notification and (delivery.notification.read_at or
+                (delivery.notification.actor_id and users_are_blocked(delivery.notification.actor_id, delivery.device.user_id))))
 
 
 def claim_delivery(delivery):

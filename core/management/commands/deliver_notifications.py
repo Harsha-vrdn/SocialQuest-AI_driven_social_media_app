@@ -1,6 +1,7 @@
 import time
 from django.core.management.base import BaseCommand
 from core.notification_delivery import deliver_pending
+from core.chat_attachments import purge_expired_attachments
 
 
 class Command(BaseCommand):
@@ -12,6 +13,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         try:
             while True:
+                purge_expired_attachments()
                 count = deliver_pending()
                 if not options['watch']:
                     self.stdout.write(f'Processed {count} queued deliveries.')

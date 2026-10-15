@@ -87,6 +87,16 @@ export function useDeviceNotifications(options: Options) {
     } catch (_) { setMessage('Could not turn off notifications. Check your connection and try again.'); }
     finally { setBusy(false); }
   };
+  // Account suspension already revoked all server sessions and push devices.
+  // Clear this device without issuing a request with the revoked credential.
+  const clearLocal = async () => {
+    const userId = latest.current.userId;
+    device.current = null; setEnabled(false); notificationContext.allowed = false;
+    try {
+      if (userId) {const saved = preferences(userId); saved.file.write(JSON.stringify({id: saved.id, enabled: false}));}
+      await Notifications.dismissAllNotificationsAsync();
+    } catch (_) { /* Token removal still signs this device out if local cleanup fails. */ }
+  };
   useEffect(() => {
     if (!options.token || !options.userId) { device.current = null; setEnabled(false); return; }
     device.current = null; setEnabled(false); setSettingsNeeded(false);
@@ -126,5 +136,5 @@ export function useDeviceNotifications(options: Options) {
     if (!options.chatsOpen || AppState.currentState !== 'active') return;
     void Notifications.getPresentedNotificationsAsync().then(items => Promise.all(items.filter(item => item.request.content.data?.kind === 'MESSAGE').map(item => Notifications.dismissNotificationAsync(item.request.identifier)))).catch(() => {});
   }, [options.chatsOpen]);
-  return {enabled, busy, message, settingsNeeded, enable: () => settingsNeeded ? Linking.openSettings() : configure(), disable};
+  return {enabled, busy, message, settingsNeeded, enable: () => settingsNeeded ? Linking.openSettings() : configure(), disable, clearLocal};
 }

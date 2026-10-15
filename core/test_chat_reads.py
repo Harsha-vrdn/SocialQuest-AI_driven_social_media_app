@@ -1,6 +1,8 @@
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
+from unittest.mock import patch
+from uuid import uuid4
 
 from .models import Conversation, ConversationReadState, Message, Notification
 
@@ -96,3 +98,66 @@ class ChatReadTests(TestCase):
         self.assertEqual(self.client.get("/api/notifications/unread-count/").data["count"], 1)
         second.refresh_from_db(); private.refresh_from_db()
         self.assertIsNone(second.read_at); self.assertIsNone(private.read_at)
+
+    def test_sender_receipt_changes_only_after_recipient_reads_the_message(self):
+        message = self.send(self.alex)
+        url = f"/api/messages/{message.pk}/"
+        self.assertEqual(self.client.get(url).data["delivery_status"], "sent")
+        self.mark(message)  # Reading your own message does not count.
+        self.assertEqual(self.client.get(url).data["delivery_status"], "sent")
+        self.client.force_authenticate(self.sam)
+        self.assertIsNone(self.client.get(url).data["delivery_status"])
+        self.mark(message)
+        self.client.force_authenticate(self.alex)
+        self.assertEqual(self.client.get(url).data["delivery_status"], "read")
+        self.assertEqual(self.chat_data()["latest_message"]["delivery_status"], "read")
+        newer = self.send(self.alex)
+        self.assertEqual(self.client.get(f"/api/messages/{newer.pk}/").data["delivery_status"], "sent")
+
+    def test_group_receipts_require_all_current_recipients_and_are_conversation_scoped(self):
+        self.chat.participants.add(self.other)
+        message = self.send(self.alex)
+        ConversationReadState.objects.create(conversation=self.chat, user=self.sam, last_read_message_id=message.pk)
+        elsewhere = Conversation.objects.create()
+        elsewhere.participants.add(self.other, self.alex)
+        ConversationReadState.objects.create(conversation=elsewhere, user=self.other, last_read_message_id=message.pk + 100)
+        url = f"/api/messages/{message.pk}/"
+        self.assertEqual(self.client.get(url).data["delivery_status"], "sent")
+        ConversationReadState.objects.create(conversation=self.chat, user=self.other, last_read_message_id=message.pk)
+        self.assertEqual(self.client.get(url).data["delivery_status"], "read")
+        self.chat.participants.remove(self.sam, self.other)
+        self.assertEqual(self.client.get(url).data["delivery_status"], "sent", "An empty recipient set is not a read receipt")
+        message.deleted_for_everyone = True; message.save()
+        self.assertIsNone(self.client.get(url).data["delivery_status"])
+
+    def test_receipt_annotation_does_not_query_each_message(self):
+        from .chat_reads import with_message_receipts
+        for _ in range(25): self.send(self.alex)
+        with self.assertNumQueries(1):
+            messages = list(with_message_receipts(Message.objects.all()))
+            self.assertTrue(all(item.has_recipients and item.has_unread_recipients for item in messages))
+
+    @patch("core.notification_delivery.queue_message")
+    def test_retrying_the_same_send_is_idempotent_and_cannot_mutate_an_existing_message(self, notify):
+        payload = {"conversation": self.chat.pk, "body": "Hello once", "client_id": str(uuid4())}
+        first = self.client.post('/api/messages/', payload, format='json')
+        second = self.client.post('/api/messages/', payload, format='json')
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.data['id'], first.data['id'])
+        self.assertEqual(Message.objects.count(), 1); self.assertEqual(notify.call_count, 1)
+        self.assertEqual(first.data['client_id'], payload['client_id'])
+        self.assertEqual(first.data['delivery_status'], 'sent')
+        self.assertEqual(self.client.post('/api/messages/', {**payload, 'body': 'Different'}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(f"/api/messages/{first.data['id']}/", {'client_id': str(uuid4())}, format='json').status_code, 400)
+        elsewhere = Conversation.objects.create(); elsewhere.participants.add(self.alex, self.other)
+        self.assertEqual(self.client.post('/api/messages/', {**payload, 'conversation': elsewhere.pk}, format='json').status_code, 400)
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.post('/api/messages/', payload, format='json').status_code, 403)
+        self.client.force_authenticate(self.sam)
+        self.assertEqual(self.client.post('/api/messages/', payload, format='json').status_code, 201)
+        self.assertEqual(Message.objects.count(), 2, 'Client IDs are scoped to the sender')
+
+    def test_legacy_sends_without_client_ids_remain_distinct(self):
+        for _ in range(2):
+            self.assertEqual(self.client.post('/api/messages/', {'conversation': self.chat.pk, 'body': 'Hello'}, format='json').status_code, 201)
+        self.assertEqual(Message.objects.count(), 2)

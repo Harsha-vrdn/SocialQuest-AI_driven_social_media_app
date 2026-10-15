@@ -4,6 +4,7 @@ from django.contrib import admin
 from django.urls import include, path
 from django.views.generic import TemplateView
 from core.views import shared_post_link
+from core.media_serving import serve_media
 
 urlpatterns = [
     path("notification-worker.js", TemplateView.as_view(template_name="notification-worker.js", content_type="application/javascript")),
@@ -15,4 +16,4 @@ urlpatterns = [
     path("s/post/<int:post_id>/<path:shared_caption>", shared_post_link, name="shared-post-caption"),
     path("login/", TemplateView.as_view(template_name="login.html"), name="login"),
     path("", TemplateView.as_view(template_name="index.html"), name="home"),
-] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+] + static(settings.MEDIA_URL, view=serve_media, document_root=settings.MEDIA_ROOT)

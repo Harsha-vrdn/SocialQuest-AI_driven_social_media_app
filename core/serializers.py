@@ -1,49 +1,78 @@
 from django.contrib.auth import get_user_model
-from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError as DjangoValidationError
+from math import isfinite
 from rest_framework import serializers
 from .media import compress_image_upload, validate_media_upload
-from .models import (Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message,
-                     Notification, Post, Profile, Quest, QuestSubmission, UserPresence)
+from .models import (Attendance, Comment, Conversation, Event, KarmaRating, Message,
+                     Notification, Post, Profile, Quest, QuestSubmission, Report)
+
+from .querysets import with_post_stats, with_public_user_stats
 
 User = get_user_model()
 
 
+class PublicUserListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        instances = list(data.all() if hasattr(data, "all") else data)
+        cache = self.context.setdefault("public_user_stats", {})
+        missing = {person.pk for person in instances if person.is_active and not hasattr(person, "follower_count_value") and person.pk not in cache}
+        if missing:
+            request = self.context.get("request")
+            cache = self.context.setdefault("public_user_stats", {})
+            cache.update((person.pk, person) for person in with_public_user_stats(
+                User.objects.filter(pk__in=missing), getattr(request, "user", None),
+            ))
+        return super().to_representation(instances)
+
+
 class PublicUserSerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        # One-off writes/login responses also need real statistics. Collection
+        # endpoints prefetch annotated users; the list serializer batches raw
+        # collections instead of querying follower/following relations per row.
+        if instance.is_active and not hasattr(instance, "follower_count_value"):
+            cache = self.context.setdefault("public_user_stats", {})
+            if instance.pk not in cache:
+                request = self.context.get("request")
+                cache[instance.pk] = with_public_user_stats(User.objects.filter(pk=instance.pk), getattr(request, "user", None)).first()
+            instance = cache[instance.pk] or instance
+        if not instance.is_active:
+            return {"id": instance.pk, "username": "", "display_name": "Unavailable account", "bio": "", "city": "",
+                    "avatar": None, "xp": 0, "karma": 0, "follower_count": 0, "following_count": 0,
+                    "is_followed_by_me": False, "is_online": False}
+        return super().to_representation(instance)
+
     display_name = serializers.CharField(source="profile.display_name", read_only=True)
     bio = serializers.CharField(source="profile.bio", read_only=True)
     city = serializers.CharField(source="profile.city", read_only=True)
     avatar = serializers.ImageField(source="profile.avatar", read_only=True)
     xp = serializers.IntegerField(source="profile.total_xp", read_only=True)
-    karma = serializers.SerializerMethodField()
-    follower_count = serializers.SerializerMethodField()
-    following_count = serializers.SerializerMethodField()
-    is_followed_by_me = serializers.SerializerMethodField()
+    karma = serializers.IntegerField(source="karma_value", read_only=True)
+    follower_count = serializers.IntegerField(source="follower_count_value", read_only=True)
+    following_count = serializers.IntegerField(source="following_count_value", read_only=True)
+    is_followed_by_me = serializers.BooleanField(source="is_followed_value", read_only=True)
 
     class Meta:
         model = User
+        list_serializer_class = PublicUserListSerializer
         fields = ["id", "username", "display_name", "bio", "city", "avatar", "xp", "karma", "follower_count", "following_count", "is_followed_by_me"]
 
-    def get_follower_count(self, obj):
-        if hasattr(obj, "follower_count_value"):
-            return obj.follower_count_value
-        return obj.follower_relations.filter(follower__is_active=True).count()
 
-    def get_following_count(self, obj):
-        if hasattr(obj, "following_count_value"):
-            return obj.following_count_value
-        return obj.following_relations.filter(following__is_active=True).count()
-
-    def get_is_followed_by_me(self, obj):
-        if hasattr(obj, "is_followed_value"):
-            return obj.is_followed_value
-        request = self.context.get("request")
-        return bool(request and request.user.is_authenticated and Follow.objects.filter(follower=request.user, following=obj).exists())
-
-    def get_karma(self, obj):
-        return obj.karma_value if hasattr(obj, "karma_value") else obj.profile.karma
+class MediaImageField(serializers.ImageField):
+    def to_internal_value(self, data):
+        # Django's ImageField normalizes content_type after opening the image.
+        # Check the caller's declared MIME before that information is replaced.
+        try:
+            validate_media_upload(data, "IMAGE")
+        except ValueError as error:
+            raise serializers.ValidationError(str(error))
+        return super().to_internal_value(data)
 
 
 class EventSerializer(serializers.ModelSerializer):
+    cover_image = MediaImageField(required=False, allow_null=True)
     capacity = serializers.IntegerField(min_value=2, required=False)
     host = PublicUserSerializer(read_only=True)
     accepted_count = serializers.SerializerMethodField()
@@ -74,10 +103,6 @@ class EventSerializer(serializers.ModelSerializer):
         if longitude is not None and not -180 <= longitude <= 180:
             raise serializers.ValidationError({"longitude": "Longitude must be between -180 and 180."})
         if attrs.get("cover_image"):
-            try:
-                validate_media_upload(attrs["cover_image"], "IMAGE")
-            except ValueError as error:
-                raise serializers.ValidationError({"cover_image": str(error)})
             attrs["cover_image"] = compress_image_upload(attrs["cover_image"])
         return attrs
 
@@ -164,16 +189,53 @@ class QuestSubmissionSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class ProfileUpdateSerializer(serializers.ModelSerializer):
+class ProfileFieldsOnlyMixin:
+    def update(self, instance, validated_data):
+        # A delayed profile/location edit must not overwrite lifecycle fields
+        # from its stale model instance after another device requested deletion.
+        for name, value in validated_data.items():
+            setattr(instance, name, value)
+        instance.save(update_fields=list(validated_data))
+        return instance
+
+
+class AccountSettingsSerializer(ProfileFieldsOnlyMixin, serializers.ModelSerializer):
+    class Meta:
+        model = Profile
+        fields = ["location_mode", "saved_city", "saved_latitude", "saved_longitude", "account_state", "deletion_due_at"]
+        read_only_fields = ["account_state", "deletion_due_at"]
+
+    def validate(self, attrs):
+        mode = attrs.get("location_mode", self.instance.location_mode)
+        city = attrs.get("saved_city", self.instance.saved_city).strip()
+        latitude = attrs.get("saved_latitude", self.instance.saved_latitude)
+        longitude = attrs.get("saved_longitude", self.instance.saved_longitude)
+        if mode == "SAVED" and not city:
+            raise serializers.ValidationError({"saved_city": "Choose or enter a saved city."})
+        if (latitude is None) != (longitude is None):
+            raise serializers.ValidationError("Provide both saved coordinates, or neither.")
+        if latitude is not None and (not isfinite(latitude) or not -90 <= latitude <= 90):
+            raise serializers.ValidationError({"saved_latitude": "Invalid latitude."})
+        if longitude is not None and (not isfinite(longitude) or not -180 <= longitude <= 180):
+            raise serializers.ValidationError({"saved_longitude": "Invalid longitude."})
+        if "saved_city" in attrs:
+            attrs["saved_city"] = city
+            if city != self.instance.saved_city and "saved_latitude" not in attrs and "saved_longitude" not in attrs:
+                attrs.update(saved_latitude=None, saved_longitude=None)
+        return attrs
+
+
+class AccountPasswordSerializer(serializers.Serializer):
+    password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=1024)
+
+
+class ProfileUpdateSerializer(ProfileFieldsOnlyMixin, serializers.ModelSerializer):
+    avatar = MediaImageField(required=False, allow_null=True)
     class Meta:
         model = Profile
         fields = ["display_name", "bio", "city", "avatar"]
 
     def validate_avatar(self, value):
-        try:
-            validate_media_upload(value, "IMAGE")
-        except ValueError as error:
-            raise serializers.ValidationError(str(error))
         return compress_image_upload(value)
 
 
@@ -190,12 +252,19 @@ class KarmaRatingSerializer(serializers.ModelSerializer):
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=8)
+    password = serializers.CharField(write_only=True, min_length=8, max_length=1024, trim_whitespace=False)
     display_name = serializers.CharField(write_only=True, max_length=80, required=False)
 
     class Meta:
         model = User
         fields = ["username", "email", "password", "display_name"]
+
+    def validate_password(self, value):
+        try:
+            validate_password(value)
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(error.messages)
+        return value
 
     def create(self, validated_data):
         display_name = validated_data.pop("display_name", "")
@@ -233,8 +302,8 @@ class PostSerializer(serializers.ModelSerializer):
     quest_title = serializers.SerializerMethodField()
     event_name = serializers.SerializerMethodField()
     liked_by_me = serializers.SerializerMethodField()
-    like_count = serializers.SerializerMethodField()
-    comment_count = serializers.SerializerMethodField()
+    like_count = serializers.IntegerField(read_only=True)
+    comment_count = serializers.IntegerField(read_only=True)
     recent_comments = serializers.SerializerMethodField()
 
     class Meta:
@@ -275,18 +344,20 @@ class PostSerializer(serializers.ModelSerializer):
         return obj.event.name if obj.event_id else ""
 
     def get_liked_by_me(self, obj):
+        if hasattr(obj, "liked_by_me_value"):
+            return obj.liked_by_me_value
         request = self.context.get("request")
         if request and request.user.is_authenticated and "likes" in getattr(obj, "_prefetched_objects_cache", {}):
             return any(like.user_id == request.user.id for like in obj.likes.all())
         return bool(request and request.user.is_authenticated and obj.likes.filter(user=request.user).exists())
 
-    def get_like_count(self, obj):
-        return obj.likes.count()
-
-    def get_comment_count(self, obj):
-        if hasattr(obj, "prefetched_comments"):
-            return len(obj.prefetched_comments)
-        return obj.comments.count()
+    def to_representation(self, instance):
+        if not hasattr(instance, "like_count") or not hasattr(instance, "comment_count"):
+            request = self.context.get("request")
+            stats = with_post_stats(Post.objects.filter(pk=instance.pk), getattr(request, "user", None)).values("like_count", "comment_count", "liked_by_me_value").get()
+            for name, value in stats.items():
+                setattr(instance, name, value)
+        return super().to_representation(instance)
 
     def get_recent_comments(self, obj):
         if hasattr(obj, "prefetched_comments"):
@@ -297,11 +368,49 @@ class PostSerializer(serializers.ModelSerializer):
 
 class MessageSerializer(serializers.ModelSerializer):
     sender = PublicUserSerializer(read_only=True)
+    attachment = serializers.SerializerMethodField()
+    client_id = serializers.UUIDField(required=False, allow_null=True)
+    delivery_status = serializers.SerializerMethodField()
+
+    def get_delivery_status(self, obj):
+        request = self.context.get("request")
+        if not request or obj.sender_id != request.user.id or obj.deleted_for_everyone:
+            return None
+        if not hasattr(obj, "has_recipients"):
+            from .chat_reads import with_message_receipts
+            obj = with_message_receipts(Message.objects.filter(pk=obj.pk)).get()
+        return "read" if obj.has_recipients and not obj.has_unread_recipients else "sent"
+
+    def validate(self, attrs):
+        if self.instance and "client_id" in attrs:
+            raise serializers.ValidationError({"client_id": "A message's send identifier cannot be changed."})
+        return attrs
+
+    def create(self, validated_data):
+        client_id = validated_data.get("client_id")
+        if not client_id:
+            self.created_message = True
+            return super().create(validated_data)
+        message, created = Message.objects.get_or_create(
+            sender=validated_data["sender"], client_id=client_id,
+            defaults={key: value for key, value in validated_data.items() if key not in ("sender", "client_id")},
+        )
+        if not created and (message.conversation_id != validated_data["conversation"].id or
+                            (not message.deleted_for_everyone and message.body != validated_data["body"])):
+            raise serializers.ValidationError({"client_id": "This send identifier was already used for a different message."})
+        self.created_message = created
+        return message
+
+    def get_attachment(self, obj):
+        from .chat_attachments import attachment_info
+        item = getattr(obj, "attachment", None)
+        return attachment_info(item) if item and not obj.deleted_for_everyone else None
 
     class Meta:
         model = Message
-        fields = ["id", "conversation", "sender", "body", "created_at", "edited_at", "deleted_for_everyone"]
+        fields = ["id", "conversation", "sender", "body", "created_at", "edited_at", "deleted_for_everyone", "attachment", "client_id", "delivery_status"]
         read_only_fields = ["sender", "created_at", "edited_at", "deleted_for_everyone"]
+        validators = []  # Idempotent retries are resolved by create(), not rejected as duplicates.
 
 
 class ChatParticipantSerializer(PublicUserSerializer):
@@ -311,8 +420,7 @@ class ChatParticipantSerializer(PublicUserSerializer):
         fields = PublicUserSerializer.Meta.fields + ["is_online"]
 
     def get_is_online(self, obj):
-        cutoff = timezone.now() - UserPresence.TIMEOUT
-        return any(session.last_seen > cutoff for session in obj.presence_sessions.all())
+        return bool(obj.is_online_value)
 
 
 class PresenceSerializer(serializers.Serializer):
@@ -354,7 +462,8 @@ class ConversationSerializer(serializers.ModelSerializer):
         messages = obj.messages.select_related("sender", "sender__profile")
         request = self.context.get("request")
         if request and request.user.is_authenticated:
-            messages = messages.exclude(hidden_for=request.user)
+            from .moderation import visible_messages
+            messages = visible_messages(request.user, messages)
         message = messages.order_by("-created_at").first()
         return MessageSerializer(message, context=self.context).data if message else None
 
@@ -368,7 +477,7 @@ class ConversationSerializer(serializers.ModelSerializer):
             other_people = [person for person in obj.participants.all() if person.id != getattr(getattr(request, "user", None), "id", None)]
         else:
             other_people = obj.participants.exclude(id=getattr(request.user, "id", None)) if request else obj.participants.all()
-        return ", ".join(person.profile.display_name or person.username for person in other_people) or "Just you"
+        return ", ".join((person.profile.display_name or person.username) if person.is_active else "Unavailable account" for person in other_people) or "Just you"
 
 
 class NotificationSerializer(serializers.ModelSerializer):
@@ -393,7 +502,7 @@ class NotificationSerializer(serializers.ModelSerializer):
         return obj.read_at is not None
 
     def get_text(self, obj):
-        actor_name = obj.actor.profile.display_name or obj.actor.username if obj.actor else "Someone"
+        actor_name = (obj.actor.profile.display_name or obj.actor.username) if obj.actor and obj.actor.is_active else "Someone"
         if obj.kind == Notification.Kind.EVENT_INVITE and obj.attendance:
             return actor_name + " invited you to " + obj.attendance.event.name + "."
         if obj.kind == Notification.Kind.INVITE_ACCEPTED and obj.attendance:
@@ -414,3 +523,69 @@ class NotificationSerializer(serializers.ModelSerializer):
             action = "replied to your comment" if obj.comment.parent_id else "commented on your post"
             return actor_name + " " + action + ": " + obj.comment.body
         return "You have a new SocialQuest update."
+
+
+class ReportContentTypeField(serializers.ChoiceField):
+    def __init__(self, **kwargs):
+        super().__init__(choices=["user", "post", "comment", "message", "event"], **kwargs)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, bool) and (isinstance(data, int) or isinstance(data, str) and data.isdigit()):
+            if len(str(data)) > 19 or not 0 < int(data) <= 9223372036854775807:
+                self.fail("invalid_choice", input=data)
+            content_type = ContentType.objects.filter(pk=data).first()
+            models = {"user": User, "post": Post, "comment": Comment, "message": Message, "event": Event}
+            if content_type:
+                for name, model in models.items():
+                    if content_type.model_class() == model:
+                        return name
+            self.fail("invalid_choice", input=data)
+        return super().to_internal_value(data)
+
+    def to_representation(self, value):
+        return "user" if value.model_class() == User else value.model
+
+
+class BoundedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
+    def to_internal_value(self, data):
+        # DRF's related field otherwise calls only pk_field.to_internal_value,
+        # skipping the min/max validators before issuing the database lookup.
+        return super().to_internal_value(self.pk_field.run_validation(data))
+
+
+class ReportSerializer(serializers.ModelSerializer):
+    content_type = ReportContentTypeField(required=False)
+    object_id = serializers.IntegerField(min_value=1, max_value=9223372036854775807, required=False)
+    reported_user = BoundedPrimaryKeyRelatedField(queryset=User.objects.filter(is_active=True), required=False, pk_field=serializers.IntegerField(min_value=1, max_value=9223372036854775807))
+
+    class Meta:
+        model = Report
+        fields = ["id", "reporter", "reported_user", "content_type", "object_id", "reason", "created_at"]
+        read_only_fields = ["id", "reporter", "created_at"]
+
+    def validate(self, attrs):
+        from .moderation import blocked_user_ids, visible_messages
+        from .permissions import visible_events, visible_posts
+        user = self.context["request"].user
+        reported = attrs.get("reported_user")
+        kind = attrs.get("content_type", "user" if reported else None)
+        object_id = attrs.get("object_id", reported.pk if reported and kind == "user" else None)
+        if not kind or object_id is None:
+            raise serializers.ValidationError("Provide a content_type and object_id, or a reported_user.")
+        querysets = {
+            "user": User.objects.filter(is_active=True), "post": visible_posts(user),
+            "event": visible_events(user), "message": visible_messages(user),
+            "comment": Comment.objects.filter(post__in=visible_posts(user)).exclude(author_id__in=blocked_user_ids(user)),
+        }
+        content = querysets[kind].filter(pk=object_id).first()
+        if content is None:
+            raise serializers.ValidationError("This content is not available to report.")
+        owner_id = content.pk if kind == "user" else content.host_id if kind == "event" else content.sender_id if kind == "message" else content.author_id
+        if owner_id == user.pk:
+            raise serializers.ValidationError("You cannot report your own account or content.")
+        if reported and reported.pk != owner_id:
+            raise serializers.ValidationError({"reported_user": "The reported user must own the content."})
+        attrs.update(content_type=ContentType.objects.get_for_model(content), object_id=content.pk,
+                     reported_user_id=owner_id)
+        attrs.pop("reported_user", None)
+        return attrs

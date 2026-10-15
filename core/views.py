@@ -1,41 +1,35 @@
-from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import BooleanField, Count, Exists, F, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import F, Prefetch, Q, prefetch_related_objects
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from uuid import UUID, uuid4
-from rest_framework import permissions, status, viewsets
-from rest_framework.exceptions import MethodNotAllowed, PermissionDenied, ValidationError
+from rest_framework import mixins, permissions, status, viewsets
+from rest_framework.exceptions import MethodNotAllowed, NotAuthenticated, PermissionDenied, ValidationError
 from rest_framework.decorators import action
 from rest_framework.generics import get_object_or_404 as get_api_object_or_404
 from rest_framework.response import Response
 from .ai import generate_quests, generate_side_quests
 from .authentication import SessionTokenAuthentication
+from .accounts import delete_account, login_account, suspend_account
 from .models import (AuthSession, Attendance, Comment, Conversation, ConversationReadState, Event, Follow, KarmaRating, Message,
-                     Notification, NotificationDevice, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission, UserPresence)
+                     Notification, NotificationDevice, Post, PostLike, PostLikeReward, PostShareClick, Profile, Quest, QuestSubmission, Report, UserBlock, UserPresence)
 from .permissions import IsHostOrReadOnly, visible_events, visible_posts
 from .recommendations import rank_events, rank_posts
 from .search import EVENT_FIELDS, PEOPLE_FIELDS, ranked_search
-from .chat_reads import with_unread_counts
+from .chat_reads import with_message_receipts, with_unread_counts
 from .serializers import (AttendanceSerializer, EventSerializer, KarmaRatingSerializer,
                           CommentSerializer, ConversationSerializer, MessageSerializer,
                           NotificationSerializer, PostSerializer, PublicUserSerializer, QuestSerializer,
-                          QuestSubmissionSerializer, RegisterSerializer, ProfileUpdateSerializer, PresenceSerializer)
+                          QuestSubmissionSerializer, RegisterSerializer, ProfileUpdateSerializer, PresenceSerializer,
+                          AccountSettingsSerializer, AccountPasswordSerializer, ReportSerializer)
+
+from .moderation import blocked_user_ids, check_message_access, users_are_blocked, visible_conversations, visible_messages
+from .querysets import with_post_stats, with_public_user_stats
+from .throttles import AuthRateThrottle
 
 User = get_user_model()
-
-
-def with_public_user_stats(queryset, viewer):
-    karma = KarmaRating.objects.filter(target_id=OuterRef("pk")).values("target_id").annotate(total=Sum("score")).values("total")
-    followed = Exists(Follow.objects.filter(follower=viewer, following_id=OuterRef("pk"))) if viewer.is_authenticated else Value(False, output_field=BooleanField())
-    return queryset.select_related("profile").annotate(
-        follower_count_value=Count("follower_relations", filter=Q(follower_relations__follower__is_active=True), distinct=True),
-        following_count_value=Count("following_relations", filter=Q(following_relations__following__is_active=True), distinct=True),
-        karma_value=Coalesce(Subquery(karma, output_field=IntegerField()), Value(0)),
-        is_followed_value=followed,
-    )
 
 
 def direct_conversation_key(first_user_id, second_user_id):
@@ -75,7 +69,14 @@ class AuthViewSet(viewsets.ViewSet):
     authentication_classes = [SessionTokenAuthentication]
     permission_classes = [permissions.AllowAny]
 
+    def get_throttles(self):
+        throttles = super().get_throttles()
+        if self.action in {"login", "register"}:
+            throttles.append(AuthRateThrottle())
+        return throttles
+
     @action(detail=False, methods=["post"])
+    @transaction.atomic
     def register(self, request):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -85,11 +86,35 @@ class AuthViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def login(self, request):
-        user = authenticate(username=request.data.get("username", ""), password=request.data.get("password", ""))
-        if not user:
+        result = login_account(request.data.get("username", ""), request.data.get("password", ""))
+        if not result:
             return Response({"detail": "Invalid username or password."}, status=status.HTTP_400_BAD_REQUEST)
-        token = AuthSession.objects.create(user=user)
-        return Response({"token": token.key, "user": PublicUserSerializer(user, context={"request": request}).data})
+        user, token, previous_state = result
+        return Response({"token": token.key, "user": PublicUserSerializer(user, context={"request": request}).data,
+                         "reactivated": previous_state != Profile.AccountState.ACTIVE,
+                         "deletion_cancelled": previous_state == Profile.AccountState.PENDING_DELETION})
+
+    @action(detail=False, methods=["get", "patch"], url_path="settings", permission_classes=[permissions.IsAuthenticated])
+    def account_settings(self, request):
+        serializer = AccountSettingsSerializer(request.user.profile, data=request.data, partial=True) if request.method == "PATCH" else AccountSettingsSerializer(request.user.profile)
+        if request.method == "PATCH":
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        return Response(serializer.data)
+
+    def account_action(self, request, *, delete=False):
+        serializer = AccountPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        profile = suspend_account(request.user.pk, serializer.validated_data["password"], delete=delete)
+        return Response({"account_state": profile.account_state, "deletion_due_at": profile.deletion_due_at})
+
+    @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    def deactivate(self, request):
+        return self.account_action(request)
+
+    @action(detail=False, methods=["post"], url_path="request-deletion", permission_classes=[permissions.IsAuthenticated])
+    def request_deletion(self, request):
+        return self.account_action(request, delete=True)
 
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def logout(self, request):
@@ -106,15 +131,26 @@ class EventViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsHostOrReadOnly]
 
     def get_queryset(self):
-        hosts = with_public_user_stats(User.objects.all(), self.request.user)
-        queryset = visible_events(self.request.user).prefetch_related(Prefetch("host", queryset=hosts), "attendances", "quests")
-        host_id = self.request.query_params.get("host")
         participant_id = self.request.query_params.get("participant")
+        my_events = self.request.query_params.get("attending", "").lower() in ("true", "1", "yes") or participant_id == "me"
+        if my_events and not self.request.user.is_authenticated:
+            raise NotAuthenticated("Log in to view your events.")
+        hosts = with_public_user_stats(User.objects.all(), self.request.user)
+        # Pending participants can still view/cancel their private event request.
+        # Private moments retain the stricter default visible_events boundary.
+        queryset = visible_events(self.request.user, include_pending=True).prefetch_related(Prefetch("host", queryset=hosts), "attendances", "quests")
+        host_id = self.request.query_params.get("host")
         if host_id:
             if not host_id.isdigit():
                 return queryset.none()
             queryset = queryset.filter(host_id=host_id)
-        if participant_id:
+        if my_events:
+            queryset = queryset.filter(
+                attendances__user=self.request.user,
+                attendances__status__in=[Attendance.Status.ACCEPTED, Attendance.Status.PENDING, Attendance.Status.INVITED],
+                ends_at__gt=timezone.now(),
+            ).distinct()
+        elif participant_id:
             if not participant_id.isdigit():
                 return queryset.none()
             queryset = queryset.filter(
@@ -127,8 +163,10 @@ class EventViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(ends_at__gt=timezone.now())
         query = self.request.query_params.get("q", "").strip()[:100]
         if query:
-            return ranked_search(queryset, query, EVENT_FIELDS, ("starts_at",))
-        return queryset.order_by("starts_at")
+            queryset = ranked_search(queryset, query, EVENT_FIELDS, ("starts_at",))
+            if not my_events:
+                return queryset
+        return queryset.order_by("starts_at", "pk")
 
     def perform_create(self, serializer):
         serializer.save(host=self.request.user)
@@ -153,6 +191,10 @@ class EventViewSet(viewsets.ModelViewSet):
         ))
         ranked = rank_events(request.user, latitude=latitude, longitude=longitude)
         events = invited + [event for _, event, _ in ranked]
+        hosts = {host.pk: host for host in with_public_user_stats(User.objects.filter(pk__in=[event.host_id for event in events]), request.user)}
+        for event in events:
+            event.host = hosts[event.host_id]
+        prefetch_related_objects(events, "attendances", "quests")
         reasons = ["You were invited"] * len(invited) + [reason for _, _, reason in ranked]
         payload = EventSerializer(events, many=True, context={"request": request}).data
         for item, reason in zip(payload, reasons):
@@ -222,6 +264,8 @@ class EventViewSet(viewsets.ModelViewSet):
         if user_id is None or not str(user_id).isdigit():
             raise ValidationError({"user_id": "Provide a valid user ID."})
         invitee = get_api_object_or_404(User, pk=int(user_id), is_active=True)
+        if users_are_blocked(request.user.pk, invitee.pk):
+            raise PermissionDenied("Invitations are unavailable between these accounts.")
         if invitee == request.user:
             raise ValidationError({"user_id": "Hosts are already part of their event."})
         attendance, created = Attendance.objects.select_for_update().get_or_create(
@@ -270,12 +314,12 @@ class EventViewSet(viewsets.ModelViewSet):
         event = self.get_object()
         if event.host != request.user:
             return Response({"detail": "Only the host can see requests."}, status=403)
-        return Response(AttendanceSerializer(event.attendances.select_related("user", "user__profile"), many=True, context={"request": request}).data)
+        return Response(AttendanceSerializer(event.attendances.prefetch_related(Prefetch("user", queryset=with_public_user_stats(User.objects.all(), request.user))), many=True, context={"request": request}).data)
 
     @action(detail=True, methods=["get"], permission_classes=[permissions.AllowAny])
     def attendees(self, request, pk=None):
         event = self.get_object()
-        accepted = event.attendances.filter(status=Attendance.Status.ACCEPTED).select_related("user", "user__profile")
+        accepted = event.attendances.filter(status=Attendance.Status.ACCEPTED).prefetch_related(Prefetch("user", queryset=with_public_user_stats(User.objects.all(), request.user)))
         return Response(AttendanceSerializer(accepted, many=True, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], url_path="review-request", permission_classes=[permissions.IsAuthenticated])
@@ -356,7 +400,7 @@ class QuestSubmissionViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]
 
     def get_queryset(self):
-        return QuestSubmission.objects.select_related("quest", "quest__event", "participant", "participant__profile").filter(participant=self.request.user)
+        return QuestSubmission.objects.select_related("quest", "quest__event").prefetch_related(Prefetch("participant", queryset=with_public_user_stats(User.objects.all(), self.request.user))).filter(participant=self.request.user)
 
     def perform_create(self, serializer):
         quest = serializer.validated_data["quest"]
@@ -396,7 +440,7 @@ class KarmaRatingViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]
 
     def get_queryset(self):
-        queryset = KarmaRating.objects.select_related("rater__profile", "target__profile", "event").filter(rater=self.request.user)
+        queryset = KarmaRating.objects.select_related("event").prefetch_related(Prefetch("rater", queryset=with_public_user_stats(User.objects.all(), self.request.user)), Prefetch("target", queryset=with_public_user_stats(User.objects.all(), self.request.user))).filter(rater=self.request.user)
         event_id = self.request.query_params.get("event")
         if event_id:
             if not event_id.isdigit():
@@ -437,7 +481,7 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        queryset = User.objects.filter(is_active=True)
+        queryset = User.objects.filter(is_active=True).exclude(pk__in=blocked_user_ids(self.request.user))
         query = self.request.query_params.get("q", "").strip()[:100]
         if query:
             queryset = ranked_search(queryset, query, PEOPLE_FIELDS, ("username",))
@@ -452,6 +496,32 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
             serializer.is_valid(raise_exception=True)
             serializer.save()
         return Response(PublicUserSerializer(request.user, context={"request": request}).data)
+
+    @action(detail=False, methods=["delete"], url_path="me/delete-account", permission_classes=[permissions.IsAuthenticated])
+    def delete_account(self, request):
+        delete_account(request.user.pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post", "delete"], permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
+    def block(self, request, pk=None):
+        person = get_api_object_or_404(User, pk=pk)
+        if person.pk == request.user.pk:
+            raise ValidationError("You cannot block yourself.")
+        if request.method == "DELETE":
+            UserBlock.objects.filter(blocker=request.user, blocked_user=person).delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        relation, created = UserBlock.objects.get_or_create(blocker=request.user, blocked_user=person)
+        Follow.objects.filter(Q(follower=request.user, following=person) | Q(follower=person, following=request.user)).delete()
+        # Clear queued payloads too; hiding a feed item must not leave a pending
+        # push containing the same blocked sender's name/message.
+        from .models import NotificationDelivery
+        NotificationDelivery.objects.filter(
+            (Q(device__user=request.user) & (Q(message__sender=person) | Q(notification__actor=person)))
+            | (Q(device__user=person) & (Q(message__sender=request.user) | Q(notification__actor=request.user))),
+            status__in=["PENDING", "SENDING"],
+        ).update(status="SUPPRESSED")
+        return Response({"blocked": True, "created": created}, status=201 if created else 200)
 
     @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def follow(self, request, pk=None):
@@ -484,12 +554,12 @@ class PeopleViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="followers")
     def followers(self, request, pk=None):
-        person = get_api_object_or_404(User, pk=pk, is_active=True)
+        person = get_api_object_or_404(User.objects.filter(is_active=True).exclude(pk__in=blocked_user_ids(request.user)), pk=pk)
         return self.relationship_list(person, "followers")
 
     @action(detail=True, methods=["get"], url_path="following")
     def following_list(self, request, pk=None):
-        person = get_api_object_or_404(User, pk=pk, is_active=True)
+        person = get_api_object_or_404(User.objects.filter(is_active=True).exclude(pk__in=blocked_user_ids(request.user)), pk=pk)
         return self.relationship_list(person, "following")
 
     @action(detail=False, methods=["put", "delete"], permission_classes=[permissions.IsAuthenticated])
@@ -518,11 +588,10 @@ class PostViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         authors = with_public_user_stats(User.objects.all(), self.request.user)
-        comments = Comment.objects.select_related("author", "author__profile").order_by("-created_at")
-        queryset = visible_posts(self.request.user).select_related("event", "quest").prefetch_related(
+        comments = Comment.objects.exclude(author_id__in=blocked_user_ids(self.request.user)).prefetch_related(Prefetch("author", queryset=authors)).order_by("-created_at")
+        queryset = with_post_stats(visible_posts(self.request.user), self.request.user).select_related("event", "quest").prefetch_related(
             Prefetch("author", queryset=authors),
-            "likes",
-            Prefetch("comments", queryset=comments, to_attr="prefetched_comments"),
+            Prefetch("comments", queryset=comments[:2], to_attr="prefetched_comments"),
         )
         author_id = self.request.query_params.get("author")
         kind = self.request.query_params.get("kind")
@@ -537,7 +606,7 @@ class PostViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(event_id=event_id)
         if kind in (Post.Kind.POST, Post.Kind.REEL):
             queryset = queryset.filter(kind=kind)
-        return queryset
+        return queryset.order_by("-created_at", "-id")
 
     def perform_create(self, serializer):
         event = serializer.validated_data.get("event")
@@ -575,13 +644,13 @@ class PostViewSet(viewsets.ModelViewSet):
                 _, rewarded = PostLikeReward.objects.get_or_create(post=post, user=request.user)
                 if created and rewarded:
                     Profile.objects.filter(user=post.author).update(total_xp=F("total_xp") + 1)
-        return Response({"liked": True, "created": created, "like_count": post.likes.count()}, status=201 if created else 200)
+        return Response({"liked": True, "created": created, "like_count": PostLike.objects.filter(post=post).count()}, status=201 if created else 200)
 
     @like.mapping.delete
     def unlike(self, request, pk=None):
         post = self.get_object()
         PostLike.objects.filter(post=post, user=request.user).delete()
-        return Response({"liked": False, "like_count": post.likes.count()})
+        return Response({"liked": False, "like_count": PostLike.objects.filter(post=post).count()})
 
     @action(detail=False, methods=["get"], permission_classes=[permissions.IsAuthenticated])
     def following(self, request):
@@ -596,7 +665,10 @@ class CommentViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        queryset = Comment.objects.filter(post__in=visible_posts(self.request.user)).select_related("author", "author__profile", "post", "parent", "parent__author", "parent__author__profile")
+        authors = with_public_user_stats(User.objects.all(), self.request.user)
+        queryset = Comment.objects.filter(post__in=visible_posts(self.request.user)).exclude(
+            author_id__in=blocked_user_ids(self.request.user),
+        ).select_related("post", "parent").prefetch_related(Prefetch("author", queryset=authors))
         post_id = self.request.query_params.get("post")
         if post_id:
             if not post_id.isdigit():
@@ -607,6 +679,9 @@ class CommentViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         post = get_object_or_404(visible_posts(self.request.user), pk=serializer.validated_data["post"].pk)
+        parent = serializer.validated_data.get("parent")
+        if parent and users_are_blocked(self.request.user.pk, parent.author_id):
+            raise PermissionDenied("Replies are unavailable between these accounts.")
         comment = serializer.save(author=self.request.user)
         recipient = comment.parent.author if comment.parent_id else post.author
         if recipient != self.request.user:
@@ -636,11 +711,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        participants = with_public_user_stats(User.objects.all(), self.request.user).prefetch_related("presence_sessions")
-        visible_messages = Message.objects.exclude(hidden_for=self.request.user).select_related("sender", "sender__profile")
-        return with_unread_counts(Conversation.objects.filter(participants=self.request.user).exclude(hidden_for=self.request.user), self.request.user).select_related("event").prefetch_related(
-            Prefetch("participants", queryset=participants),
-            Prefetch("messages", queryset=visible_messages, to_attr="visible_messages"),
+        participants = with_public_user_stats(User.objects.all(), self.request.user)
+        messages = with_message_receipts(visible_messages(self.request.user)).select_related("attachment").prefetch_related(Prefetch("sender", queryset=participants))
+        return with_unread_counts(visible_conversations(self.request.user), self.request.user).select_related("event").prefetch_related(
+            Prefetch("participants", queryset=participants.exclude(pk__in=blocked_user_ids(self.request.user))),
+            Prefetch("messages", queryset=messages, to_attr="visible_messages"),
         ).order_by("-updated_at")
 
     def create(self, request, *args, **kwargs):
@@ -662,7 +737,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         message_id = request.data.get("message_id")
         if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
             raise ValidationError({"message_id": "Provide the ID of the last displayed message."})
-        get_api_object_or_404(conversation.messages.exclude(hidden_for=request.user), pk=message_id)
+        get_api_object_or_404(visible_messages(request.user, conversation.messages.all()), pk=message_id)
         with transaction.atomic():
             read_state, _ = ConversationReadState.objects.get_or_create(conversation=conversation, user=request.user)
             # The conditional update cannot move a cursor backwards when devices race.
@@ -670,14 +745,22 @@ class ConversationViewSet(viewsets.ModelViewSet):
         current = with_unread_counts(Conversation.objects.filter(pk=conversation.pk), request.user).get()
         return Response({"unread_count": current.unread_count, "read_through_message_id": current.read_through_message_id})
 
+    @action(detail=True, methods=["get"], url_path="attachment-devices")
+    def attachment_devices(self, request, pk=None):
+        from .chat_attachments import conversation_devices
+        participants, devices = conversation_devices(self.get_object(), request.user)
+        return Response({"participants": participants, "devices": [{"id": str(device.pk), "user": device.user_id, "public_key": device.public_key} for device in devices]})
+
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def direct(self, request):
         user_id = request.data.get("user_id")
         if user_id is None or not (isinstance(user_id, int) or (isinstance(user_id, str) and str(user_id).isdigit())):
             return Response({"detail": "user_id must be a valid integer."}, status=status.HTTP_400_BAD_REQUEST)
-        target = get_object_or_404(User, id=int(user_id))
+        target = get_object_or_404(User, id=int(user_id), is_active=True)
         if target == request.user:
             return Response({"detail": "Choose someone else to start a conversation."}, status=400)
+        if users_are_blocked(request.user.pk, target.pk):
+            raise PermissionDenied("Messaging is unavailable between these accounts.")
         with transaction.atomic():
             conversation, created = Conversation.objects.get_or_create(
                 direct_key=direct_conversation_key(request.user.id, target.id),
@@ -696,7 +779,8 @@ class MessageViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        queryset = Message.objects.select_related("sender", "sender__profile", "conversation").filter(conversation__participants=self.request.user).exclude(hidden_for=self.request.user)
+        senders = with_public_user_stats(User.objects.all(), self.request.user)
+        queryset = with_message_receipts(visible_messages(self.request.user)).select_related("conversation", "attachment").prefetch_related(Prefetch("sender", queryset=senders))
         conversation_id = self.request.query_params.get("conversation")
         if conversation_id:
             if not conversation_id.isdigit():
@@ -706,9 +790,10 @@ class MessageViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         conversation = serializer.validated_data["conversation"]
-        if not conversation.participants.filter(id=self.request.user.id).exists():
-            raise PermissionDenied("You are not part of this conversation.")
+        check_message_access(conversation, self.request.user)
         message = serializer.save(sender=self.request.user)
+        if not serializer.created_message:
+            return
         Conversation.objects.filter(pk=conversation.pk).update(updated_at=timezone.now())
         conversation.hidden_for.clear()
         from .notification_delivery import queue_message
@@ -732,6 +817,9 @@ class MessageViewSet(viewsets.ModelViewSet):
             message.edited_at = timezone.now()
             message.hidden_for.clear()
             message.save(update_fields=["body", "deleted_for_everyone", "edited_at"])
+            if getattr(message, "attachment", None):
+                from .chat_attachments import purge_attachment
+                purge_attachment(message.attachment.pk, "deleted")
         else:
             message.hidden_for.add(request.user)
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -786,9 +874,13 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         from .notification_delivery import ensure_ended_notifications
         ensure_ended_notifications(self.request.user.id)
-        return Notification.objects.filter(recipient=self.request.user).exclude(kind=Notification.Kind.MESSAGE).select_related(
-            "actor", "actor__profile", "attendance", "attendance__event", "conversation", "message", "comment", "comment__post"
-        )
+        actors = with_public_user_stats(User.objects.all(), self.request.user)
+        blocked = blocked_user_ids(self.request.user)
+        return Notification.objects.filter(recipient=self.request.user).exclude(kind=Notification.Kind.MESSAGE).exclude(
+            actor_id__in=blocked,
+        ).exclude(attendance__event__host_id__in=blocked).select_related(
+            "attendance", "attendance__event", "conversation", "message", "comment", "comment__post"
+        ).prefetch_related(Prefetch("actor", queryset=actors))
 
     @action(detail=False, methods=["post"], url_path="mark-read")
     def mark_read(self, request):
@@ -804,3 +896,12 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=["get"], url_path="unread-count")
     def unread_count(self, request):
         return Response({"count": self.get_queryset().filter(read_at__isnull=True).count()})
+
+
+class ReportViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
+    serializer_class = ReportSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["post", "options"]
+
+    def perform_create(self, serializer):
+        serializer.save(reporter=self.request.user)

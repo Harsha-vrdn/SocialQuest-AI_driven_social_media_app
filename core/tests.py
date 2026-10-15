@@ -13,7 +13,7 @@ from PIL import Image
 from rest_framework.test import APIClient
 
 from .models import AuthSession, Attendance, Comment, Conversation, Event, Follow, KarmaRating, Message, Notification, NotificationDevice, Post, PostLikeReward, PostShareClick, Quest, QuestSubmission, UserPresence
-from .media import MAX_IMAGE_DIMENSION, MAX_UPLOAD_BYTES, compress_image_upload
+from .media import MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, compress_image_upload
 from .serializers import PostSerializer
 
 User = get_user_model()
@@ -247,6 +247,30 @@ class SocialQuestFlowTests(TestCase):
         detail = self.client.get(f"/api/posts/{post.id}/")
         self.assertEqual(detail.data["like_count"], 1)
         self.assertEqual(detail.data["comment_count"], 1)
+
+    def test_reels_support_likes_and_full_comment_threads(self):
+        reel = Post.objects.create(author=self.alex, kind=Post.Kind.REEL, body="A community reel")
+        Post.objects.create(author=self.alex, kind=Post.Kind.POST, body="A regular post")
+        self.client.force_authenticate(self.sam)
+        self.assertEqual(self.client.post(f"/api/posts/{reel.id}/like/").status_code, 201)
+        self.client.post(f"/api/posts/{reel.id}/like/")
+        comment = self.client.post("/api/comments/", {"post": reel.id, "body": "Great reel!"}, format="json")
+        self.assertEqual(comment.status_code, 201)
+        reply = self.client.post("/api/comments/", {"post": reel.id, "parent": comment.data["id"], "body": "My reply"}, format="json")
+        self.assertEqual(reply.status_code, 201)
+        feed = self.client.get("/api/posts/?kind=REEL").data["results"]
+        self.assertEqual([post["id"] for post in feed], [reel.id])
+        self.assertTrue(feed[0]["liked_by_me"])
+        self.assertEqual(feed[0]["like_count"], 1)
+        self.assertEqual(feed[0]["comment_count"], 2)
+        self.assertEqual(self.client.get(f"/api/comments/?post={reel.id}").data["count"], 2)
+        self.assertEqual(self.client.patch(f"/api/comments/{comment.data['id']}/", {"body": "Edited reel comment"}, format="json").status_code, 200)
+        self.assertEqual(self.client.delete(f"/api/posts/{reel.id}/like/").status_code, 200)
+        self.assertEqual(self.client.delete(f"/api/comments/{comment.data['id']}/").status_code, 204)
+        detail = self.client.get(f"/api/posts/{reel.id}/").data
+        self.assertFalse(detail["liked_by_me"])
+        self.assertEqual(detail["like_count"], 0)
+        self.assertEqual(detail["comment_count"], 0)
 
     def test_recommendations_prioritize_social_connections(self):
         Follow.objects.create(follower=self.alex, following=self.host)
@@ -709,10 +733,10 @@ class AuditRegressionTests(TestCase):
         corrupt = SimpleUploadedFile('fake.jpg', b'not really an image', content_type='image/jpeg')
         self.assertEqual(self.client.post('/api/posts/', {'body':'Fake', 'media':corrupt}, format='multipart').status_code, 400)
         oversized = image_upload('large.jpg')
-        oversized.size = MAX_UPLOAD_BYTES + 1
+        oversized.size = MAX_IMAGE_BYTES + 1
         serializer = PostSerializer(data={'body':'Large', 'media':oversized})
         self.assertFalse(serializer.is_valid())
-        self.assertIn('50 MB', str(serializer.errors))
+        self.assertIn('10 MB', str(serializer.errors))
 
     def test_generated_quests_have_bounded_fields_and_distinct_fallbacks(self):
         from .ai import _fallback_main_quest, _fallback_side_quests, _validated_quests
@@ -954,7 +978,7 @@ class PeopleAndPresenceTests(TestCase):
         self.assertFalse(self.sam_is_online())
         UserPresence.objects.create(user=self.sam, session_id=uuid4(), last_seen=now)
         self.assertTrue(self.sam_is_online())
-        with patch('core.serializers.timezone.now', return_value=now + UserPresence.TIMEOUT):
+        with patch('core.querysets.timezone.now', return_value=now + UserPresence.TIMEOUT):
             self.assertFalse(self.sam_is_online())
         self.assertNotIn('is_online', self.client.get(f'/api/people/{self.sam.id}/').data)
         self.client.force_authenticate(self.jordan)

@@ -21,8 +21,14 @@ test('every script loaded by the website compiles as a complete browser script',
 
 test('notification and post-creator dependencies load before the application', () => {
   const appIndex = scripts.indexOf('/static/app.js');
-  for (const dependency of ['/static/notifications.js', '/static/post-studio.js']) {
+  for (const dependency of ['/static/notifications.js', '/static/post-studio.js', '/static/chat-attachments.js']) {
     assert.ok(scripts.indexOf(dependency) >= 0 && scripts.indexOf(dependency) < appIndex,
       `${dependency} must be available when the app starts`);
   }
+});
+
+test('encrypted attachment device registration starts when the account loads', () => {
+  const source = fs.readFileSync(path.join(webRoot, 'static/app.js'), 'utf8');
+  const startup = source.slice(source.indexOf('(async function init()'));
+  assert.match(startup, /state\.user = await api\('\/people\/me\/'\);\s*window\.SocialQuestAttachments\?\.init\(/);
 });

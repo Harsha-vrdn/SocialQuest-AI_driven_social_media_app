@@ -79,7 +79,7 @@ export function PostComposer(props: Props) {
   return <Modal visible={props.visible && !props.editingPhoto} animationType="slide" presentationStyle="fullScreen" onRequestClose={close}>
     <KeyboardAvoidingView style={[s.screen, {paddingTop: insets.top}]} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
       <View style={s.header}>
-        <Pressable accessibilityRole="button" accessibilityLabel="Close post creator" disabled={props.busy} onPress={close} style={s.iconButton}><GlassBackdrop radius={12} /><Ionicons name="close" size={26} color={colors.text} /></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="Close post creator" disabled={props.busy} onPress={close} style={s.iconButton}><GlassBackdrop native radius={16} /><Ionicons name="close" size={26} color={colors.text} /></Pressable>
         <View style={s.headerCopy}><Text style={s.eyebrow}>SOCIALQUEST STUDIO</Text><Text style={s.title}>{props.quest ? 'Complete quest' : 'Create a post'}</Text></View>
         {width >= 360 ? <View style={s.stepBadge}><Text style={s.stepBadgeText}>{step + 1} / 3</Text></View> : null}
       </View>
@@ -135,7 +135,7 @@ const getStyles = createThemedStyles(({colors, accents}) => ({
   headerCopy: {minWidth: 0, flex: 1},
   eyebrow: {fontFamily: fonts.bold, fontSize: 11, color: colors.muted, lineHeight: 16, letterSpacing: 1.3},
   title: {lineHeight: 28, fontFamily: fonts.bold, color: colors.text, fontSize: 22, marginTop: 4, letterSpacing: 0},
-  iconButton: {width: 44, height: 44, alignItems: "center", justifyContent: "center", backgroundColor: colors.elevated, borderRadius: 16, borderCurve: "continuous"},
+  iconButton: {width: 44, height: 44, alignItems: "center", justifyContent: "center", backgroundColor: "transparent", borderRadius: 16, borderCurve: "continuous"},
   stepBadge: {padding: 8, backgroundColor: colors.accentSoft, borderRadius: 12, borderCurve: "continuous"},
   stepBadgeText: {fontFamily: fonts.copy, color: colors.muted, fontSize: 12},
   steps: {flexDirection: "row", paddingHorizontal: 4, gap: 4, backgroundColor: colors.surface, borderRadius: 20, marginHorizontal: 20, paddingVertical: 4, marginBottom: 6},

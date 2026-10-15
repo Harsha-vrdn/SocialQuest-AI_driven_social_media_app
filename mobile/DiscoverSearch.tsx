@@ -11,12 +11,14 @@ const SearchCell = makeRevealCell('search');
 type Item = {id: number};
 type Results<T> = {key: string; items: T[]; count: number; page: number; more: boolean};
 
-export function DiscoverSearch<E extends Item, U extends Item>({api, query, onQuery, kind, onKind, focusRequest, refreshKey, nearbyEvents, onNearby, onHost, renderEvent, renderPerson}: {
+export function DiscoverSearch<E extends Item, U extends Item>({api, query, onQuery, kind, onKind, focusRequest, refreshKey, eventRevision = 0, nearbyEvents, onNearby, onExplore, onHost, renderEvent, renderPerson, bottomInset = 0}: {
   api: (path: string, options?: any) => Promise<any>;
   query: string; onQuery: (value: string) => void;
   kind: SearchKind; onKind: (value: SearchKind) => void; focusRequest: number; refreshKey: unknown;
   nearbyEvents: E[] | null; onNearby: () => void; onHost: () => void;
+  eventRevision?: number; onExplore?: () => void;
   renderEvent: (event: E) => ReactNode; renderPerson: (person: U) => ReactNode;
+  bottomInset?: number;
 }) {
   const {theme} = useTheme();
   const {colors} = theme;
@@ -31,9 +33,11 @@ export function DiscoverSearch<E extends Item, U extends Item>({api, query, onQu
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
+  const [eventFilter, setEventFilter] = useState<'explore' | 'mine'>('explore');
   const term = query.trim();
-  const nearby = !term && kind === 'events' && nearbyEvents !== null;
-  const key = JSON.stringify([kind, term, nearby]);
+  const myEvents = kind === 'events' && eventFilter === 'mine';
+  const nearby = !myEvents && !term && kind === 'events' && nearbyEvents !== null;
+  const key = JSON.stringify([kind, term, nearby, kind === 'events' ? eventFilter : null, kind === 'events' ? eventRevision : 0]);
   // Hide results immediately on a query/tab change, before the debounce fires.
   const current = results.key === key;
   const items = current ? results.items : [];
@@ -46,7 +50,7 @@ export function DiscoverSearch<E extends Item, U extends Item>({api, query, onQu
     controller.current = new AbortController();
     try {
       const suffix = '?q=' + encodeURIComponent(term) + '&page=' + page;
-      const path = kind === 'events' && !term ? '/events/recommended/' : '/' + kind + '/' + suffix;
+      const path = myEvents ? '/events/' + suffix + '&attending=true' : kind === 'events' && !term ? '/events/recommended/' : '/' + kind + '/' + suffix;
       const data = nearby ? nearbyEvents : await apiRef.current(path, {singlePage: true, signal: controller.current.signal});
       if (requestVersion.current !== version) return;
       const found = Array.isArray(data) ? data : data?.results || [];
@@ -67,6 +71,7 @@ export function DiscoverSearch<E extends Item, U extends Item>({api, query, onQu
   }, [key, refresh, refreshKey, nearbyEvents]);
 
   const submit = () => { Keyboard.dismiss(); setRefresh(value => value + 1); };
+  const exploreEvents = () => {setEventFilter('explore'); onQuery(''); onExplore?.(); Keyboard.dismiss();};
   const loadMore = () => {
     if (!inFlight.current && current && results.more) void requestSearch(results.page + 1, ++requestVersion.current);
   };
@@ -92,24 +97,33 @@ export function DiscoverSearch<E extends Item, U extends Item>({api, query, onQu
           <Text style={[styles.tabText, kind === value && styles.activeText]}>{value === 'events' ? 'Events' : 'People'}</Text>
         </Pressable>)}
       </View>
+      {kind === 'events' ? <View accessibilityRole="tablist" accessibilityLabel="Event filters" style={styles.tabs}>
+        {(['explore', 'mine'] as const).map(value => <Pressable key={value} accessibilityRole="tab"
+          accessibilityLabel={value === 'explore' ? 'Explore events' : 'My Events'} accessibilityState={{selected: eventFilter === value}}
+          onPress={() => {setEventFilter(value); if (value === 'explore') onExplore?.();}}
+          style={[styles.filterTab, eventFilter === value && styles.activeTab]}>
+          <Text style={[styles.filterText, eventFilter === value && styles.activeText]}>{value === 'explore' ? 'Explore' : 'My Events'}</Text>
+        </Pressable>)}
+      </View> : null}
     </View>
-    <FlatList<E | U> key={kind} data={items} CellRendererComponent={SearchCell} keyExtractor={item => String(item.id)} contentContainerStyle={styles.results} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
+    <FlatList<E | U> key={kind === 'events' ? kind + ':' + eventFilter : kind} data={items} CellRendererComponent={SearchCell} keyExtractor={item => String(item.id)} contentContainerStyle={[styles.results, {paddingBottom: styles.results.paddingBottom + bottomInset}]} scrollIndicatorInsets={{bottom: bottomInset}} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
       onRefresh={() => setRefresh(value => value + 1)} refreshing={loading && current && results.page <= 1}
       ListHeaderComponent={<View style={styles.resultsHeader}>
         {kind === 'events' && !term ? <View style={styles.actions}>
-          <Pressable accessibilityRole="button" onPress={onNearby} style={[styles.action, nearby && styles.activeTab]}><Ionicons name="navigate-outline" size={16} color={colors.accent} /><Text style={styles.actionText}>{nearby ? 'Near you' : 'Near me'}</Text></Pressable>
-          <Pressable accessibilityRole="button" onPress={onHost} style={styles.action}><Ionicons name="add-outline" size={18} color={colors.accent} /><Text style={styles.actionText}>Host an event</Text></Pressable>
+          <Pressable accessibilityLabel={nearby ? 'Near you' : 'Near me'} accessibilityRole="button" onPress={() => {setEventFilter('explore'); onNearby();}} style={[styles.action, nearby && styles.activeTab]}><Ionicons name="navigate-outline" size={16} color={colors.accent} /><Text style={styles.actionText}>{nearby ? 'Near you' : 'Near me'}</Text></Pressable>
+          <Pressable accessibilityLabel="Host an event" accessibilityRole="button" onPress={onHost} style={styles.action}><Ionicons name="add-outline" size={18} color={colors.accent} /><Text style={styles.actionText}>Host an event</Text></Pressable>
         </View> : null}
-        <Text accessibilityLiveRegion="polite" style={styles.summary}>{waiting && !items.length ? 'Searching…' : error && !items.length ? 'Search unavailable' : term ? `${current ? results.count : 0} ${countLabel} · Best matches first` : kind === 'events' ? nearby ? 'EVENTS NEAR YOU' : 'RECOMMENDED FOR YOU' : 'MEET THE COMMUNITY'}</Text>
+        <Text accessibilityLiveRegion="polite" style={styles.summary}>{waiting && !items.length ? 'Searching…' : error && !items.length ? 'Search unavailable' : term ? `${current ? results.count : 0} ${countLabel} · ${myEvents ? 'Soonest first' : 'Best matches first'}` : myEvents ? 'YOUR UPCOMING EVENTS · SOONEST FIRST' : kind === 'events' ? nearby ? 'EVENTS NEAR YOU' : 'RECOMMENDED FOR YOU' : 'MEET THE COMMUNITY'}</Text>
       </View>}
       renderItem={({item}) => <>{kind === 'events' ? renderEvent(item as E) : renderPerson(item as U)}</>}
       ListEmptyComponent={<View style={styles.empty}>{waiting ? <ActivityIndicator accessibilityLabel="Searching" color={colors.accent} /> : <>
         <Ionicons name={error ? 'cloud-offline-outline' : 'search-outline'} size={32} color={colors.muted} />
-        <Text style={styles.emptyTitle}>{error ? 'Could not load results' : term ? `No matching ${noun}` : `No ${noun} yet`}</Text>
-        <Text style={styles.emptyBody}>{error || (kind === 'events' ? 'Try an event name, place, or host.' : 'Try a name, @username, or city.')}</Text>
+        <Text style={styles.emptyTitle}>{error ? 'Could not load results' : term ? `No matching ${noun}` : myEvents ? 'No upcoming events yet' : `No ${noun} yet`}</Text>
+        <Text style={styles.emptyBody}>{error || (myEvents && !term ? 'Your requests, invitations and accepted plans will appear here.' : kind === 'events' ? 'Try an event name, place, or host.' : 'Try a name, @username, or city.')}</Text>
+        {myEvents && !error ? <Pressable accessibilityRole="button" accessibilityLabel="Explore events" style={styles.more} onPress={exploreEvents}><Text style={styles.actionText}>Explore events</Text></Pressable> : null}
       </>}</View>}
-      ListFooterComponent={error ? <View>{items.length ? <Text accessibilityRole="alert" style={styles.emptyBody}>{error}</Text> : null}<Pressable accessibilityRole="button" style={styles.more} onPress={() => items.length ? loadMore() : setRefresh(value => value + 1)}><Text style={styles.actionText}>Try again</Text></Pressable></View>
-        : current && results.more ? <Pressable accessibilityRole="button" accessibilityState={{disabled: loading}} disabled={loading} style={styles.more} onPress={loadMore}>{loading ? <ActivityIndicator color={colors.accent} /> : <Text style={styles.actionText}>Load more {noun}</Text>}</Pressable> : null} />
+      ListFooterComponent={error ? <View>{items.length ? <Text accessibilityRole="alert" style={styles.emptyBody}>{error}</Text> : null}<Pressable accessibilityLabel="Try again" accessibilityRole="button" style={styles.more} onPress={() => items.length ? loadMore() : setRefresh(value => value + 1)}><Text style={styles.actionText}>Try again</Text></Pressable></View>
+        : current && results.more ? <Pressable accessibilityLabel="Load more" accessibilityRole="button" accessibilityState={{disabled: loading}} disabled={loading} style={styles.more} onPress={loadMore}>{loading ? <ActivityIndicator color={colors.accent} /> : <Text style={styles.actionText}>Load more {noun}</Text>}</Pressable> : null} />
   </View>;
 }
 
@@ -125,6 +139,8 @@ const getStyles = createThemedStyles(({colors}) => ({
   tabs: {flexDirection: 'row', gap: 8, paddingBottom: 4},
   tab: {flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, padding: 12, minHeight: 48, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, borderRadius: 10},
   activeTab: {backgroundColor: colors.selection, borderColor: colors.accent},
+  filterTab: {flex: 1, minWidth: 0, alignItems: 'center', justifyContent: 'center', padding: 10, minHeight: 44, borderWidth: 1, borderColor: colors.border, borderRadius: 10, backgroundColor: colors.surface},
+  filterText: {fontFamily: fonts.bold, color: colors.muted, fontSize: 12, lineHeight: 18, textAlign: 'center'},
   tabText: {fontFamily: fonts.copy, fontSize: 14, color: colors.muted}, activeText: {color: colors.accent},
   results: {paddingHorizontal: 20, paddingBottom: 24, gap: 12}, resultsHeader: {gap: 16, paddingTop: 12, paddingBottom: 4},
   summary: {fontFamily: fonts.copy, fontSize: 11, lineHeight: 18, color: colors.muted},

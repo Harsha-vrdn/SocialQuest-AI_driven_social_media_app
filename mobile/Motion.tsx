@@ -3,6 +3,7 @@ import {AccessibilityInfo, Animated, Easing, Modal, Pressable, StyleSheet, type 
 import {motion} from './theme';
 
 const ReducedMotion = createContext(true);
+export const useReducedMotion = () => useContext(ReducedMotion);
 const easeOut = Easing.bezier(0.22, 1, 0.36, 1);
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
@@ -28,12 +29,15 @@ export const SoftPressable = forwardRef<View, PressableProps & {feedback?: 'scal
 ) {
   const reduced = useContext(ReducedMotion);
   const scale = useRef(new Animated.Value(1)).current;
-  const [pressed, setPressed] = useState(false);
-  const resolvedStyle = typeof style === 'function' ? style({pressed}) : style;
-  const flattened = StyleSheet.flatten(resolvedStyle);
+  const customPressStyle = typeof style === 'function';
+  const withFeedback = (resolvedStyle: StyleProp<ViewStyle>) => {
+    if (feedback === 'none') return resolvedStyle;
+    const flattened = StyleSheet.flatten(resolvedStyle);
+    return [resolvedStyle, {transform: [...(Array.isArray(flattened?.transform) ? flattened.transform : []), {scale}]}];
+  };
   const animate = (down: boolean) => {
+    if (reduced || feedback === 'none' || disabled || customPressStyle) return;
     scale.stopAnimation();
-    if (reduced || feedback === 'none' || disabled) { scale.setValue(1); return; }
     if (down) {
       Animated.timing(scale, {toValue: 0.95, duration: motion.press, easing: easeOut, useNativeDriver: true, isInteraction: false}).start();
     } else {
@@ -41,19 +45,21 @@ export const SoftPressable = forwardRef<View, PressableProps & {feedback?: 'scal
     }
   };
   useEffect(() => {
-    if (disabled || reduced || feedback === 'none') { scale.stopAnimation(); scale.setValue(1); }
+    if (disabled || reduced || feedback === 'none' || customPressStyle) { scale.stopAnimation(); scale.setValue(1); }
     return () => scale.stopAnimation();
-  }, [disabled, feedback, reduced, scale]);
+  }, [disabled, feedback, reduced, customPressStyle, scale]);
+  // Animated cannot bind a native node hidden inside a style callback. Custom
+  // pressed styles own their feedback; static controls get native scale.
   return <AnimatedPressable {...props} ref={ref} disabled={disabled}
-    style={[resolvedStyle, feedback !== 'none' && {transform: [...(Array.isArray(flattened?.transform) ? flattened.transform : []), {scale}]}]}
-    onPressIn={event => {setPressed(true); animate(true); onPressIn?.(event);}}
-    onPressOut={event => {setPressed(false); animate(false); onPressOut?.(event);}}>
-    {typeof children === 'function' ? children({pressed}) : children}
+    style={typeof style === 'function' ? style : withFeedback(style)}
+    onPressIn={event => {animate(true); onPressIn?.(event);}}
+    onPressOut={event => {animate(false); onPressOut?.(event);}}>
+    {children}
   </AnimatedPressable>;
 });
 
 // Animate the existing container, so changing tabs never remounts form state.
-export function ScreenTransition({children, transitionKey, style}: PropsWithChildren<{transitionKey: string | number; style?: StyleProp<ViewStyle>}>) {
+export function ScreenTransition({children, transitionKey, style, fade = true}: PropsWithChildren<{transitionKey: string | number; style?: StyleProp<ViewStyle>; fade?: boolean}>) {
   const reduced = useContext(ReducedMotion);
   const progress = useRef(new Animated.Value(1)).current;
   useLayoutEffect(() => {
@@ -64,13 +70,14 @@ export function ScreenTransition({children, transitionKey, style}: PropsWithChil
     animation.start();
     return () => animation.stop();
   }, [transitionKey, reduced, progress]);
-  return <Animated.View style={[style, {opacity: progress.interpolate({inputRange: [0, 1], outputRange: [0.3, 1]}), transform: [{translateY: progress.interpolate({inputRange: [0, 1], outputRange: [16, 0]})}, {scale: progress.interpolate({inputRange: [0, 1], outputRange: [0.985, 1]})}]}]}>{children}</Animated.View>;
+  // UIKit glass must not be inside a fading parent; keep the slide/scale feedback.
+  return <Animated.View style={[style, {opacity: fade ? progress.interpolate({inputRange: [0, 1], outputRange: [0.3, 1]}) : 1, transform: [{translateY: progress.interpolate({inputRange: [0, 1], outputRange: [16, 0]})}, {scale: progress.interpolate({inputRange: [0, 1], outputRange: [0.985, 1]})}]}]}>{children}</Animated.View>;
 }
 
 // Fade transparent sheets so their dimming layer no longer slides up the screen.
-export function MotionModal({animationType = 'slide', transparent, ...props}: ModalProps) {
+export function MotionModal({animationType = 'slide', transparent, hardwareAccelerated = true, ...props}: ModalProps) {
   const reduced = useContext(ReducedMotion);
-  return <Modal {...props} transparent={transparent} animationType={reduced ? 'none' : transparent ? 'fade' : animationType} />;
+  return <Modal {...props} hardwareAccelerated={hardwareAccelerated} transparent={transparent} animationType={reduced ? 'none' : transparent ? 'fade' : animationType} />;
 }
 
 export function LikeFeedback({children, style}: PropsWithChildren<{style?: StyleProp<ViewStyle>}>) {
